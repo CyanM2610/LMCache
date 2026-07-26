@@ -310,17 +310,23 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
         """Submit an asynchronous host-to-CXLMemSim store task."""
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
+        task_keys = list(keys)
+        task_objects = list(objects)
         with self._lock:
             self._ensure_open_locked()
             task_id = self._next_task_id_locked()
             self._inflight_store_tasks += 1
-        assert self._store_executor is not None
-        self._store_executor.submit(
-            self._execute_store_task,
-            task_id,
-            list(keys),
-            list(objects),
-        )
+            assert self._store_executor is not None
+            try:
+                self._store_executor.submit(
+                    self._execute_store_task,
+                    task_id,
+                    task_keys,
+                    task_objects,
+                )
+            except Exception:
+                self._inflight_store_tasks -= 1
+                raise
         return task_id
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
@@ -337,12 +343,21 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
     ) -> L2TaskId:
         """Submit an asynchronous lookup-and-lock task."""
         del layout_desc
+        task_keys = list(keys)
         with self._lock:
             self._ensure_open_locked()
             task_id = self._next_task_id_locked()
             self._inflight_lookup_tasks += 1
-        assert self._lookup_executor is not None
-        self._lookup_executor.submit(self._execute_lookup_task, task_id, list(keys))
+            assert self._lookup_executor is not None
+            try:
+                self._lookup_executor.submit(
+                    self._execute_lookup_task,
+                    task_id,
+                    task_keys,
+                )
+            except Exception:
+                self._inflight_lookup_tasks -= 1
+                raise
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -366,17 +381,23 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
         """Submit an asynchronous CXLMemSim-to-host load task."""
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
+        task_keys = list(keys)
+        task_objects = list(objects)
         with self._lock:
             self._ensure_open_locked()
             task_id = self._next_task_id_locked()
             self._inflight_load_tasks += 1
-        assert self._load_executor is not None
-        self._load_executor.submit(
-            self._execute_load_task,
-            task_id,
-            list(keys),
-            list(objects),
-        )
+            assert self._load_executor is not None
+            try:
+                self._load_executor.submit(
+                    self._execute_load_task,
+                    task_id,
+                    task_keys,
+                    task_objects,
+                )
+            except Exception:
+                self._inflight_load_tasks -= 1
+                raise
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -553,7 +574,12 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
             self._occupied_slots += 1
             self._inflight_stores[key] = slot_id
 
-        buffer = self._host_buffer(obj)
+        try:
+            buffer = self._host_buffer(obj)
+        except Exception:
+            logger.exception("CXLMemSim buffer inspection failed for key %s", key)
+            self._rollback_store(key, slot_id)
+            return False, 0, False
         if buffer is None:
             self._rollback_store(key, slot_id)
             return False, 0, False

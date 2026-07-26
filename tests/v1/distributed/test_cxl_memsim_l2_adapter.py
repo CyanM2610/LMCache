@@ -170,6 +170,36 @@ class _MemoryObjWithRawTensor:
         self._delegate.ref_count_down()
 
 
+class _ExplodingMemoryObj:
+    def __init__(self, delegate: MemoryObj) -> None:
+        self._delegate = delegate
+
+    @property
+    def raw_tensor(self) -> torch.Tensor:
+        raise RuntimeError("injected buffer inspection failure")
+
+    def release(self) -> None:
+        self._delegate.ref_count_down()
+
+
+class _PauseAfterReleaseLock:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.released = threading.Event()
+        self.resume = threading.Event()
+        self._pause_next_release = True
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *args: object) -> None:
+        self._lock.release()
+        if self._pause_next_release:
+            self._pause_next_release = False
+            self.released.set()
+            assert self.resume.wait(timeout=5)
+
+
 class _RecordingListener(L2AdapterListener):
     def __init__(self) -> None:
         self.stored: list[tuple[list[ObjectKey], list[int]]] = []
@@ -514,6 +544,28 @@ def test_failed_store_rolls_back_slot_for_next_key() -> None:
         adapter.close()
 
 
+def test_buffer_inspection_exception_rolls_back_slot_for_next_key() -> None:
+    adapter, _ = _make_adapter(capacity_bytes=4096)
+    exploding = cast(MemoryObj, _ExplodingMemoryObj(_memory_obj(1)))
+    replacement = _memory_obj(2)
+    try:
+        failed = _wait_store(
+            adapter,
+            adapter.submit_store_task([_key(1)], [exploding]),
+        )
+        succeeded = _wait_store(
+            adapter,
+            adapter.submit_store_task([_key(2)], [replacement]),
+        )
+
+        assert not failed.is_successful()
+        assert succeeded.is_successful()
+    finally:
+        cast(_ExplodingMemoryObj, exploding).release()
+        replacement.ref_count_down()
+        adapter.close()
+
+
 def test_store_rejects_noncontiguous_host_buffer_before_native_call() -> None:
     adapter, factory = _make_adapter()
     invalid = _memory_obj(3)
@@ -752,4 +804,41 @@ def test_delete_during_load_defers_slot_reuse_until_native_read_finishes() -> No
         source.ref_count_down()
         target.ref_count_down()
         replacement.ref_count_down()
+        adapter.close()
+
+
+def test_submit_racing_close_queues_task_before_executor_detaches() -> None:
+    adapter, factory = _make_adapter()
+    source = _memory_obj(1)
+    pause_lock = _PauseAfterReleaseLock()
+    adapter._lock = cast(threading.Lock, pause_lock)
+    submit_errors: list[BaseException] = []
+
+    def submit() -> None:
+        try:
+            adapter.submit_store_task([_key(1)], [source])
+        except BaseException as exc:
+            submit_errors.append(exc)
+
+    submit_thread = threading.Thread(target=submit)
+    close_thread = threading.Thread(target=adapter.close)
+    try:
+        submit_thread.start()
+        assert pause_lock.released.wait(timeout=5)
+        close_thread.start()
+        deadline = time.monotonic() + 5
+        while not factory.clients[0].closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        pause_lock.resume.set()
+        submit_thread.join(timeout=5)
+        close_thread.join(timeout=5)
+
+        assert not submit_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert submit_errors == []
+    finally:
+        pause_lock.resume.set()
+        submit_thread.join(timeout=5)
+        close_thread.join(timeout=5)
+        source.ref_count_down()
         adapter.close()
