@@ -16,7 +16,7 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.internal_api import L2StoreResult
+from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
 from lmcache.v1.distributed.l2_adapters.cxl_memsim_client import (
     BulkClientStats,
     BulkTransferResult,
@@ -43,9 +43,13 @@ class _FakeClient:
         self.write_calls: list[tuple[int, int]] = []
         self.read_calls: list[tuple[int, int]] = []
         self.fail_next_write = False
+        self.fail_next_read = False
         self.write_started = threading.Event()
         self.write_release = threading.Event()
         self.write_release.set()
+        self.read_started = threading.Event()
+        self.read_release = threading.Event()
+        self.read_release.set()
         self._stats_lock = threading.Lock()
         self._stats = {field: 0 for field in BulkClientStats.__dataclass_fields__}
 
@@ -55,6 +59,13 @@ class _FakeClient:
 
     def release_write(self) -> None:
         self.write_release.set()
+
+    def block_next_read(self) -> None:
+        self.read_started.clear()
+        self.read_release.clear()
+
+    def release_read(self) -> None:
+        self.read_release.set()
 
     def write_from(
         self,
@@ -91,7 +102,12 @@ class _FakeClient:
         dst_ptr: int,
         size: int,
     ) -> BulkTransferResult:
+        self.read_started.set()
+        assert self.read_release.wait(timeout=5)
         self.read_calls.append((offset, size))
+        if self.fail_next_read:
+            self.fail_next_read = False
+            raise RuntimeError("injected read failure")
         source = (ctypes.c_ubyte * size).from_buffer(self.buffer, offset)
         ctypes.memmove(dst_ptr, ctypes.addressof(source), size)
         result = BulkTransferResult(
@@ -152,6 +168,26 @@ class _MemoryObjWithRawTensor:
 
     def release(self) -> None:
         self._delegate.ref_count_down()
+
+
+class _RecordingListener(L2AdapterListener):
+    def __init__(self) -> None:
+        self.stored: list[tuple[list[ObjectKey], list[int]]] = []
+        self.accessed: list[list[ObjectKey]] = []
+        self.deleted: list[list[ObjectKey]] = []
+
+    def on_l2_keys_stored(
+        self,
+        keys: list[ObjectKey],
+        sizes: list[int],
+    ) -> None:
+        self.stored.append((list(keys), list(sizes)))
+
+    def on_l2_keys_accessed(self, keys: list[ObjectKey]) -> None:
+        self.accessed.append(list(keys))
+
+    def on_l2_keys_deleted(self, keys: list[ObjectKey]) -> None:
+        self.deleted.append(list(keys))
 
 
 def _config(**overrides: object) -> CxlMemSimL2AdapterConfig:
@@ -233,6 +269,30 @@ def _lookup_once(adapter: CxlMemSimL2Adapter, key: ObjectKey) -> bool:
     result = adapter.query_lookup_and_lock_result(task_id)
     assert result is not None
     return result.test(0)
+
+
+def _lookup_many(
+    adapter: CxlMemSimL2Adapter,
+    keys: list[ObjectKey],
+) -> list[bool]:
+    task_id = adapter.submit_lookup_and_lock_task(keys, _EMPTY_LAYOUT)
+    _wait_for_event(adapter.get_lookup_and_lock_event_fd())
+    result = adapter.query_lookup_and_lock_result(task_id)
+    assert result is not None
+    return [result.test(index) for index in range(len(keys))]
+
+
+def _wait_load(
+    adapter: CxlMemSimL2Adapter,
+    task_id: int,
+    *,
+    size: int = 1,
+    timeout: float = 5.0,
+) -> list[bool]:
+    _wait_for_event(adapter.get_load_event_fd(), timeout)
+    result = adapter.query_load_result(task_id)
+    assert result is not None
+    return [result.test(index) for index in range(size)]
 
 
 def test_cxl_memsim_config_parses_and_registers_adapter_type() -> None:
@@ -530,4 +590,166 @@ def test_concurrent_duplicate_store_waits_for_first_commit() -> None:
         client.release_write()
         source.ref_count_down()
         duplicate.ref_count_down()
+        adapter.close()
+
+
+def test_lookup_load_and_delete_round_trip_with_metadata_and_listeners() -> None:
+    adapter, factory = _make_adapter(offset_bytes=512)
+    listener = _RecordingListener()
+    adapter.register_listener(listener)
+    source = _memory_obj(7)
+    target = _memory_obj(0)
+    key = _key(1, cache_salt="tenant-a")
+    source.metadata.cached_positions = torch.tensor([3, 5, 8])
+    try:
+        assert _wait_store(
+            adapter,
+            adapter.submit_store_task([key], [source]),
+        ).is_successful()
+        source.metadata.cached_positions[0] = 99
+
+        assert _lookup_many(adapter, [key, _key(2)]) == [True, False]
+        load_task = adapter.submit_load_task([key, _key(2)], [target, target])
+        assert _wait_load(adapter, load_task, size=2) == [True, False]
+        assert adapter.query_load_result(load_task) is None
+        assert target.tensor is not None
+        assert source.tensor is not None
+        assert torch.equal(target.tensor, source.tensor)
+        assert target.metadata.cached_positions is not None
+        assert torch.equal(
+            target.metadata.cached_positions,
+            torch.tensor([3, 5, 8]),
+        )
+        assert listener.stored == [([key], [4096])]
+        assert listener.accessed == [[key]]
+
+        adapter.submit_unlock([key])
+        adapter.delete([key])
+        assert not _lookup_once(adapter, key)
+        assert listener.deleted == [[key]]
+        assert adapter.get_usage().total_bytes_used == 0
+        assert dict(adapter.get_usage().bytes_by_cache_salt) == {}
+
+        status = adapter.report_status()
+        assert status["transport"]["write_requests"] == 1
+        assert status["transport"]["read_requests"] == 1
+        assert status["transport"]["write_bytes"] == 4096
+        assert status["transport"]["read_bytes"] == 4096
+        assert factory.clients[0].write_calls == [(512, 4096)]
+        assert factory.clients[0].read_calls == [(512, 4096)]
+    finally:
+        source.ref_count_down()
+        target.ref_count_down()
+        adapter.close()
+
+
+def test_lookup_lock_reference_count_prevents_delete_until_fully_unlocked() -> None:
+    adapter, _ = _make_adapter(capacity_bytes=4096)
+    source = _memory_obj(1)
+    key = _key(1)
+    try:
+        assert _wait_store(
+            adapter,
+            adapter.submit_store_task([key], [source]),
+        ).is_successful()
+        assert _lookup_once(adapter, key)
+        assert _lookup_once(adapter, key)
+
+        adapter.delete([key])
+        adapter.submit_unlock([key])
+        adapter.delete([key])
+        assert _lookup_once(adapter, key)
+        adapter.submit_unlock([key])
+
+        adapter.submit_unlock([key])
+        adapter.delete([key])
+        assert not _lookup_once(adapter, key)
+    finally:
+        source.ref_count_down()
+        adapter.close()
+
+
+def test_load_rejects_small_destination_without_native_read() -> None:
+    adapter, factory = _make_adapter()
+    source = _memory_obj(4)
+    target = _memory_obj(0, elements=1024)
+    key = _key(1)
+    try:
+        assert _wait_store(
+            adapter,
+            adapter.submit_store_task([key], [source]),
+        ).is_successful()
+
+        load_task = adapter.submit_load_task([key], [target])
+        assert _wait_load(adapter, load_task) == [False]
+        assert factory.clients[0].read_calls == []
+    finally:
+        source.ref_count_down()
+        target.ref_count_down()
+        adapter.close()
+
+
+def test_failed_load_returns_miss_and_releases_read_borrow() -> None:
+    adapter, factory = _make_adapter(capacity_bytes=4096)
+    source = _memory_obj(2)
+    target = _memory_obj(0)
+    key = _key(1)
+    try:
+        assert _wait_store(
+            adapter,
+            adapter.submit_store_task([key], [source]),
+        ).is_successful()
+        factory.clients[0].fail_next_read = True
+
+        assert _wait_load(adapter, adapter.submit_load_task([key], [target])) == [False]
+        adapter.delete([key])
+        assert adapter.get_usage().total_bytes_used == 0
+    finally:
+        source.ref_count_down()
+        target.ref_count_down()
+        adapter.close()
+
+
+def test_delete_during_load_defers_slot_reuse_until_native_read_finishes() -> None:
+    adapter, factory = _make_adapter(capacity_bytes=4096)
+    client = factory.clients[0]
+    source = _memory_obj(3)
+    target = _memory_obj(0)
+    replacement = _memory_obj(8)
+    first_key = _key(1)
+    replacement_key = _key(2)
+    try:
+        assert _wait_store(
+            adapter,
+            adapter.submit_store_task([first_key], [source]),
+        ).is_successful()
+        client.block_next_read()
+        load_task = adapter.submit_load_task([first_key], [target])
+        assert client.read_started.wait(timeout=5)
+
+        adapter.delete([first_key])
+        during_read = _wait_store(
+            adapter,
+            adapter.submit_store_task([replacement_key], [replacement]),
+        )
+        assert not during_read.is_successful()
+        assert adapter.report_status()["pending_free_slot_count"] == 1
+
+        client.release_read()
+        assert _wait_load(adapter, load_task) == [True]
+        assert target.tensor is not None
+        assert source.tensor is not None
+        assert torch.equal(target.tensor, source.tensor)
+
+        after_read = _wait_store(
+            adapter,
+            adapter.submit_store_task([replacement_key], [replacement]),
+        )
+        assert after_read.is_successful()
+        assert client.write_calls == [(0, 4096), (0, 4096)]
+    finally:
+        client.release_read()
+        source.ref_count_down()
+        target.ref_count_down()
+        replacement.ref_count_down()
         adapter.close()

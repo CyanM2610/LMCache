@@ -249,6 +249,8 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
         self._inflight_stores: dict[ObjectKey, int] = {}
         self._free_slots = list(reversed(range(self._max_slots)))
         self._occupied_slots = 0
+        self._borrowed_slots = 0
+        self._pending_free_slots = 0
         self._next_task_id = 0
         self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
@@ -361,7 +363,7 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
-        """Submit a placeholder asynchronous load task."""
+        """Submit an asynchronous CXLMemSim-to-host load task."""
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
         with self._lock:
@@ -369,13 +371,40 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
             task_id = self._next_task_id_locked()
             self._inflight_load_tasks += 1
         assert self._load_executor is not None
-        self._load_executor.submit(self._finish_empty_load, task_id, len(keys))
+        self._load_executor.submit(
+            self._execute_load_task,
+            task_id,
+            list(keys),
+            list(objects),
+        )
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
         """Return and remove one completed load result."""
         with self._lock:
             return self._completed_load_tasks.pop(task_id, None)
+
+    def delete(self, keys: list[ObjectKey]) -> None:
+        """Delete unlocked keys and defer slots borrowed by active reads."""
+        deleted_keys: list[ObjectKey] = []
+        with self._state_condition:
+            for key in dict.fromkeys(keys):
+                entry = self._entries.get(key)
+                if entry is None or entry.external_locks > 0:
+                    continue
+                self._entries.pop(key)
+                deleted_keys.append(key)
+                if entry.read_borrows > 0:
+                    entry.pending_free = True
+                    self._pending_free_slots += 1
+                else:
+                    self._recycle_slot_locked(entry.slot_id)
+
+        if deleted_keys:
+            self._notify_keys_deleted(
+                deleted_keys,
+                [self._config.slot_bytes] * len(deleted_keys),
+            )
 
     def get_usage(self) -> AdapterUsage:
         """Return fixed-slot occupancy and per-salt accounting."""
@@ -425,6 +454,8 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
             live_slots = len(self._entries)
             inflight_stores = len(self._inflight_stores)
             occupied_slots = self._occupied_slots
+            borrowed_slots = self._borrowed_slots
+            pending_free_slots = self._pending_free_slots
             locked_keys = sum(
                 entry.external_locks > 0 for entry in self._entries.values()
             )
@@ -440,6 +471,8 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
             "occupied_slot_count": occupied_slots,
             "live_slot_count": live_slots,
             "locked_key_count": locked_keys,
+            "borrowed_slot_count": borrowed_slots,
+            "pending_free_slot_count": pending_free_slots,
             "inflight_key_store_count": inflight_stores,
             "inflight_store_tasks": inflight_store,
             "inflight_lookup_tasks": inflight_lookup,
@@ -493,12 +526,16 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
                     bytes_transferred,
                 )
                 self._inflight_store_tasks -= 1
-            if stored_keys:
-                self._notify_keys_stored(
-                    stored_keys,
-                    [self._config.slot_bytes] * len(stored_keys),
-                )
-            self._signal(self._store_efd)
+            try:
+                if stored_keys:
+                    self._notify_keys_stored(
+                        stored_keys,
+                        [self._config.slot_bytes] * len(stored_keys),
+                    )
+            except Exception:
+                logger.exception("CXLMemSim store listener failed")
+            finally:
+                self._signal(self._store_efd)
 
     def _store_one(
         self,
@@ -525,14 +562,13 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
 
         try:
             self._client.write_from(offset, pointer, payload_bytes)
+            cached_positions = obj.metadata.cached_positions
+            if cached_positions is not None:
+                cached_positions = cached_positions.clone()
         except Exception:
             logger.exception("CXLMemSim write failed for key %s", key)
             self._rollback_store(key, slot_id)
             return False, 0, False
-
-        cached_positions = obj.metadata.cached_positions
-        if cached_positions is not None:
-            cached_positions = cached_positions.clone()
         with self._state_condition:
             self._inflight_stores.pop(key, None)
             self._entries[key] = _SlotEntry(
@@ -546,9 +582,12 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
     def _rollback_store(self, key: ObjectKey, slot_id: int) -> None:
         with self._state_condition:
             self._inflight_stores.pop(key, None)
-            self._free_slots.append(slot_id)
-            self._occupied_slots -= 1
+            self._recycle_slot_locked(slot_id)
             self._state_condition.notify_all()
+
+    def _recycle_slot_locked(self, slot_id: int) -> None:
+        self._free_slots.append(slot_id)
+        self._occupied_slots -= 1
 
     def _host_buffer(self, obj: MemoryObj) -> tuple[int, int] | None:
         raw_tensor = obj.raw_tensor
@@ -593,11 +632,89 @@ class CxlMemSimL2Adapter(L2AdapterInterface):
                 self._inflight_lookup_tasks -= 1
             self._signal(self._lookup_efd)
 
-    def _finish_empty_load(self, task_id: L2TaskId, size: int) -> None:
-        with self._lock:
-            self._completed_load_tasks[task_id] = Bitmap(size)
-            self._inflight_load_tasks -= 1
-        self._signal(self._load_efd)
+    def _execute_load_task(
+        self,
+        task_id: L2TaskId,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> None:
+        bitmap = Bitmap(len(keys))
+        loaded_keys: list[ObjectKey] = []
+        try:
+            for index, (key, obj) in enumerate(zip(keys, objects, strict=True)):
+                entry = self._borrow_entry(key)
+                if entry is None:
+                    continue
+                try:
+                    if not self._load_one(entry, obj):
+                        continue
+                    bitmap.set(index)
+                    loaded_keys.append(key)
+                except Exception:
+                    logger.exception("CXLMemSim read failed for key %s", key)
+                finally:
+                    self._release_entry(entry)
+        except Exception:
+            logger.exception("Unexpected CXLMemSim load task failure")
+        finally:
+            with self._lock:
+                self._completed_load_tasks[task_id] = bitmap
+                self._inflight_load_tasks -= 1
+            try:
+                if loaded_keys:
+                    self._notify_keys_accessed(loaded_keys)
+            except Exception:
+                logger.exception("CXLMemSim load listener failed")
+            finally:
+                self._signal(self._load_efd)
+
+    def _borrow_entry(self, key: ObjectKey) -> _SlotEntry | None:
+        with self._state_condition:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            entry.read_borrows += 1
+            self._borrowed_slots += 1
+            return entry
+
+    def _release_entry(self, entry: _SlotEntry) -> None:
+        with self._state_condition:
+            entry.read_borrows -= 1
+            self._borrowed_slots -= 1
+            if entry.read_borrows == 0 and entry.pending_free:
+                entry.pending_free = False
+                self._pending_free_slots -= 1
+                self._recycle_slot_locked(entry.slot_id)
+                self._state_condition.notify_all()
+
+    def _load_one(self, entry: _SlotEntry, obj: MemoryObj) -> bool:
+        if not self._valid_load_buffer(obj, entry.payload_bytes):
+            return False
+        offset = self._config.offset_bytes + entry.slot_id * self._config.slot_bytes
+        self._client.read_into(offset, obj.data_ptr, entry.payload_bytes)
+        cached_positions = entry.cached_positions
+        obj.metadata.cached_positions = (
+            None if cached_positions is None else cached_positions.clone()
+        )
+        return True
+
+    @staticmethod
+    def _valid_load_buffer(obj: MemoryObj, payload_bytes: int) -> bool:
+        raw_tensor = obj.raw_tensor
+        if (
+            raw_tensor is None
+            or raw_tensor.device.type != "cpu"
+            or not raw_tensor.is_contiguous()
+            or obj.data_ptr <= 0
+        ):
+            return False
+        physical_bytes = obj.get_physical_size()
+        tensor_bytes = raw_tensor.numel() * raw_tensor.element_size()
+        return (
+            obj.get_size() >= payload_bytes
+            and tensor_bytes >= payload_bytes
+            and (physical_bytes <= 0 or physical_bytes >= payload_bytes)
+        )
 
 
 register_l2_adapter_type("cxl_memsim", CxlMemSimL2AdapterConfig)
