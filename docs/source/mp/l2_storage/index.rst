@@ -39,7 +39,8 @@ Adapter Types
 
 LMCache ships several L2 storage backends, grouped by medium under
 :doc:`Supported Backends <supported_storages>`. Select one or more with the
-``--l2-adapter`` flag.
+``--l2-adapter`` flag. For simulated CXL-memory experiments, see the
+:doc:`CXLMemSim adapter <cxl_memsim>`.
 
 .. toctree::
    :maxdepth: 2

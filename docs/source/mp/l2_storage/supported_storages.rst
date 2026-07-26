@@ -52,6 +52,9 @@ target.
    * - :doc:`DAX <dax>`
      - ``dax``
      - Byte-addressable memory
+   * - :doc:`CXLMemSim <cxl_memsim>`
+     - ``cxl_memsim``
+     - Simulated byte-addressable memory
    * - :doc:`Mock <mock>`
      - ``mock``
      - Testing
@@ -69,6 +72,7 @@ target.
    file_and_block
    remote_and_distributed
    dax
+   cxl_memsim
    mock
    fault_inject
    plugin
