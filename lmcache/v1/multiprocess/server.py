@@ -184,7 +184,12 @@ def _build_modules(
         ValueError: If blend engine is requested with
         supported_transfer_mode="engine_driven".
     """
-    lookup_module = LookupModule(ctx)
+    cxl_shared_tier = (
+        CXLSharedTierModule.open(mp_config.cxl_shared_tier)
+        if mp_config.cxl_shared_tier.enabled
+        else None
+    )
+    lookup_module = LookupModule(ctx, cxl_shared_tier=cxl_shared_tier)
     p2p_controller = P2PController(
         ctx,
         mp_config.p2p_config,
@@ -196,11 +201,6 @@ def _build_modules(
     # be constructed with them as liveness targets / reap listeners. They are
     # the InstanceLivenessTargets the reaper scans.
     transfer_modules: list[EngineModule] = []
-    cxl_shared_tier = (
-        CXLSharedTierModule.open(mp_config.cxl_shared_tier)
-        if mp_config.cxl_shared_tier.enabled
-        else None
-    )
     if mp_config.supported_transfer_mode == "lmcache_driven":
         transfer_modules.append(
             LMCacheDrivenTransferModule(ctx, cxl_shared_tier=cxl_shared_tier)

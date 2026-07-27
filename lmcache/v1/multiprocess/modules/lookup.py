@@ -4,6 +4,7 @@
 # Standard
 from dataclasses import dataclass
 from functools import partial
+from typing import Protocol, Sequence
 import threading
 import time
 
@@ -27,6 +28,12 @@ from lmcache.v1.multiprocess.protocol import RequestType
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
+
+
+class _CXLReadyLookup(Protocol):
+    def count_ready_prefix(
+        self, object_keys: Sequence[ObjectKey], keys_per_chunk: int
+    ) -> int: ...
 
 
 def compute_extra_count(
@@ -124,6 +131,7 @@ class _PrefetchJob:
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
+    direct_found_chunks: int | None = None
 
 
 class LookupModule:
@@ -138,11 +146,19 @@ class LookupModule:
         ctx: Shared engine context providing storage manager, token hasher,
             session manager, event bus, layout descriptor registry, and
             chunk size.
+        cxl_shared_tier: Optional direct shared tier that owns prefix lookup
+            when configured.
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self,
+        ctx: MPCacheServerContext,
+        cxl_shared_tier: _CXLReadyLookup | None = None,
+    ) -> None:
         self._ctx = ctx
+        self._cxl_shared_tier = cxl_shared_tier
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
+        self._direct_lookup_requests: set[str] = set()
         self._prefetch_job_lock = threading.Lock()
         self._setup_metrics()
 
@@ -197,8 +213,10 @@ class LookupModule:
         }
 
     def close(self) -> None:
-        """Release resources owned by this module (no-op)."""
-        pass
+        """Release request bookkeeping owned by this module."""
+        with self._prefetch_job_lock:
+            self._prefetch_jobs.clear()
+            self._direct_lookup_requests.clear()
 
     # -----------------------------------------------------------------
     # Handlers
@@ -318,6 +336,33 @@ class LookupModule:
         )
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
 
+        if self._cxl_shared_tier is not None:
+            keys_per_chunk = world_size * attn_desc.num_object_groups
+            found_chunks = self._cxl_shared_tier.count_ready_prefix(
+                obj_keys, keys_per_chunk
+            )
+            handle = PrefetchHandle(
+                prefetch_request_id=-1,
+                external_request_id=key.request_id,
+                l1_found_indices=(),
+                total_requested_keys=len(obj_keys),
+                submit_time=time.monotonic(),
+            )
+            self._register_prefetch_job(
+                _PrefetchJob(
+                    handle=handle,
+                    world_size=key.world_size,
+                    request_id=key.request_id,
+                    requested_tokens=requested_tokens,
+                    num_object_groups=attn_desc.num_object_groups,
+                    model_name=model_name,
+                    cache_salt=key.cache_salt,
+                    direct_found_chunks=found_chunks,
+                ),
+                direct=True,
+            )
+            return
+
         handle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=obj_keys,
@@ -363,6 +408,9 @@ class LookupModule:
             )
             return 0
 
+        if job.direct_found_chunks is not None:
+            return job.direct_found_chunks
+
         found = self._ctx.storage_manager.query_prefetch_lookup_hits(job.handle)
         if found is None:
             return None
@@ -397,17 +445,20 @@ class LookupModule:
             )
             return 0
 
-        found = self._ctx.storage_manager.query_prefetch_status(job.handle)
-        if found is None:
-            return None
+        if job.direct_found_chunks is not None:
+            found_count = job.direct_found_chunks
+        else:
+            found = self._ctx.storage_manager.query_prefetch_status(job.handle)
+            if found is None:
+                return None
 
-        # NOTE(Kuntai): this assumes two things:
-        # 1. the world size is the same between keys
-        # 2. the lookup sort the keys in prefix order and breaks at the
-        #    first failure
-        found_count = _get_prefix_hit_length(
-            found.count_leading_ones(), job.world_size, job.num_object_groups
-        )
+            # NOTE(Kuntai): this assumes two things:
+            # 1. the world size is the same between keys
+            # 2. the lookup sort the keys in prefix order and breaks at the
+            #    first failure
+            found_count = _get_prefix_hit_length(
+                found.count_leading_ones(), job.world_size, job.num_object_groups
+            )
 
         self._ctx.event_bus.publish(
             Event(
@@ -457,6 +508,9 @@ class LookupModule:
             )
             return 0
 
+        if job.direct_found_chunks is not None:
+            return self.query_prefetch_status(request_id)
+
         if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
             return None
         return self.query_prefetch_status(request_id)
@@ -482,6 +536,10 @@ class LookupModule:
             tp_size: Tensor-parallel size for MLA
                 multi-reader locking.
         """
+        with self._prefetch_job_lock:
+            if key.request_id in self._direct_lookup_requests:
+                return
+
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
             list(key.token_ids), start=key.start, end=key.end
         )
@@ -531,6 +589,12 @@ class LookupModule:
                 "Session %s has no lookup ipc key, skipping touch",
                 request_id,
             )
+            return
+
+        with self._prefetch_job_lock:
+            is_direct = request_id in self._direct_lookup_requests
+            self._direct_lookup_requests.discard(request_id)
+        if is_direct:
             return
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
@@ -589,9 +653,13 @@ class LookupModule:
                 obj_keys.extend(group_keys[lo:hi])
         return obj_keys
 
-    def _register_prefetch_job(self, job: _PrefetchJob) -> None:
+    def _register_prefetch_job(
+        self, job: _PrefetchJob, *, direct: bool = False
+    ) -> None:
         with self._prefetch_job_lock:
             self._prefetch_jobs[job.request_id] = job
+            if direct:
+                self._direct_lookup_requests.add(job.request_id)
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""

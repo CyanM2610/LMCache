@@ -303,3 +303,33 @@ def test_lookup_single_group_matches_single_group_layout():
 
     expected = ipc_key_to_object_keys(_lookup_key(world_size=2), chunk_hashes, [0])[0]
     assert keys == expected
+
+
+def test_lookup_uses_ready_cxl_prefix_without_dram_prefetch():
+    """A configured CXL tier owns lookup and does not acquire DRAM locks."""
+    ctx = MagicMock()
+    ctx.chunk_size = 16
+    ctx.event_bus.has_subscribers.return_value = False
+    ctx.layout_desc_registry.find.return_value = MagicMock()
+    ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
+        num_chunks_in_sw=[-1]
+    )
+    ctx.token_hasher.compute_chunk_hashes.return_value = [b"c0", b"c1"]
+    cxl_shared_tier = MagicMock()
+    cxl_shared_tier.count_ready_prefix.return_value = 1
+    module = LookupModule(ctx, cxl_shared_tier=cxl_shared_tier)
+    key = _lookup_key(world_size=2)
+
+    module.lookup(key, tp_size=1)
+
+    cxl_shared_tier.count_ready_prefix.assert_called_once()
+    object_keys, keys_per_chunk = cxl_shared_tier.count_ready_prefix.call_args.args
+    assert len(object_keys) == 4
+    assert keys_per_chunk == 2
+    ctx.storage_manager.submit_prefetch_task.assert_not_called()
+    assert module.query_prefetch_lookup_hits(key.request_id) == 1
+    assert module.query_prefetch_status(key.request_id) == 1
+
+    module.free_lookup_locks(key, tp_size=1)
+
+    ctx.storage_manager.finish_read_prefetched.assert_not_called()
