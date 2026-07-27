@@ -4,7 +4,7 @@
 # Standard
 from dataclasses import dataclass
 from itertools import islice
-from typing import Generator, Sequence
+from typing import Any, Generator, Protocol, Sequence
 import threading
 import time
 
@@ -59,6 +59,22 @@ logger = init_logger(__name__)
 _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
     lmc_ops, "execute_object_group_transfer"
 )
+
+
+class _CXLSharedTier(Protocol):
+    def register_engine(
+        self, instance_id: int, cache_context: Any, model_name: str
+    ) -> None: ...
+
+    def unregister_engine(self, instance_id: int) -> None: ...
+
+    def store(self, request: Any) -> Any: ...
+
+    def contains(self, request: Any) -> bool: ...
+
+    def retrieve(self, request: Any) -> Any: ...
+
+    def close(self) -> None: ...
 
 
 def get_layout_desc(
@@ -634,10 +650,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     Args:
         ctx: The shared engine context.
+        cxl_shared_tier: Optional Gate B direct shared-tier coordinator.
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self,
+        ctx: MPCacheServerContext,
+        cxl_shared_tier: _CXLSharedTier | None = None,
+    ) -> None:
         self._ctx = ctx
+        self._cxl_shared_tier = cxl_shared_tier
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -760,6 +782,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if reaped:
             del e  # a bound name would pin the final entry (see _release_entries)
             reaped.clear()
+            self._unregister_cxl_engines(reaped_ids)
             self._release_entries(entries)
         return reaped_ids
 
@@ -848,9 +871,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._device_host_func_dispatcher.stop()
 
         with self._lock:
-            entries = list(self._cache_contexts.values())
+            registered = list(self._cache_contexts.items())
             self._cache_contexts.clear()
+        entries = [entry for _, entry in registered]
+        self._unregister_cxl_engines([instance_id for instance_id, _ in registered])
         self._release_entries(entries)
+        if self._cxl_shared_tier is not None:
+            self._cxl_shared_tier.close()
 
     def register_kv_cache(
         self,
@@ -913,6 +940,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             model_name, world_size, layout_desc, attn_desc
         )
 
+        try:
+            if self._cxl_shared_tier is not None:
+                self._cxl_shared_tier.register_engine(
+                    instance_id, cache_context, model_name
+                )
+        except Exception:
+            self._ctx.layout_desc_registry.unregister(model_name, world_size)
+            cache_context.close()
+            raise
+
         with self._lock:
             self._cache_contexts[instance_id] = ContextEntry(
                 cache_context=cache_context,
@@ -947,10 +984,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
             return
 
+        self._unregister_cxl_engines([instance_id])
         # No scalar binding: `popped` must stay the only reference so
         # _release_entries' reclaim actually unmaps the IPC segments.
         self._release_entries(popped)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
+
+    def _unregister_cxl_engines(self, instance_ids: list[int]) -> None:
+        if self._cxl_shared_tier is None:
+            return
+        for instance_id in instance_ids:
+            self._cxl_shared_tier.unregister_engine(instance_id)
 
     @_lmcache_nvtx_annotate
     def store(
@@ -1046,6 +1090,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 event_backend.record_event(event, cache_context.stream)
                 return event_backend.export_event(event, cache_context.device), False
 
+            if self._cxl_shared_tier is not None:
+                return self._store_cxl_direct(
+                    key=key,
+                    instance_id=instance_id,
+                    gpu_block_ids=gpu_block_ids,
+                    obj_keys_per_obj_group=obj_keys_per_obj_group,
+                    num_chunks=num_chunks,
+                    cache_context=cache_context,
+                    model_name=model_name,
+                    event_backend=event_backend,
+                    event=event,
+                    event_ipc_handle=event_ipc_handle,
+                )
+
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
                 cache_context, gpu_block_ids
             )
@@ -1062,7 +1120,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 Event(
                     event_type=EventType.MP_STORE_SUBMITTED,
                     session_id=key.request_id,
-                    metadata={"device": str(cache_context.device)},
+                    metadata={
+                        "device": str(cache_context.device),
+                        "path": "dram",
+                    },
                 )
             )
 
@@ -1075,6 +1136,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "device": str(cache_context.device),
                         "engine_id": instance_id,
                         "model_name": model_name,
+                        "path": "dram",
                     },
                 ),
             )
@@ -1146,6 +1208,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             "model_name": model_name,
                             "total_bytes": total_bytes,
                             "num_tokens": num_tokens,
+                            "path": "dram",
                         },
                     ),
                 )
@@ -1160,6 +1223,115 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return (
             event_backend.export_event(event, cache_context.device),
             store_succeeded,
+        )
+
+    def _store_cxl_direct(
+        self,
+        *,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+        obj_keys_per_obj_group: list[list[ObjectKey]],
+        num_chunks: int,
+        cache_context: BaseCacheContext,
+        model_name: str,
+        event_backend: EventIPCBackend,
+        event: Any,
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """Execute one STORE through the configured direct CXL tier.
+
+        Args:
+            key: Original MP request identity.
+            instance_id: Registered engine instance.
+            gpu_block_ids: Raw request-local block IDs by kernel group.
+            obj_keys_per_obj_group: Resolved keys in object-group order.
+            num_chunks: Number of complete chunks in the request.
+            cache_context: Imported engine CUDA context.
+            model_name: Registered model identity.
+            event_backend: IPC event implementation for the engine device.
+            event: Consumer event returned to the worker.
+            event_ipc_handle: Producer event that protects source HBM.
+
+        Returns:
+            Exported completion event and terminal success flag.
+        """
+        # Import lazily to avoid a module cycle: the vLLM adapter reuses pure
+        # block-ID helpers from this module.
+        # First Party
+        from lmcache.v1.multiprocess.cxl.data_plane_adapter import (
+            VLLMTransferRequest,
+        )
+
+        producer_event = event_backend.import_event(
+            event_ipc_handle, cache_context.device
+        )
+        event_backend.wait_event(producer_event, cache_context.stream)
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_STORE_SUBMITTED,
+                session_id=key.request_id,
+                metadata={
+                    "device": str(cache_context.device),
+                    "path": "cxl_direct",
+                },
+            )
+        )
+        self._ctx.event_bus.publish_on_stream(
+            cache_context.cupy_stream,
+            Event(
+                event_type=EventType.MP_STORE_START,
+                session_id=key.request_id,
+                metadata={
+                    "device": str(cache_context.device),
+                    "engine_id": instance_id,
+                    "model_name": model_name,
+                    "path": "cxl_direct",
+                },
+            ),
+        )
+        request = VLLMTransferRequest(
+            op_id=f"{key.request_id}:store:{time.monotonic_ns()}",
+            instance_id=instance_id,
+            model_name=model_name,
+            token_count=self._ctx.chunk_size,
+            object_keys=tuple(
+                object_key
+                for object_group in obj_keys_per_obj_group
+                for object_key in object_group
+            ),
+            block_ids_by_group=tuple(tuple(block_ids) for block_ids in gpu_block_ids),
+        )
+        shared_tier = self._cxl_shared_tier
+        if shared_tier is None:
+            raise RuntimeError("CXL direct STORE is not configured")
+        result = shared_tier.store(request)
+        succeeded = result.status == "ok"
+        if not succeeded:
+            logger.error("CXL direct STORE failed: %s", result.error)
+        event_backend.record_event(event, cache_context.stream)
+        stored_count = (
+            sum(len(keys) for keys in obj_keys_per_obj_group) if succeeded else 0
+        )
+        self._ctx.event_bus.publish_on_stream(
+            cache_context.cupy_stream,
+            Event(
+                event_type=EventType.MP_STORE_END,
+                session_id=key.request_id,
+                metadata={
+                    "stored_count": stored_count,
+                    "device": str(cache_context.device),
+                    "engine_id": instance_id,
+                    "model_name": model_name,
+                    "total_bytes": result.payload_bytes,
+                    "num_tokens": num_chunks * self._ctx.chunk_size if succeeded else 0,
+                    "path": "cxl_direct",
+                },
+            ),
+        )
+        return (
+            event_backend.export_event(event, cache_context.device),
+            succeeded,
         )
 
     @_lmcache_nvtx_annotate
@@ -1211,30 +1383,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         num_chunks = len(obj_keys_per_obj_group[0])
 
-        # CPU-synchronous sentinel: a GPU retrieve is about to be enqueued.
-        # Must be published via publish() (not publish_on_stream) so the
-        # drain thread sees it before MP_REQUEST_END can race MP_RETRIEVE_END.
-        self._ctx.event_bus.publish(
-            Event(
-                event_type=EventType.MP_RETRIEVE_SUBMITTED,
-                session_id=key.request_id,
-                metadata={"device": str(cache_context.device)},
-            )
-        )
-
-        self._ctx.event_bus.publish_on_stream(
-            cache_context.cupy_stream,
-            Event(
-                event_type=EventType.MP_RETRIEVE_START,
-                session_id=key.request_id,
-                metadata={
-                    "device": str(cache_context.device),
-                    "engine_id": instance_id,
-                    "model_name": model_name,
-                },
-            ),
-        )
-
         blocks_per_chunk = [
             cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
             for group_idx in range(
@@ -1269,6 +1417,66 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 )
                 event_backend.record_event(event, cache_context.stream)
                 return event_backend.export_event(event, cache_context.device), False
+
+            if self._cxl_shared_tier is not None:
+                # First Party
+                from lmcache.v1.multiprocess.cxl.data_plane_adapter import (
+                    VLLMTransferRequest,
+                )
+
+                request = VLLMTransferRequest(
+                    op_id=f"{key.request_id}:retrieve:{time.monotonic_ns()}",
+                    instance_id=instance_id,
+                    model_name=model_name,
+                    token_count=self._ctx.chunk_size,
+                    object_keys=tuple(
+                        object_key
+                        for object_group in obj_keys_per_obj_group
+                        for object_key in object_group
+                    ),
+                    block_ids_by_group=tuple(
+                        tuple(block_ids) for block_ids in gpu_block_ids
+                    ),
+                    skip_first_n_tokens=skip_first_n_tokens,
+                )
+                if self._cxl_shared_tier.contains(request):
+                    return self._retrieve_cxl_direct(
+                        key=key,
+                        instance_id=instance_id,
+                        request=request,
+                        num_chunks=num_chunks,
+                        num_object_groups=num_object_groups,
+                        cache_context=cache_context,
+                        model_name=model_name,
+                        event_backend=event_backend,
+                        event=event,
+                        event_ipc_handle=event_ipc_handle,
+                    )
+
+            # CPU-synchronous sentinel: a DRAM retrieve is about to be enqueued.
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.MP_RETRIEVE_SUBMITTED,
+                    session_id=key.request_id,
+                    metadata={
+                        "device": str(cache_context.device),
+                        "path": "dram",
+                    },
+                )
+            )
+            self._ctx.event_bus.publish_on_stream(
+                cache_context.cupy_stream,
+                Event(
+                    event_type=EventType.MP_RETRIEVE_START,
+                    session_id=key.request_id,
+                    metadata={
+                        "device": str(cache_context.device),
+                        "engine_id": instance_id,
+                        "model_name": model_name,
+                        "path": "dram",
+                    },
+                ),
+            )
 
             # Cut and stage all block_ids to GPU once before the transfer
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
@@ -1337,6 +1545,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             "cache_salt": key.cache_salt,
                             "total_bytes": total_bytes,
                             "num_tokens": num_tokens,
+                            "path": "dram",
                         },
                     ),
                 )
@@ -1352,4 +1561,93 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return (
             event_backend.export_event(event, cache_context.device),
             retrieve_succeeded,
+        )
+
+    def _retrieve_cxl_direct(
+        self,
+        *,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        request: Any,
+        num_chunks: int,
+        num_object_groups: int,
+        cache_context: BaseCacheContext,
+        model_name: str,
+        event_backend: EventIPCBackend,
+        event: Any,
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """Execute one bound RETRIEVE through the direct CXL tier.
+
+        Args:
+            key: Original MP request identity.
+            instance_id: Registered engine instance.
+            request: Versioned CXL transfer request.
+            num_chunks: Number of complete chunks requested.
+            num_object_groups: Object groups represented per chunk.
+            cache_context: Imported engine CUDA context.
+            model_name: Registered model identity.
+            event_backend: IPC event implementation for the engine device.
+            event: Consumer event returned to the worker.
+            event_ipc_handle: Producer event protecting destination HBM use.
+
+        Returns:
+            Exported completion event and terminal success flag.
+        """
+        producer_event = event_backend.import_event(
+            event_ipc_handle, cache_context.device
+        )
+        event_backend.wait_event(producer_event, cache_context.stream)
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_RETRIEVE_SUBMITTED,
+                session_id=key.request_id,
+                metadata={
+                    "device": str(cache_context.device),
+                    "path": "cxl_direct",
+                },
+            )
+        )
+        self._ctx.event_bus.publish_on_stream(
+            cache_context.cupy_stream,
+            Event(
+                event_type=EventType.MP_RETRIEVE_START,
+                session_id=key.request_id,
+                metadata={
+                    "device": str(cache_context.device),
+                    "engine_id": instance_id,
+                    "model_name": model_name,
+                    "path": "cxl_direct",
+                },
+            ),
+        )
+        shared_tier = self._cxl_shared_tier
+        if shared_tier is None:
+            raise RuntimeError("CXL direct RETRIEVE is not configured")
+        result = shared_tier.retrieve(request)
+        succeeded = result.status == "ok"
+        if not succeeded:
+            logger.error("CXL direct RETRIEVE failed: %s", result.error)
+        event_backend.record_event(event, cache_context.stream)
+        retrieved_count = num_chunks * num_object_groups if succeeded else 0
+        self._ctx.event_bus.publish_on_stream(
+            cache_context.cupy_stream,
+            Event(
+                event_type=EventType.MP_RETRIEVE_END,
+                session_id=key.request_id,
+                metadata={
+                    "retrieved_count": retrieved_count,
+                    "device": str(cache_context.device),
+                    "engine_id": instance_id,
+                    "model_name": model_name,
+                    "cache_salt": key.cache_salt,
+                    "total_bytes": result.payload_bytes,
+                    "num_tokens": num_chunks * self._ctx.chunk_size if succeeded else 0,
+                    "path": "cxl_direct",
+                },
+            ),
+        )
+        return (
+            event_backend.export_event(event, cache_context.device),
+            succeeded,
         )

@@ -13,6 +13,57 @@ import os
 import uuid
 
 
+@dataclass(frozen=True)
+class CXLSharedTierConfig:
+    """Opt-in configuration for the GPU-visible CXL proxy tier."""
+
+    enabled: bool = False
+    """Whether the CXL shared tier is enabled."""
+
+    provider: str = "posix_shm"
+    """Backing region provider. Gate B supports only ``posix_shm``."""
+
+    shm_name: str | None = None
+    """POSIX shared-memory name containing a valid Beluga region header."""
+
+    capacity_bytes: int | None = None
+    """Expected payload capacity declared by the region header."""
+
+    alignment_bytes: int = 4096
+    """Required power-of-two extent alignment."""
+
+    layout_id: str = "packed_kv_v1"
+    """Packed layout ABI accepted by the shared tier."""
+
+    def __post_init__(self) -> None:
+        """Validate a complete enabled configuration.
+
+        Raises:
+            ValueError: If an enabled configuration is incomplete or uses an
+                unsupported provider, layout, capacity, or alignment.
+        """
+        if not self.enabled:
+            return
+        if self.provider != "posix_shm":
+            raise ValueError("cxl_shared_tier.provider must be 'posix_shm'")
+        if (
+            self.shm_name is None
+            or not self.shm_name.startswith("/")
+            or ("/" in self.shm_name[1:])
+        ):
+            raise ValueError(
+                "cxl_shared_tier.shm_name must be a POSIX shared-memory name"
+            )
+        if self.capacity_bytes is None or self.capacity_bytes <= 0:
+            raise ValueError("cxl_shared_tier.capacity_bytes must be positive")
+        if self.alignment_bytes <= 0 or self.alignment_bytes & (
+            self.alignment_bytes - 1
+        ):
+            raise ValueError("cxl_shared_tier.alignment_bytes must be a power of two")
+        if self.layout_id != "packed_kv_v1":
+            raise ValueError("cxl_shared_tier.layout_id must be 'packed_kv_v1'")
+
+
 @dataclass
 class MPServerConfig:
     """Configuration for the ZMQ-based multiprocess cache server."""
@@ -60,6 +111,9 @@ class MPServerConfig:
     """Transfer mode: 'lmcache_driven' for server-driven transfer
     (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), 'engine_driven' for
     engine-driven transfer (PREPARE/COMMIT), or 'auto' to enable both."""
+
+    cxl_shared_tier: CXLSharedTierConfig = field(default_factory=CXLSharedTierConfig)
+    """Optional GPU-visible CXL proxy tier configuration."""
 
     runtime_plugin_config: "RuntimePluginConfig" = field(
         default_factory=lambda: RuntimePluginConfig()
@@ -115,6 +169,13 @@ class MPServerConfig:
             raise ValueError(
                 "worker registration grace must be >= the worker reap timeout "
                 f"({reap}s); got {grace}"
+            )
+        if (
+            self.cxl_shared_tier.enabled
+            and self.supported_transfer_mode == "engine_driven"
+        ):
+            raise ValueError(
+                "cxl_shared_tier requires lmcache_driven or auto transfer mode"
             )
 
 
@@ -311,6 +372,42 @@ def add_mp_server_args(
         "or 'auto' to enable both transfer paths. Default is 'auto'.",
     )
     mp_group.add_argument(
+        "--cxl-shared-tier-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the GPU-visible CXL proxy shared tier. Default is false.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-provider",
+        type=str,
+        default="posix_shm",
+        help="CXL shared-tier provider. Gate B supports posix_shm.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-shm-name",
+        type=str,
+        default=None,
+        help="POSIX SHM name containing the pre-created CXL proxy region.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-capacity-bytes",
+        type=int,
+        default=None,
+        help="Expected CXL proxy payload capacity in bytes.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-alignment-bytes",
+        type=int,
+        default=4096,
+        help="Power-of-two CXL extent alignment. Default is 4096.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-layout-id",
+        type=str,
+        default="packed_kv_v1",
+        help="Packed CXL layout ABI. Gate B requires packed_kv_v1.",
+    )
+    mp_group.add_argument(
         "--runtime-plugin-locations",
         type=str,
         nargs="*",
@@ -409,6 +506,14 @@ def parse_args_to_mp_server_config(
         separate_object_groups=args.separate_object_groups,
         enable_segmented_prefix=args.enable_segmented_prefix,
         supported_transfer_mode=args.supported_transfer_mode,
+        cxl_shared_tier=CXLSharedTierConfig(
+            enabled=args.cxl_shared_tier_enabled,
+            provider=args.cxl_shared_tier_provider,
+            shm_name=args.cxl_shared_tier_shm_name,
+            capacity_bytes=args.cxl_shared_tier_capacity_bytes,
+            alignment_bytes=args.cxl_shared_tier_alignment_bytes,
+            layout_id=args.cxl_shared_tier_layout_id,
+        ),
         runtime_plugin_config=RuntimePluginConfig(
             locations=(args.runtime_plugin_locations or []),
             extra_config=plugin_extra,

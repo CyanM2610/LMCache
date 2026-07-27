@@ -49,6 +49,26 @@ class _FakeDeviceHostFuncDispatcher:
         """Stop no background thread."""
 
 
+class _RecordingSharedTier:
+    """Record the public engine-registration lifecycle at the CXL boundary."""
+
+    def __init__(self) -> None:
+        self.registered: list[tuple[int, object, str]] = []
+        self.unregistered: list[int] = []
+        self.closed = False
+
+    def register_engine(
+        self, instance_id: int, cache_context: object, model_name: str
+    ) -> None:
+        self.registered.append((instance_id, cache_context, model_name))
+
+    def unregister_engine(self, instance_id: int) -> None:
+        self.unregistered.append(instance_id)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 @pytest.fixture
 def stub_native_storage_ops() -> Any:
     """Stub native modules so MP server imports work in source-only test runs."""
@@ -141,6 +161,62 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
 
     module.unregister_kv_cache(2)
     assert ctx.layout_desc_registry.find("shared-model", 1) is None
+
+
+def test_gpu_registration_lifecycle_is_delegated_to_enabled_shared_tier(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_native_storage_ops: Any,
+) -> None:
+    """CXL registration must follow the imported GPU context lifetime."""
+    # First Party
+    from lmcache.utils import EngineType
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
+    from lmcache.v1.multiprocess.modules import (
+        lmcache_driven_transfer as lmcache_driven_transfer_mod,
+    )
+
+    ctx = MagicMock()
+    ctx.chunk_size = 16
+    ctx.layout_desc_registry = LayoutDescRegistry()
+    gpu_context = _FakeGPUContext()
+    shared_tier = _RecordingSharedTier()
+
+    monkeypatch.setattr(
+        lmcache_driven_transfer_mod,
+        "DeviceHostFuncDispatcher",
+        _FakeDeviceHostFuncDispatcher,
+    )
+    monkeypatch.setattr(
+        lmcache_driven_transfer_mod,
+        "create_cache_context",
+        lambda *args, **kwargs: gpu_context,
+    )
+    monkeypatch.setattr(
+        lmcache_driven_transfer_mod,
+        "get_layout_desc",
+        lambda *args, **kwargs: MemoryLayoutDesc(
+            shapes=[torch.Size([2, 16, 32])], dtypes=[torch.float32]
+        ),
+    )
+    monkeypatch.setattr(
+        lmcache_driven_transfer_mod.torch_dev,
+        "empty_cache",
+        lambda: None,
+        raising=False,
+    )
+
+    module = lmcache_driven_transfer_mod.LMCacheDrivenTransferModule(
+        ctx, cxl_shared_tier=shared_tier
+    )
+    module.register_kv_cache(7, [], "shared-model", 1, EngineType.VLLM, {}, [])
+    assert shared_tier.registered == [(7, gpu_context, "shared-model")]
+
+    module.unregister_kv_cache(7)
+    assert shared_tier.unregistered == [7]
+
+    module.close()
+    assert shared_tier.closed is True
 
 
 def _layout() -> Any:

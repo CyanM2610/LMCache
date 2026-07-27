@@ -15,6 +15,7 @@ import pytest
 
 # First Party
 from lmcache.v1.multiprocess.config import (
+    CXLSharedTierConfig,
     CoordinatorConfig,
     MPServerConfig,
     add_coordinator_args,
@@ -127,3 +128,85 @@ def test_instance_id_defaults_are_distinct():
 def test_instance_id_dataclass_default_is_distinct():
     # Direct construction (no CLI) also mints a fresh id per instance.
     assert MPServerConfig().instance_id != MPServerConfig().instance_id
+
+
+def test_cxl_shared_tier_is_disabled_without_configuration():
+    config = _parse_mp([])
+
+    assert config.cxl_shared_tier == CXLSharedTierConfig()
+    assert config.cxl_shared_tier.enabled is False
+
+
+def test_cxl_shared_tier_parses_complete_opt_in_configuration():
+    config = _parse_mp(
+        [
+            "--cxl-shared-tier-enabled",
+            "--cxl-shared-tier-provider",
+            "posix_shm",
+            "--cxl-shared-tier-shm-name",
+            "/beluga-cxl",
+            "--cxl-shared-tier-capacity-bytes",
+            "1048576",
+            "--cxl-shared-tier-alignment-bytes",
+            "4096",
+            "--cxl-shared-tier-layout-id",
+            "packed_kv_v1",
+        ]
+    )
+
+    assert config.cxl_shared_tier == CXLSharedTierConfig(
+        enabled=True,
+        provider="posix_shm",
+        shm_name="/beluga-cxl",
+        capacity_bytes=1048576,
+        alignment_bytes=4096,
+        layout_id="packed_kv_v1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--cxl-shared-tier-enabled"], "shm_name"),
+        (
+            [
+                "--cxl-shared-tier-enabled",
+                "--cxl-shared-tier-shm-name",
+                "/beluga-cxl",
+            ],
+            "capacity_bytes",
+        ),
+        (
+            [
+                "--cxl-shared-tier-enabled",
+                "--cxl-shared-tier-shm-name",
+                "/beluga-cxl",
+                "--cxl-shared-tier-capacity-bytes",
+                "1048576",
+                "--cxl-shared-tier-alignment-bytes",
+                "3000",
+            ],
+            "alignment_bytes",
+        ),
+    ],
+)
+def test_cxl_shared_tier_rejects_incomplete_or_invalid_opt_in(
+    args: list[str], message: str
+):
+    with pytest.raises(ValueError, match=message):
+        _parse_mp(args)
+
+
+def test_cxl_shared_tier_requires_lmcache_driven_transfer_mode():
+    with pytest.raises(ValueError, match="lmcache_driven"):
+        _parse_mp(
+            [
+                "--supported-transfer-mode",
+                "engine_driven",
+                "--cxl-shared-tier-enabled",
+                "--cxl-shared-tier-shm-name",
+                "/beluga-cxl",
+                "--cxl-shared-tier-capacity-bytes",
+                "1048576",
+            ]
+        )

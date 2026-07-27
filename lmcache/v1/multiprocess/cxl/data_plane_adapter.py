@@ -5,8 +5,13 @@
 from __future__ import annotations
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import reduce
+from operator import mul
 from typing import Any, Protocol
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -182,6 +187,97 @@ class VLLMDataPlaneAdapter:
         )
         if layout_fingerprint(consumer) != layout_fingerprint(layout):
             raise ValueError("cache context is incompatible with packed layout")
+
+    def split_chunks(
+        self, request: VLLMTransferRequest
+    ) -> tuple[VLLMTransferRequest, ...]:
+        """Split a request into independently publishable packed chunks.
+
+        Args:
+            request: Complete chunk-aligned transfer request.
+
+        Returns:
+            Requests ordered by chunk, each carrying one object from every
+            object group and the matching block IDs from every kernel group.
+
+        Raises:
+            ValueError: If object groups or block IDs do not form complete,
+                equally sized chunks.
+        """
+        manager = self._cache_context.kv_layer_groups_manager
+        keys_by_group: list[list[ObjectKey]] = [[] for _ in manager.object_groups]
+        for object_key in request.object_keys:
+            group_id = object_key.object_group_id
+            if group_id < 0 or group_id >= len(keys_by_group):
+                raise ValueError("ObjectKey references an unknown object group")
+            keys_by_group[group_id].append(object_key)
+        chunk_counts = {len(keys) for keys in keys_by_group}
+        if len(chunk_counts) != 1 or not chunk_counts or 0 in chunk_counts:
+            raise ValueError("every object group must contain the same chunks")
+        num_chunks = next(iter(chunk_counts))
+
+        block_slices: list[list[tuple[int, ...]]] = []
+        if len(request.block_ids_by_group) != manager.num_kernel_groups:
+            raise ValueError("block ID group count does not match cache context")
+        for kernel_group_id, block_ids in enumerate(request.block_ids_by_group):
+            blocks_per_chunk = self._cache_context.calculate_num_blocks(
+                request.token_count, kernel_group_id
+            )
+            if len(block_ids) != num_chunks * blocks_per_chunk:
+                raise ValueError("block IDs do not exactly cover packed chunks")
+            block_slices.append(
+                [
+                    tuple(
+                        block_ids[
+                            chunk_id * blocks_per_chunk : (chunk_id + 1)
+                            * blocks_per_chunk
+                        ]
+                    )
+                    for chunk_id in range(num_chunks)
+                ]
+            )
+
+        return tuple(
+            replace(
+                request,
+                op_id=f"{request.op_id}:chunk:{chunk_id}",
+                object_keys=tuple(group_keys[chunk_id] for group_keys in keys_by_group),
+                block_ids_by_group=tuple(
+                    group_slices[chunk_id] for group_slices in block_slices
+                ),
+                skip_first_n_tokens=0,
+            )
+            for chunk_id in range(num_chunks)
+        )
+
+    def packed_size_bytes(self, request: VLLMTransferRequest) -> int:
+        """Return the exact packed extent bytes for a transfer request.
+
+        Args:
+            request: Request whose ObjectKeys declare packed object groups.
+
+        Returns:
+            Sum of all kernel-group payload bytes in declared object order.
+
+        Raises:
+            ValueError: If an ObjectKey references an unknown object group.
+        """
+        manager = self._cache_context.kv_layer_groups_manager
+        total = 0
+        for object_key in request.object_keys:
+            group_id = object_key.object_group_id
+            if group_id < 0 or group_id >= len(manager.object_groups):
+                raise ValueError("ObjectKey references an unknown object group")
+            object_group = manager.object_groups[group_id]
+            for kernel_group_id in object_group.kernel_group_indices:
+                shape, dtype = self._cache_context.get_kernel_group_shape_dtype(
+                    request.token_count, kernel_group_id
+                )
+                elements = reduce(mul, (int(dimension) for dimension in shape), 1)
+                total += elements * torch.empty((), dtype=dtype).element_size()
+        if total <= 0:
+            raise ValueError("packed request has no payload bytes")
+        return total
 
     def build_store_plan(
         self, request: VLLMTransferRequest, extent: ExtentDescriptor

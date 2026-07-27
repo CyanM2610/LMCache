@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -48,9 +49,9 @@ class _CacheContext:
 
     def get_kernel_group_shape_dtype(
         self, num_tokens: int, kernel_group_idx: int
-    ) -> tuple[tuple[int, ...], str]:
+    ) -> tuple[tuple[int, ...], torch.dtype]:
         layers = 28 if kernel_group_idx == 0 else 4
-        return (2, layers, num_tokens, 128), "torch.bfloat16"
+        return (2, layers, num_tokens, 128), torch.bfloat16
 
     def get_engine_kv_format(self, kernel_group_idx: int) -> _Format:
         return (_Format.FIRST, _Format.SECOND)[kernel_group_idx]
@@ -103,6 +104,37 @@ def test_store_plan_preserves_object_and_block_order() -> None:
     assert plan.instance_id == 7
     assert plan.object_keys == _keys()
     assert plan.block_ids_by_group == ((9, 3, 7, 1), (22, 19, 5, 8))
+
+
+def test_split_chunks_preserves_object_groups_and_exact_packed_size() -> None:
+    adapter = VLLMDataPlaneAdapter(_CacheContext())
+    first_chunk = _keys()
+    second_chunk = (
+        ObjectKey(b"first-2", "Qwen2.5-7B-Instruct", 0, object_group_id=0),
+        ObjectKey(b"second-2", "Qwen2.5-7B-Instruct", 0, object_group_id=1),
+    )
+    request = _request(
+        object_keys=(
+            first_chunk[0],
+            second_chunk[0],
+            first_chunk[1],
+            second_chunk[1],
+        ),
+        block_ids_by_group=(
+            (9, 3, 7, 1, 6, 4, 2, 0),
+            (22, 19, 5, 8, 17, 13, 11, 10),
+        ),
+    )
+
+    chunks = adapter.split_chunks(request)
+
+    assert [chunk.object_keys for chunk in chunks] == [first_chunk, second_chunk]
+    assert chunks[0].block_ids_by_group == ((9, 3, 7, 1), (22, 19, 5, 8))
+    assert chunks[1].block_ids_by_group == ((6, 4, 2, 0), (17, 13, 11, 10))
+    assert [adapter.packed_size_bytes(chunk) for chunk in chunks] == [
+        1_048_576,
+        1_048_576,
+    ]
 
 
 def test_retrieve_plan_applies_prefix_skip_per_kernel_group() -> None:

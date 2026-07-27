@@ -44,6 +44,7 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ThreadPoolType,
 )
+from lmcache.v1.multiprocess.modules.cxl_shared_tier import CXLSharedTierModule
 from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
     EngineDrivenTransferModule,
 )
@@ -195,12 +196,21 @@ def _build_modules(
     # be constructed with them as liveness targets / reap listeners. They are
     # the InstanceLivenessTargets the reaper scans.
     transfer_modules: list[EngineModule] = []
+    cxl_shared_tier = (
+        CXLSharedTierModule.open(mp_config.cxl_shared_tier)
+        if mp_config.cxl_shared_tier.enabled
+        else None
+    )
     if mp_config.supported_transfer_mode == "lmcache_driven":
-        transfer_modules.append(LMCacheDrivenTransferModule(ctx))
+        transfer_modules.append(
+            LMCacheDrivenTransferModule(ctx, cxl_shared_tier=cxl_shared_tier)
+        )
     elif mp_config.supported_transfer_mode == "engine_driven":
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "auto":
-        transfer_modules.append(LMCacheDrivenTransferModule(ctx))
+        transfer_modules.append(
+            LMCacheDrivenTransferModule(ctx, cxl_shared_tier=cxl_shared_tier)
+        )
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     else:
         raise ValueError(
@@ -366,7 +376,7 @@ def run_cache_server(
     InitializeMPUsageContext(mp_config, storage_manager_config)
     InitializeMPContinuousUsage(event_bus, mp_config.chunk_size)
 
-    zmq_context = zmq.Context.instance()
+    zmq_context: zmq.Context = zmq.Context.instance()
     server = MessageQueueServer(
         bind_url=f"tcp://{mp_config.host}:{mp_config.port}",
         context=zmq_context,
