@@ -10,6 +10,8 @@
 #include "utils.h"
 #include "event_recorder.h"
 #include "completion_recorder.h"
+#include "cxl_region_kernels.cuh"
+#include "cxl_region_ops.h"
 #include <torch/torch.h>
 #include <torch/extension.h>
 #include <iostream>
@@ -102,6 +104,26 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),
         py::arg("block_ids"), py::arg("device"), py::arg("direction"),
         py::arg("shape_desc"), py::arg("lmcache_chunk_size"),
+        py::arg("engine_kv_format"), py::arg("skip_prefix_n_blocks"),
+        py::call_guard<py::gil_scoped_release>());
+  py::class_<CudaRegionRegistration>(m, "CudaRegionRegistration")
+      .def(py::init<const std::string&, size_t>(), py::arg("shm_name"),
+           py::arg("expected_capacity"))
+      .def_property_readonly("capacity", &CudaRegionRegistration::capacity)
+      .def("device_address", &CudaRegionRegistration::device_address,
+           py::arg("offset"), py::arg("length"))
+      .def("copy_from_device", &CudaRegionRegistration::copy_from_device,
+           py::arg("source"), py::arg("offset"), py::arg("length"),
+           py::arg("stream_ptr"), py::call_guard<py::gil_scoped_release>())
+      .def("copy_to_device", &CudaRegionRegistration::copy_to_device,
+           py::arg("destination"), py::arg("offset"), py::arg("length"),
+           py::arg("stream_ptr"), py::call_guard<py::gil_scoped_release>())
+      .def("close", &CudaRegionRegistration::close,
+           py::call_guard<py::gil_scoped_release>());
+  m.def("cxl_region_block_kv_transfer", &cxl_region_block_kv_transfer,
+        py::arg("paged_buffer_ptrs_tensor"), py::arg("region_object_ptrs"),
+        py::arg("block_ids"), py::arg("device"), py::arg("shape_desc"),
+        py::arg("direction"), py::arg("lmcache_chunk_size"),
         py::arg("engine_kv_format"), py::arg("skip_prefix_n_blocks"),
         py::call_guard<py::gil_scoped_release>());
   py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc")

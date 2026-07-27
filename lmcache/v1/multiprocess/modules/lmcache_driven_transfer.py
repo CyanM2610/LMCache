@@ -131,29 +131,80 @@ def batched_iteration_with_skip(
         batch_start_idx += len(batch)
 
 
-def downsample_and_stage_block_ids(
+def downsample_block_ids(
     cache_context: BaseCacheContext,
     block_ids: list[list[int]],
-) -> list[torch.Tensor]:
-    """Cut the block id lists to skip the unneeded blocks in a chunk and
-    stage it into GPU tensors for later use.
+) -> list[list[int]]:
+    """Drop per-chunk blocks outside each kernel group's attention window.
 
-    This mainly targets the case where a portion of the blocks are not
-    needed for every chunk, such as deepseek v4's swa cache.
-
-    Note that the we do NOT do any object-level skipping here.
+    This pure planning helper does not apply object-level skipping and does not
+    stage GPU tensors.
 
     Args:
         cache_context: The cache context containing the KV cache information.
         block_ids: The original block id lists, indexed by LMCache KV group index.
 
     Returns:
-        The cut block id lists, indexed by LMCache KV group index.
+        New cut block ID lists, indexed by LMCache KV group index.
+
+    Raises:
+        ValueError: If a block list does not contain complete chunks.
 
     Note:
-        This function has some coupled logic with transfer_kv_per_object_group below.
-        The caller need to make sure that the block ids seen by
-        transfer_kv_per_object_group are produced by this function.
+        This function has coupled logic with ``transfer_kv_per_object_group``.
+        Callers must pass its output to the matching transfer planner.
+    """
+    result = [list(group) for group in block_ids]
+    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
+    for kernel_group_id in range(num_kernel_groups):
+        subchunk_sw_size_tokens = (
+            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
+                kernel_group_id
+            )
+        )
+        tokens_per_chunk = min(
+            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
+        )
+        keep_blocks_per_chunk = cache_context.calculate_num_blocks(
+            tokens_per_chunk, kernel_group_id
+        )
+        total_blocks_per_chunk = cache_context.calculate_num_blocks(
+            cache_context.lmcache_tokens_per_chunk, kernel_group_id
+        )
+        old_block_ids = result[kernel_group_id]
+        if len(old_block_ids) % total_blocks_per_chunk != 0:
+            raise ValueError(
+                f"len(block_ids[{kernel_group_id}]) must be a multiple of "
+                f"total_blocks_per_chunk ({total_blocks_per_chunk}), got "
+                f"{len(old_block_ids)}"
+            )
+
+        new_block_ids = []
+        for i in range(0, len(old_block_ids), total_blocks_per_chunk):
+            chunk_block_ids = old_block_ids[i : i + total_blocks_per_chunk]
+            new_block_ids.extend(chunk_block_ids[-keep_blocks_per_chunk:])
+        result[kernel_group_id] = new_block_ids
+    return result
+
+
+def downsample_and_stage_block_ids(
+    cache_context: BaseCacheContext,
+    block_ids: list[list[int]],
+) -> list[torch.Tensor]:
+    """Downsample block IDs and stage them into GPU tensors.
+
+    Args:
+        cache_context: The cache context containing KV-cache information.
+        block_ids: Raw block IDs indexed by LMCache kernel group.
+
+    Returns:
+        Downsampled GPU block-ID tensors indexed by kernel group.
+
+    Raises:
+        ValueError: If a block list does not contain complete chunks.
+
+    Note:
+        Object-level skipping remains the transfer planner's responsibility.
 
     Example:
         If a model have 2 kernel groups, one is full attention with block size 32,
@@ -172,43 +223,10 @@ def downsample_and_stage_block_ids(
           [13, 14, 17, 18], # swa attention group only needs the last 2 block per chunk
         ]
     """
-    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
-    for kernel_group_id in range(num_kernel_groups):
-        subchunk_sw_size_tokens = (
-            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
-                kernel_group_id
-            )
-        )
-        tokens_per_chunk = min(
-            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
-        )
-        keep_blocks_per_chunk = cache_context.calculate_num_blocks(
-            tokens_per_chunk, kernel_group_id
-        )
-        total_blocks_per_chunk = cache_context.calculate_num_blocks(
-            cache_context.lmcache_tokens_per_chunk, kernel_group_id
-        )
-
-        new_block_ids = []
-        old_block_ids = block_ids[kernel_group_id]
-        assert len(old_block_ids) % total_blocks_per_chunk == 0, (
-            f"len(block_ids[{kernel_group_id}]) should be a multiple "
-            f"of total_blocks_per_chunk ({total_blocks_per_chunk}), but got "
-            f"{len(old_block_ids)}"
-        )
-
-        for i in range(0, len(old_block_ids), total_blocks_per_chunk):
-            chunk_block_ids = old_block_ids[i : i + total_blocks_per_chunk]
-            new_block_ids.extend(chunk_block_ids[-keep_blocks_per_chunk:])
-
-        block_ids[kernel_group_id] = new_block_ids
-
-    # Stage the cut block ids into GPU tensors
-    block_ids_gpu = cache_context.stage_block_ids(block_ids)
-    return block_ids_gpu
+    return cache_context.stage_block_ids(downsample_block_ids(cache_context, block_ids))
 
 
-def _recalculate_blocks_to_skip(
+def recalculate_blocks_to_skip(
     blocks_per_chunk: int,
     blocks_per_window: int,
     blocks_to_skip: int,
@@ -379,7 +397,7 @@ def _run_object_group_transfer_plan(
             orig_skip_blocks = cache_context.calculate_num_blocks(
                 skip_tokens_in_chunk, kernel_group_id
             )
-            recalculated_skip_blocks = _recalculate_blocks_to_skip(
+            recalculated_skip_blocks = recalculate_blocks_to_skip(
                 blocks_per_chunk,
                 blocks_per_window,
                 orig_skip_blocks,
@@ -534,7 +552,7 @@ def transfer_kv_per_object_group(
             orig_skip_blocks = cache_context.calculate_num_blocks(
                 skip_tokens_in_chunk, kernel_group_id
             )
-            recalculated_skip_blocks = _recalculate_blocks_to_skip(
+            recalculated_skip_blocks = recalculate_blocks_to_skip(
                 blocks_per_chunk,
                 blocks_per_window,
                 orig_skip_blocks,

@@ -51,6 +51,8 @@ class CudaProfile(BuildProfile):
             "csrc/pybind.cpp",
             "csrc/mem_kernels.cu",
             "csrc/mp_mem_kernels.cu",
+            "csrc/cxl_region_kernels.cu",
+            "csrc/cxl_region_ops.cpp",
             "csrc/cal_cdf.cu",
             "csrc/ac_enc.cu",
             "csrc/ac_dec.cu",
