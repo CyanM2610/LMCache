@@ -876,8 +876,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         entries = [entry for _, entry in registered]
         self._unregister_cxl_engines([instance_id for instance_id, _ in registered])
         self._release_entries(entries)
-        if self._cxl_shared_tier is not None:
-            self._cxl_shared_tier.close()
+        shared_tier = getattr(self, "_cxl_shared_tier", None)
+        if shared_tier is not None:
+            shared_tier.close()
 
     def register_kv_cache(
         self,
@@ -941,10 +942,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
 
         try:
-            if self._cxl_shared_tier is not None:
-                self._cxl_shared_tier.register_engine(
-                    instance_id, cache_context, model_name
-                )
+            shared_tier = getattr(self, "_cxl_shared_tier", None)
+            if shared_tier is not None:
+                shared_tier.register_engine(instance_id, cache_context, model_name)
         except Exception:
             self._ctx.layout_desc_registry.unregister(model_name, world_size)
             cache_context.close()
@@ -991,10 +991,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     def _unregister_cxl_engines(self, instance_ids: list[int]) -> None:
-        if self._cxl_shared_tier is None:
+        shared_tier = getattr(self, "_cxl_shared_tier", None)
+        if shared_tier is None:
             return
         for instance_id in instance_ids:
-            self._cxl_shared_tier.unregister_engine(instance_id)
+            shared_tier.unregister_engine(instance_id)
 
     @_lmcache_nvtx_annotate
     def store(
@@ -1438,6 +1439,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         tuple(block_ids) for block_ids in gpu_block_ids
                     ),
                     skip_first_n_tokens=skip_first_n_tokens,
+                    external_request_id=key.request_id,
                 )
                 if self._cxl_shared_tier.contains(request):
                     return self._retrieve_cxl_direct(

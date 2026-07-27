@@ -25,6 +25,10 @@ from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.cxl.policy_protocol import (
+    GateELookupResponse,
+    GateERequestEnvelope,
+)
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
 
@@ -74,6 +78,7 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "POLICY_LOOKUP",
 ]
 
 # Type alias for cache keys
@@ -159,6 +164,13 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "LOOKUP": ProtocolDefinition(
             payload_classes=[KeyType, int],
             response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Versioned Gate E lookup is a distinct operation so legacy LOOKUP
+        # clients cannot silently misparse ticket-bearing responses.
+        "POLICY_LOOKUP": ProtocolDefinition(
+            payload_classes=[KeyType, int, GateERequestEnvelope],
+            response_class=GateELookupResponse,
             handler_type=HandlerType.BLOCKING,
         ),
         # Query the status of a prefetch job by request_id

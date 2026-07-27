@@ -90,6 +90,10 @@ class RequestType(enum.Enum):
     P2P_QUERY_LOOKUP_RESULTS = enum.auto()
     P2P_UNLOCK_OBJECTS = enum.auto()
 
+    # Versioned Gate E policy operations. Kept at the end to preserve numeric
+    # values of every existing request type.
+    POLICY_LOOKUP = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

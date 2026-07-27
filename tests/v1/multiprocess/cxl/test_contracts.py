@@ -46,7 +46,7 @@ def _object_key() -> ObjectKey:
         ("offset", -1),
         ("length", 0),
         ("generation", 0),
-        ("tier", "dram"),
+        ("tier", "ssd"),
         ("layout_id", ""),
         ("layout_fingerprint", "A" * 64),
         ("layout_fingerprint", "a" * 63),

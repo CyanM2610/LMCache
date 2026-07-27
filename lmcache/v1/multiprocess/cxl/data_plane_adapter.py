@@ -42,6 +42,7 @@ class VLLMTransferRequest:
     block_ids_by_group: tuple[tuple[int, ...], ...]
     skip_first_n_tokens: int = 0
     payload_checksum_expected: str | None = None
+    external_request_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.op_id or not self.model_name:
@@ -54,6 +55,8 @@ class VLLMTransferRequest:
             raise ValueError("block ID groups must not be empty")
         if self.skip_first_n_tokens < 0:
             raise ValueError("skip_first_n_tokens must be non-negative")
+        if self.external_request_id == "":
+            raise ValueError("external_request_id must be non-empty when supplied")
 
 
 class DataPlaneAdapter(Protocol):

@@ -28,6 +28,10 @@ from lmcache.v1.multiprocess.group_view import (
     expand_engine_block_ids,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
+from lmcache.v1.multiprocess.cxl.policy_protocol import (
+    GateELookupResponse,
+    GateERequestEnvelope,
+)
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
@@ -777,6 +781,124 @@ class LMCacheMPSchedulerAdapter:
 
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt)
+
+    @_lmcache_nvtx_annotate
+    def policy_lookup(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        envelope: GateERequestEnvelope,
+        cache_salt: str = "",
+    ) -> GateELookupResponse:
+        """Run a versioned, ticket-bound policy lookup on every MP server.
+
+        Any timeout, non-fetch response, or cross-server disagreement releases
+        all tickets and returns an explicit zero-match result.
+        """
+        self._ensure_heartbeat_started()
+        if envelope.request_id != request_id:
+            raise ValueError("policy envelope request_id does not match request")
+        if not self.is_healthy:
+            return GateELookupResponse.recompute("MP server is unhealthy")
+
+        aligned_end = (
+            len(token_ids) // self.lmcache_tokens_per_chunk
+        ) * self.lmcache_tokens_per_chunk
+        if aligned_end == 0:
+            return GateELookupResponse.recompute("no complete LMCache chunk")
+        key = self._create_key(
+            token_ids,
+            start=0,
+            end=aligned_end,
+            request_id=request_id,
+            cache_salt=cache_salt,
+        ).no_worker_id_version()
+        futures: dict[str, MessagingFuture[Any]] = {
+            url: send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.POLICY_LOOKUP,
+                [key, self.tp_size, envelope],
+            )
+            for url in self._server_urls
+        }
+
+        responses: dict[str, GateELookupResponse] = {}
+        for url, future in futures.items():
+            try:
+                response = future.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "POLICY_LOOKUP to %s timed out after %ss.",
+                    url,
+                    self._mq_timeout,
+                )
+                self._release_policy_lookup(
+                    token_ids, aligned_end, request_id, cache_salt
+                )
+                self._health_events[url].clear()
+                return GateELookupResponse.recompute("policy lookup timed out")
+            if not isinstance(response, GateELookupResponse):
+                self._release_policy_lookup(
+                    token_ids, aligned_end, request_id, cache_salt
+                )
+                return GateELookupResponse.unsupported(
+                    "server did not return the Gate E response contract"
+                )
+            responses[url] = response
+
+        fetches = [
+            response for response in responses.values() if response.status == "fetch"
+        ]
+        if len(fetches) != len(responses):
+            if fetches:
+                self._release_policy_lookup(
+                    token_ids, aligned_end, request_id, cache_salt
+                )
+            first = next(
+                response
+                for response in responses.values()
+                if response.status != "fetch"
+            )
+            return GateELookupResponse(
+                first.protocol_version,
+                first.status,
+                0,
+                (),
+                first.reason,
+            )
+
+        matched = {response.matched_tokens for response in fetches}
+        if len(matched) != 1:
+            self._release_policy_lookup(token_ids, aligned_end, request_id, cache_salt)
+            return GateELookupResponse.recompute(
+                "policy hit mismatch across MP servers"
+            )
+        matched_tokens = matched.pop()
+        ticket_ids = tuple(
+            ticket_id for response in fetches for ticket_id in response.ticket_ids
+        )
+        return GateELookupResponse(
+            envelope.protocol_version,
+            "fetch",
+            matched_tokens,
+            ticket_ids,
+            "all MP servers returned ticket-bound matches",
+        )
+
+    def _release_policy_lookup(
+        self,
+        token_ids: list[int],
+        aligned_end: int,
+        request_id: str,
+        cache_salt: str,
+    ) -> None:
+        self.free_lookup_locks(
+            token_ids,
+            0,
+            aligned_end,
+            request_id,
+            cache_salt,
+        )
 
     def _free_inconsistent_lookup_locks(
         self,

@@ -7,6 +7,7 @@ from __future__ import annotations
 # Standard
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 import threading
 import uuid
 
@@ -49,15 +50,31 @@ class CXLRegionManager:
         *,
         layout_id: str,
         layout_fingerprint: str,
+        tier: Literal["dram", "cxl"] = "cxl",
     ) -> None:
         self._handle = handle
         self._layout_id = layout_id
         self._layout_fingerprint = layout_fingerprint
+        self._tier = tier
         self._free: list[tuple[int, int]] = [(0, handle.capacity)]
         self._allocations: dict[str, _Allocation] = {}
         self._allocation_by_offset: dict[int, _Allocation] = {}
         self._generation_by_offset: dict[int, int] = {}
         self._lock = threading.RLock()
+
+    @property
+    def capacity_bytes(self) -> int:
+        """Return the fixed allocatable region capacity."""
+        return self._handle.capacity
+
+    @property
+    def used_bytes(self) -> int:
+        """Return bytes held by all non-reclaimed allocations."""
+        with self._lock:
+            return sum(
+                allocation.reservation.length
+                for allocation in self._allocations.values()
+            )
 
     def reserve(self, length: int, alignment: int) -> ExtentReservation:
         """Reserve the deterministic best-fit aligned free range.
@@ -113,7 +130,7 @@ class CXLRegionManager:
                 offset=offset,
                 length=length,
                 generation=generation,
-                tier="cxl",
+                tier=self._tier,
                 layout_id=self._layout_id,
                 layout_fingerprint=self._layout_fingerprint,
             )

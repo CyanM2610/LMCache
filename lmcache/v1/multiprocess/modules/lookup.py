@@ -19,6 +19,11 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.cxl.policy_protocol import (
+    GATE_E_PROTOCOL_VERSION,
+    GateELookupResponse,
+    GateERequestEnvelope,
+)
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
     HandlerSpec,
@@ -34,6 +39,32 @@ class _CXLReadyLookup(Protocol):
     def count_ready_prefix(
         self, object_keys: Sequence[ObjectKey], keys_per_chunk: int
     ) -> int: ...
+
+    def bind_ready_prefix(
+        self,
+        request_id: str,
+        object_keys: Sequence[ObjectKey],
+        keys_per_chunk: int,
+    ) -> int: ...
+
+    def policy_bind_ready_prefix(
+        self,
+        request_id: str,
+        object_keys: Sequence[ObjectKey],
+        keys_per_chunk: int,
+        envelope: GateERequestEnvelope,
+    ) -> int: ...
+
+    def release_lookup_tickets(
+        self,
+        request_id: str,
+        reason: str,
+        object_keys: Sequence[ObjectKey] | None = None,
+    ) -> None: ...
+
+    def get_bound_ticket_ids(self, request_id: str) -> tuple[str, ...]: ...
+
+    def get_lookup_decision_reason(self, request_id: str) -> str: ...
 
 
 def compute_extra_count(
@@ -176,6 +207,11 @@ class LookupModule:
         return [
             HandlerSpec(RequestType.LOOKUP, self.lookup, ThreadPoolType.NORMAL),
             HandlerSpec(
+                RequestType.POLICY_LOOKUP,
+                self.policy_lookup,
+                ThreadPoolType.NORMAL,
+            ),
+            HandlerSpec(
                 RequestType.QUERY_PREFETCH_STATUS,
                 self.query_prefetch_status,
                 ThreadPoolType.NORMAL,
@@ -222,10 +258,54 @@ class LookupModule:
     # Handlers
     # -----------------------------------------------------------------
 
+    def policy_lookup(
+        self,
+        key: IPCCacheServerKey,
+        tp_size: int,
+        envelope: GateERequestEnvelope,
+    ) -> GateELookupResponse:
+        """Return a positive match only after direct-tier ticket binding."""
+        if envelope.protocol_version != GATE_E_PROTOCOL_VERSION:
+            return GateELookupResponse.unsupported(
+                f"policy protocol {envelope.protocol_version} is unsupported"
+            )
+        if envelope.request_id != key.request_id:
+            return GateELookupResponse.unsupported(
+                "request envelope identity does not match cache key"
+            )
+        shared_tier = self._cxl_shared_tier
+        if shared_tier is None or not hasattr(
+            type(shared_tier), "policy_bind_ready_prefix"
+        ):
+            return GateELookupResponse.unsupported(
+                "ticket-bound direct shared tier is unavailable"
+            )
+        self.lookup(key, tp_size, policy_envelope=envelope)
+        found_chunks = self.query_prefetch_status(key.request_id)
+        if not found_chunks:
+            return GateELookupResponse.recompute(
+                shared_tier.get_lookup_decision_reason(key.request_id)
+            )
+        ticket_ids = shared_tier.get_bound_ticket_ids(key.request_id)
+        if len(ticket_ids) != found_chunks:
+            shared_tier.release_lookup_tickets(key.request_id, "incomplete ticket set")
+            return GateELookupResponse.recompute(
+                "positive prefix did not have one ticket per chunk"
+            )
+        return GateELookupResponse(
+            GATE_E_PROTOCOL_VERSION,
+            "fetch",
+            found_chunks * self._ctx.chunk_size,
+            ticket_ids,
+            shared_tier.get_lookup_decision_reason(key.request_id),
+        )
+
     def lookup(
         self,
         key: IPCCacheServerKey,
         tp_size: int,
+        *,
+        policy_envelope: GateERequestEnvelope | None = None,
     ) -> None:
         """Submit a prefix lookup.
 
@@ -338,9 +418,23 @@ class LookupModule:
 
         if self._cxl_shared_tier is not None:
             keys_per_chunk = world_size * attn_desc.num_object_groups
-            found_chunks = self._cxl_shared_tier.count_ready_prefix(
-                obj_keys, keys_per_chunk
-            )
+            if policy_envelope is not None and hasattr(
+                type(self._cxl_shared_tier), "policy_bind_ready_prefix"
+            ):
+                found_chunks = self._cxl_shared_tier.policy_bind_ready_prefix(
+                    key.request_id,
+                    obj_keys,
+                    keys_per_chunk,
+                    policy_envelope,
+                )
+            elif hasattr(type(self._cxl_shared_tier), "bind_ready_prefix"):
+                found_chunks = self._cxl_shared_tier.bind_ready_prefix(
+                    key.request_id, obj_keys, keys_per_chunk
+                )
+            else:
+                found_chunks = self._cxl_shared_tier.count_ready_prefix(
+                    obj_keys, keys_per_chunk
+                )
             handle = PrefetchHandle(
                 prefetch_request_id=-1,
                 external_request_id=key.request_id,
@@ -536,10 +630,6 @@ class LookupModule:
             tp_size: Tensor-parallel size for MLA
                 multi-reader locking.
         """
-        with self._prefetch_job_lock:
-            if key.request_id in self._direct_lookup_requests:
-                return
-
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
             list(key.token_ids), start=key.start, end=key.end
         )
@@ -555,6 +645,18 @@ class LookupModule:
         # be over-released (e.g. window=512, LMCache hit 1024, vLLM hit 768 ->
         # chunks 512..768 may leak). Revisit when sliding-window prefetch is on.
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
+
+        with self._prefetch_job_lock:
+            if key.request_id in self._direct_lookup_requests:
+                if self._cxl_shared_tier is not None and hasattr(
+                    type(self._cxl_shared_tier), "release_lookup_tickets"
+                ):
+                    self._cxl_shared_tier.release_lookup_tickets(
+                        key.request_id,
+                        "lookup locks released",
+                        obj_keys,
+                    )
+                return
 
         extra_count = compute_extra_count(tp_size, key.world_size)
 
@@ -595,6 +697,12 @@ class LookupModule:
             is_direct = request_id in self._direct_lookup_requests
             self._direct_lookup_requests.discard(request_id)
         if is_direct:
+            if self._cxl_shared_tier is not None and hasattr(
+                type(self._cxl_shared_tier), "release_lookup_tickets"
+            ):
+                self._cxl_shared_tier.release_lookup_tickets(
+                    request_id, "external session ended"
+                )
             return
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]

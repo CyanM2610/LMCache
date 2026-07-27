@@ -107,7 +107,7 @@ class ExtentDescriptor:
     offset: int
     length: int
     generation: int
-    tier: Literal["cxl"]
+    tier: Literal["dram", "cxl"]
     layout_id: str
     layout_fingerprint: str
 
@@ -122,8 +122,8 @@ class ExtentDescriptor:
             raise ValueError("extent end must fit uint64")
         if self.generation <= 0 or self.generation > _UINT64_MAX:
             raise ValueError("generation must be in the uint64 positive range")
-        if self.tier != "cxl":
-            raise ValueError("ExtentDescriptor tier must be 'cxl'")
+        if self.tier not in ("dram", "cxl"):
+            raise ValueError("ExtentDescriptor tier must be 'dram' or 'cxl'")
         if not self.layout_id:
             raise ValueError("layout_id must not be empty")
         _validate_sha256(self.layout_fingerprint, "layout_fingerprint")
@@ -262,9 +262,7 @@ class CompositeCompletion:
 
     op_id: str
     cuda_status: Literal["pending", "ok", "error"]
-    modeled_status: Literal[
-        "pending", "ok", "error", "cancelled", "not_required"
-    ]
+    modeled_status: Literal["pending", "ok", "error", "cancelled", "not_required"]
     cuda_elapsed_ns: int | None
     modeled_queue_ns: int | None
     modeled_service_ns: int | None

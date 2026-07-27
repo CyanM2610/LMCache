@@ -47,6 +47,15 @@ class CXLSharedTierConfig:
     model_timeout_ms: int = 1000
     """Modeled-access open and completion timeout."""
 
+    policy_cxl_bandwidth_bytes_per_s: int = 16_000_000_000
+    """Gate E CXL service-bandwidth estimate used by the cost policy."""
+
+    policy_cxl_latency_ns: int = 100
+    """Gate E fixed CXL service-latency estimate."""
+
+    policy_cuda_bandwidth_bytes_per_s: int = 25_000_000_000
+    """Gate E host-to-device copy-bandwidth estimate."""
+
     def __post_init__(self) -> None:
         """Validate a complete enabled configuration.
 
@@ -58,8 +67,7 @@ class CXLSharedTierConfig:
             return
         if self.provider not in ("posix_shm", "cxlmemsim_shm"):
             raise ValueError(
-                "cxl_shared_tier.provider must be 'posix_shm' or "
-                "'cxlmemsim_shm'"
+                "cxl_shared_tier.provider must be 'posix_shm' or 'cxlmemsim_shm'"
             )
         if (
             self.shm_name is None
@@ -81,6 +89,16 @@ class CXLSharedTierConfig:
             raise ValueError("cxl_shared_tier.model_mode is unsupported")
         if self.model_timeout_ms <= 0:
             raise ValueError("cxl_shared_tier.model_timeout_ms must be positive")
+        if (
+            min(
+                self.policy_cxl_bandwidth_bytes_per_s,
+                self.policy_cuda_bandwidth_bytes_per_s,
+            )
+            <= 0
+        ):
+            raise ValueError("Gate E bandwidth estimates must be positive")
+        if self.policy_cxl_latency_ns < 0:
+            raise ValueError("Gate E CXL latency estimate must be non-negative")
         if self.model_mode == "cxlmemsim":
             if self.provider != "cxlmemsim_shm":
                 raise ValueError(
@@ -470,6 +488,24 @@ def add_mp_server_args(
         help="Modeled-access timeout in milliseconds. Default is 1000.",
     )
     mp_group.add_argument(
+        "--cxl-shared-tier-policy-cxl-bandwidth-bytes-per-s",
+        type=int,
+        default=16_000_000_000,
+        help="Gate E CXL service-bandwidth estimate.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-policy-cxl-latency-ns",
+        type=int,
+        default=100,
+        help="Gate E fixed CXL service-latency estimate.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-policy-cuda-bandwidth-bytes-per-s",
+        type=int,
+        default=25_000_000_000,
+        help="Gate E host-to-device copy-bandwidth estimate.",
+    )
+    mp_group.add_argument(
         "--runtime-plugin-locations",
         type=str,
         nargs="*",
@@ -579,6 +615,13 @@ def parse_args_to_mp_server_config(
             model_control_name=args.cxl_shared_tier_model_control_name,
             model_client_library=args.cxl_shared_tier_model_client_library,
             model_timeout_ms=args.cxl_shared_tier_model_timeout_ms,
+            policy_cxl_bandwidth_bytes_per_s=(
+                args.cxl_shared_tier_policy_cxl_bandwidth_bytes_per_s
+            ),
+            policy_cxl_latency_ns=args.cxl_shared_tier_policy_cxl_latency_ns,
+            policy_cuda_bandwidth_bytes_per_s=(
+                args.cxl_shared_tier_policy_cuda_bandwidth_bytes_per_s
+            ),
         ),
         runtime_plugin_config=RuntimePluginConfig(
             locations=(args.runtime_plugin_locations or []),

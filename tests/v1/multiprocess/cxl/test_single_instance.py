@@ -31,6 +31,10 @@ from lmcache.v1.multiprocess.cxl.model_client import (
     ModeledAccessRequest,
     RegisteredModelRegion,
 )
+from lmcache.v1.multiprocess.cxl.policy_protocol import (
+    GATE_E_PROTOCOL_VERSION,
+    GateERequestEnvelope,
+)
 from lmcache.v1.multiprocess.cxl.residency import ResidencyState
 from lmcache.v1.multiprocess.modules.cxl_shared_tier import (
     CXLSharedTierModule,
@@ -539,8 +543,7 @@ def test_cxlmemsim_modeled_completion_is_used_by_store_and_retrieve(
     shm.buf[: len(header)] = header
     model = _FakeModelClient()
     monkeypatch.setattr(
-        "lmcache.v1.multiprocess.modules.cxl_shared_tier."
-        "CXLMemSimModelClient.open",
+        "lmcache.v1.multiprocess.modules.cxl_shared_tier.CXLMemSimModelClient.open",
         lambda **_: model,
     )
     native = _FakeNativeOps()
@@ -604,6 +607,43 @@ def test_store_publishes_immutable_chunks_only_after_cuda_success() -> None:
         duplicate = module.store(_request("store-duplicate", keys))
         assert duplicate.status == "ok"
         assert len(native.transfers) == 2
+    finally:
+        module.close()
+        shm.close()
+        shm.unlink()
+
+
+def test_gate_e_policy_binds_before_hit_and_recompute_returns_no_ticket() -> None:
+    native = _FakeNativeOps()
+    module, shm = _open_module(native)
+    keys = (_key(b"policy-a"), _key(b"policy-b"))
+    try:
+        assert module.store(_request("store-policy", keys)).status == "ok"
+        fingerprint = module.lookup_ready(keys[0]).descriptor.layout_fingerprint
+        fetch = GateERequestEnvelope(
+            GATE_E_PROTOCOL_VERSION,
+            "request",
+            None,
+            1_000_000_000,
+            fingerprint,
+        )
+
+        assert module.policy_bind_ready_prefix("request", keys, 1, fetch) == 2
+        assert len(module.get_bound_ticket_ids("request")) == 2
+        module.release_lookup_tickets("request", "APC overlap", object_keys=(keys[0],))
+        assert len(module.get_bound_ticket_ids("request")) == 1
+        module.release_lookup_tickets("request", "lookup replaced")
+
+        recompute = GateERequestEnvelope(
+            GATE_E_PROTOCOL_VERSION,
+            "request",
+            None,
+            1,
+            fingerprint,
+        )
+        assert module.policy_bind_ready_prefix("request", keys, 1, recompute) == 0
+        assert module.get_bound_ticket_ids("request") == ()
+        assert '"winner": "recompute"' in module.get_lookup_decision_reason("request")
     finally:
         module.close()
         shm.close()

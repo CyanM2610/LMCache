@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
 import math
+import re
 import sys
 
 # Third Party
@@ -46,6 +47,11 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
 )
+from lmcache.integration.vllm.recompute_estimator import (
+    RecomputeCalibrationKey,
+    RecomputeEstimator,
+    calibration_bucket,
+)
 from lmcache.integration.vllm.utils import (
     apply_mm_hashes_to_token_ids,
     extract_mm_features,
@@ -54,6 +60,12 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.utils import init_logger as lmcache_init_logger
 from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
+from lmcache.v1.multiprocess.cxl.policy_protocol import (
+    GATE_E_PROTOCOL_VERSION,
+    GateEConnectorTranslator,
+    GateELookupResponse,
+    GateERequestEnvelope,
+)
 
 try:
     # First Party
@@ -679,6 +691,33 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            extra_config = (
+                vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+            )
+            self._policy_mode = str(
+                extra_config.get("lmcache.mp.policy_mode", "legacy")
+            )
+            if self._policy_mode not in ("legacy", "gate_e"):
+                raise ValueError("lmcache.mp.policy_mode must be 'legacy' or 'gate_e'")
+            self._gate_e_lookup_results: dict[str, GateELookupResponse] = {}
+            self._layout_fingerprint = str(
+                extra_config.get("lmcache.mp.layout_fingerprint", "")
+            )
+            if (
+                self._policy_mode == "gate_e"
+                and re.fullmatch(r"[0-9a-f]{64}", self._layout_fingerprint) is None
+            ):
+                raise ValueError(
+                    "gate_e policy mode requires "
+                    "lmcache.mp.layout_fingerprint (lowercase SHA-256)"
+                )
+            default_recompute_ns = int(
+                extra_config.get("lmcache.mp.recompute_default_ns", 1_000_000_000)
+            )
+            self._recompute_estimator = RecomputeEstimator(
+                default_estimate_ns=default_recompute_ns
+            )
+            self._recompute_device = str(vllm_config.device_config.device)
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
             # Global ranks are assigned to nodes in contiguous blocks:
@@ -1014,15 +1053,36 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
-        self.scheduler_adapter.maybe_submit_lookup_request(
-            request.request_id,
-            token_ids=tracker.get_token_ids(),
-            cache_salt=tracker.cache_salt,
-        )
+        if self._policy_mode == "gate_e":
+            response = self._gate_e_lookup_results.get(request.request_id)
+            if response is None:
+                token_ids = tracker.get_token_ids()
+                key = self._recompute_key(len(token_ids))
+                envelope = GateERequestEnvelope(
+                    GATE_E_PROTOCOL_VERSION,
+                    request.request_id,
+                    self._request_deadline_ns(request),
+                    self._recompute_estimator.estimate(key),
+                    self._layout_fingerprint,
+                )
+                response = self.scheduler_adapter.policy_lookup(
+                    request.request_id,
+                    token_ids,
+                    envelope,
+                    tracker.cache_salt,
+                )
+                self._gate_e_lookup_results[request.request_id] = response
+            ret = GateEConnectorTranslator.matched_tokens(response)
+        else:
+            self.scheduler_adapter.maybe_submit_lookup_request(
+                request.request_id,
+                token_ids=tracker.get_token_ids(),
+                cache_salt=tracker.cache_salt,
+            )
 
-        ret = self.scheduler_adapter.check_lookup_result(request.request_id)
-        if ret is None:
-            return None, True
+            ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+            if ret is None:
+                return None, True
 
         if ret == 0:
             return 0, False
@@ -1459,3 +1519,30 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "[KVConnector] Cleaned up request_tracker for request %s",
                 request_id,
             )
+        self._gate_e_lookup_results.pop(request_id, None)
+
+    def _recompute_key(self, prompt_tokens: int) -> RecomputeCalibrationKey:
+        return RecomputeCalibrationKey(
+            self.scheduler_adapter.model_name,
+            self._layout_fingerprint,
+            calibration_bucket(prompt_tokens),
+            1,
+            calibration_bucket(len(self.request_trackers)),
+            self._recompute_device,
+        )
+
+    @staticmethod
+    def _request_deadline_ns(request: "Request") -> int | None:
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        value = extra_args.get("lmcache.deadline_ns")
+        return None if value is None else int(value)
+
+    def record_recompute_observation(
+        self,
+        *,
+        prompt_tokens: int,
+        elapsed_ns: int,
+    ) -> None:
+        """Record one raw prefill calibration observation."""
+        self._recompute_estimator.record(self._recompute_key(prompt_tokens), elapsed_ns)
