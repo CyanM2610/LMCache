@@ -107,8 +107,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("engine_kv_format"), py::arg("skip_prefix_n_blocks"),
         py::call_guard<py::gil_scoped_release>());
   py::class_<CudaRegionRegistration>(m, "CudaRegionRegistration")
-      .def(py::init<const std::string&, size_t>(), py::arg("shm_name"),
-           py::arg("expected_capacity"))
+      .def(py::init<const std::string&, size_t, size_t>(), py::arg("shm_name"),
+           py::arg("expected_capacity"), py::arg("payload_offset") = 4096)
       .def_property_readonly("capacity", &CudaRegionRegistration::capacity)
       .def("device_address", &CudaRegionRegistration::device_address,
            py::arg("offset"), py::arg("length"))

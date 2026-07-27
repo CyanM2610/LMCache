@@ -28,6 +28,16 @@ struct RegionHeader {
   uint64_t capacity;
   uint64_t alignment;
 };
+
+struct CxlMemSimRegionHeader {
+  uint64_t magic;
+  uint64_t version;
+  uint64_t total_size;
+  uint64_t data_offset;
+  uint64_t metadata_offset;
+  uint64_t num_cachelines;
+  uint64_t base_addr;
+};
 #pragma pack(pop)
 
 void check_cuda(cudaError_t status, const char* operation) {
@@ -44,7 +54,8 @@ bool is_power_of_two(uint64_t value) {
 }  // namespace
 
 CudaRegionRegistration::CudaRegionRegistration(const std::string& shm_name,
-                                               size_t expected_capacity) {
+                                               size_t expected_capacity,
+                                               size_t payload_offset) {
   fd_ = shm_open(shm_name.c_str(), O_RDWR, 0);
   if (fd_ < 0) {
     throw std::runtime_error("failed to open POSIX shared region " + shm_name);
@@ -52,7 +63,7 @@ CudaRegionRegistration::CudaRegionRegistration(const std::string& shm_name,
   try {
     struct stat stat_buffer {};
     if (fstat(fd_, &stat_buffer) != 0 ||
-        stat_buffer.st_size < static_cast<off_t>(kRegionHeaderSize)) {
+        stat_buffer.st_size < static_cast<off_t>(sizeof(RegionHeader))) {
       throw std::runtime_error("shared region is smaller than its header");
     }
     mapping_size_ = static_cast<size_t>(stat_buffer.st_size);
@@ -63,21 +74,33 @@ CudaRegionRegistration::CudaRegionRegistration(const std::string& shm_name,
       throw std::runtime_error("failed to mmap POSIX shared region");
     }
 
-    const auto* header = static_cast<const RegionHeader*>(mapping_);
-    if (std::memcmp(header->magic, kRegionMagic.data(), kRegionMagic.size()) !=
-            0 ||
-        header->version != kRegionVersion ||
-        header->header_size != kRegionHeaderSize || header->capacity == 0 ||
-        !is_power_of_two(header->alignment)) {
-      throw std::runtime_error("shared region header is incompatible");
-    }
-    if (header->capacity != expected_capacity ||
-        header->capacity > std::numeric_limits<size_t>::max() ||
-        mapping_size_ - kRegionHeaderSize < header->capacity) {
+    if (payload_offset > mapping_size_ ||
+        expected_capacity > mapping_size_ - payload_offset) {
       throw std::runtime_error("shared region capacity does not match config");
     }
-    capacity_ = static_cast<size_t>(header->capacity);
-    payload_host_ = static_cast<char*>(mapping_) + kRegionHeaderSize;
+    const auto* header = static_cast<const RegionHeader*>(mapping_);
+    const bool beluga_header =
+        std::memcmp(header->magic, kRegionMagic.data(), kRegionMagic.size()) ==
+            0 &&
+        header->version == kRegionVersion &&
+        header->header_size == payload_offset &&
+        header->capacity == expected_capacity &&
+        is_power_of_two(header->alignment);
+    constexpr uint64_t kCxlMemSimMagic = 0x43584C4D454D5348ULL;
+    const auto* cxlmemsim =
+        static_cast<const CxlMemSimRegionHeader*>(mapping_);
+    const bool cxlmemsim_header =
+        cxlmemsim->magic == kCxlMemSimMagic && cxlmemsim->version == 1 &&
+        cxlmemsim->total_size == mapping_size_ &&
+        cxlmemsim->data_offset == payload_offset &&
+        cxlmemsim->num_cachelines <=
+            std::numeric_limits<uint64_t>::max() / 64 &&
+        cxlmemsim->num_cachelines * 64 == expected_capacity;
+    if (!beluga_header && !cxlmemsim_header) {
+      throw std::runtime_error("shared region header is incompatible");
+    }
+    capacity_ = expected_capacity;
+    payload_host_ = static_cast<char*>(mapping_) + payload_offset;
     check_cuda(
         cudaHostRegister(payload_host_, capacity_,
                          cudaHostRegisterMapped | cudaHostRegisterPortable),

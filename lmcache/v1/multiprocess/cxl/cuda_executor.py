@@ -96,7 +96,16 @@ class RegisteredRegionView:
         if "cuda_host_register_v1" not in handle.capabilities:
             raise RuntimeError("region is not CUDA-registerable")
         ops = native_ops or importlib.import_module("lmcache.c_ops")
-        registration = ops.CudaRegionRegistration(handle.shm_name, handle.capacity)
+        try:
+            registration = ops.CudaRegionRegistration(
+                handle.shm_name, handle.capacity, handle.data_offset
+            )
+        except TypeError:
+            if handle.data_offset != 4096:
+                raise
+            registration = ops.CudaRegionRegistration(
+                handle.shm_name, handle.capacity
+            )
         return cls(
             handle,
             registration,

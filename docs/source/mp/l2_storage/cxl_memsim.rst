@@ -142,3 +142,41 @@ serialization time, and touched cache-line counts. These are cumulative for
 the current native client. Adapter status also exposes live, locked,
 borrowed, pending-free, and occupied slot counts.
 
+GPU-direct modeled shared tier
+------------------------------
+
+The MP server also has an opt-in GPU-visible shared-tier path. Unlike the L2
+adapter above, its CUDA executor copies directly between vLLM HBM and the
+page-aligned data area owned by CXLMemSim. CXLMemSim receives metadata only and
+models the corresponding CXL access concurrently with CUDA.
+
+Start the simulator with modeled access enabled, then configure LMCache with
+the exact advertised data capacity (``--capacity`` MiB minus the 4096-byte
+shared-memory header):
+
+.. code-block:: bash
+
+    ./build-vllm/cxlmemsim_server \
+        --comm-mode=bulk-shm \
+        --bulk-shm-name=/cxlmemsim_bulk \
+        --enable-gpu-direct-modeled-access=true \
+        --modeled-access-shm-name=/cxlmemsim_modeled \
+        --capacity=256
+
+    lmcache server \
+        --supported-transfer-mode=lmcache_driven \
+        --cxl-shared-tier-enabled \
+        --cxl-shared-tier-provider=cxlmemsim_shm \
+        --cxl-shared-tier-shm-name=/cxlmemsim_shared \
+        --cxl-shared-tier-capacity-bytes=268431360 \
+        --cxl-shared-tier-model-mode=cxlmemsim \
+        --cxl-shared-tier-model-control-name=/cxlmemsim_modeled \
+        --cxl-shared-tier-model-client-library=/path/to/CXLMemSim/build-vllm/libcxlmemsim_modeled_client.so
+
+The default ``model_mode`` remains ``noop`` for the earlier POSIX-SHM path.
+The ``cxlmemsim`` mode does not fall back: startup fails if the native library,
+capability, protocol, backing header, capacity, or alignment is incompatible.
+For each operation, LMCache reports CUDA elapsed time, modeled queue and
+service time, and effective elapsed time. Effective completion is
+``max(cuda_complete, modeled_complete)``; the branch durations are never
+summed.

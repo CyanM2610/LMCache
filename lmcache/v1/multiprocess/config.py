@@ -21,7 +21,7 @@ class CXLSharedTierConfig:
     """Whether the CXL shared tier is enabled."""
 
     provider: str = "posix_shm"
-    """Backing region provider. Gate B supports only ``posix_shm``."""
+    """Backing region provider: Beluga POSIX SHM or CXLMemSim SHM."""
 
     shm_name: str | None = None
     """POSIX shared-memory name containing a valid Beluga region header."""
@@ -35,6 +35,18 @@ class CXLSharedTierConfig:
     layout_id: str = "packed_kv_v1"
     """Packed layout ABI accepted by the shared tier."""
 
+    model_mode: str = "noop"
+    """Completion model: ``noop`` or capability-negotiated ``cxlmemsim``."""
+
+    model_control_name: str = "/cxlmemsim_modeled"
+    """CXLMemSim modeled-access control SHM name."""
+
+    model_client_library: str | None = None
+    """Path to the CXLMemSim modeled-access client shared library."""
+
+    model_timeout_ms: int = 1000
+    """Modeled-access open and completion timeout."""
+
     def __post_init__(self) -> None:
         """Validate a complete enabled configuration.
 
@@ -44,8 +56,11 @@ class CXLSharedTierConfig:
         """
         if not self.enabled:
             return
-        if self.provider != "posix_shm":
-            raise ValueError("cxl_shared_tier.provider must be 'posix_shm'")
+        if self.provider not in ("posix_shm", "cxlmemsim_shm"):
+            raise ValueError(
+                "cxl_shared_tier.provider must be 'posix_shm' or "
+                "'cxlmemsim_shm'"
+            )
         if (
             self.shm_name is None
             or not self.shm_name.startswith("/")
@@ -62,6 +77,27 @@ class CXLSharedTierConfig:
             raise ValueError("cxl_shared_tier.alignment_bytes must be a power of two")
         if self.layout_id != "packed_kv_v1":
             raise ValueError("cxl_shared_tier.layout_id must be 'packed_kv_v1'")
+        if self.model_mode not in ("noop", "cxlmemsim"):
+            raise ValueError("cxl_shared_tier.model_mode is unsupported")
+        if self.model_timeout_ms <= 0:
+            raise ValueError("cxl_shared_tier.model_timeout_ms must be positive")
+        if self.model_mode == "cxlmemsim":
+            if self.provider != "cxlmemsim_shm":
+                raise ValueError(
+                    "cxlmemsim model mode requires provider 'cxlmemsim_shm'"
+                )
+            if (
+                not self.model_control_name.startswith("/")
+                or "/" in self.model_control_name[1:]
+            ):
+                raise ValueError(
+                    "cxl_shared_tier.model_control_name must be a POSIX "
+                    "shared-memory name"
+                )
+            if not self.model_client_library:
+                raise ValueError(
+                    "cxl_shared_tier.model_client_library must be configured"
+                )
 
 
 @dataclass
@@ -381,7 +417,8 @@ def add_mp_server_args(
         "--cxl-shared-tier-provider",
         type=str,
         default="posix_shm",
-        help="CXL shared-tier provider. Gate B supports posix_shm.",
+        choices=["posix_shm", "cxlmemsim_shm"],
+        help="CXL shared-tier provider.",
     )
     mp_group.add_argument(
         "--cxl-shared-tier-shm-name",
@@ -406,6 +443,31 @@ def add_mp_server_args(
         type=str,
         default="packed_kv_v1",
         help="Packed CXL layout ABI. Gate B requires packed_kv_v1.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-model-mode",
+        type=str,
+        choices=["noop", "cxlmemsim"],
+        default="noop",
+        help="CXL completion model. Default is noop.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-model-control-name",
+        type=str,
+        default="/cxlmemsim_modeled",
+        help="CXLMemSim modeled-access control SHM name.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-model-client-library",
+        type=str,
+        default=None,
+        help="CXLMemSim modeled-access client shared library.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-model-timeout-ms",
+        type=int,
+        default=1000,
+        help="Modeled-access timeout in milliseconds. Default is 1000.",
     )
     mp_group.add_argument(
         "--runtime-plugin-locations",
@@ -513,6 +575,10 @@ def parse_args_to_mp_server_config(
             capacity_bytes=args.cxl_shared_tier_capacity_bytes,
             alignment_bytes=args.cxl_shared_tier_alignment_bytes,
             layout_id=args.cxl_shared_tier_layout_id,
+            model_mode=args.cxl_shared_tier_model_mode,
+            model_control_name=args.cxl_shared_tier_model_control_name,
+            model_client_library=args.cxl_shared_tier_model_client_library,
+            model_timeout_ms=args.cxl_shared_tier_model_timeout_ms,
         ),
         runtime_plugin_config=RuntimePluginConfig(
             locations=(args.runtime_plugin_locations or []),

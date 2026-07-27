@@ -52,7 +52,10 @@ class _NativeOps:
     def __init__(self) -> None:
         self.transfers: list[dict[str, object]] = []
 
-    def CudaRegionRegistration(self, shm_name: str, capacity: int) -> _Registration:
+    def CudaRegionRegistration(
+        self, shm_name: str, capacity: int, data_offset: int = REGION_HEADER_SIZE
+    ) -> _Registration:
+        del data_offset
         return _Registration(shm_name, capacity)
 
     def cxl_region_block_kv_transfer(

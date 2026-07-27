@@ -210,3 +210,42 @@ def test_cxl_shared_tier_requires_lmcache_driven_transfer_mode():
                 "1048576",
             ]
         )
+
+
+def test_cxl_shared_tier_parses_cxlmemsim_modeled_access() -> None:
+    config = _parse_mp(
+        [
+            "--cxl-shared-tier-enabled",
+            "--cxl-shared-tier-provider",
+            "cxlmemsim_shm",
+            "--cxl-shared-tier-shm-name",
+            "/cxlmemsim_shared",
+            "--cxl-shared-tier-capacity-bytes",
+            "1044480",
+            "--cxl-shared-tier-model-mode",
+            "cxlmemsim",
+            "--cxl-shared-tier-model-control-name",
+            "/cxlmemsim_modeled",
+            "--cxl-shared-tier-model-client-library",
+            "/opt/cxl/libcxlmemsim_modeled_client.so",
+            "--cxl-shared-tier-model-timeout-ms",
+            "2500",
+        ]
+    )
+
+    assert config.cxl_shared_tier.provider == "cxlmemsim_shm"
+    assert config.cxl_shared_tier.model_mode == "cxlmemsim"
+    assert config.cxl_shared_tier.model_control_name == "/cxlmemsim_modeled"
+    assert config.cxl_shared_tier.model_timeout_ms == 2500
+
+
+def test_cxlmemsim_modeled_access_rejects_unrelated_backing() -> None:
+    with pytest.raises(ValueError, match="cxlmemsim_shm"):
+        CXLSharedTierConfig(
+            enabled=True,
+            provider="posix_shm",
+            shm_name="/beluga-cxl",
+            capacity_bytes=4096,
+            model_mode="cxlmemsim",
+            model_client_library="/opt/cxl/libmodeled.so",
+        )

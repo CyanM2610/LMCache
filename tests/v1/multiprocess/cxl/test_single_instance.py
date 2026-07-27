@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from types import SimpleNamespace
 from typing import Callable, Iterator
+import struct
 import uuid
 
 # Third Party
@@ -22,11 +23,20 @@ from lmcache.v1.multiprocess.cxl.contracts import CompositeCompletion
 from lmcache.v1.multiprocess.cxl.data_plane_adapter import VLLMTransferRequest
 from lmcache.v1.multiprocess.cxl.region_provider import (
     REGION_HEADER_SIZE,
+    RegionHandle,
     pack_region_header,
 )
+from lmcache.v1.multiprocess.cxl.model_client import (
+    ModelCompletion,
+    ModeledAccessRequest,
+    RegisteredModelRegion,
+)
 from lmcache.v1.multiprocess.cxl.residency import ResidencyState
-from lmcache.v1.multiprocess.modules.cxl_shared_tier import CXLSharedTierModule
-from lmcache.v1.multiprocess.modules.cxl_shared_tier import CXLTransferResult
+from lmcache.v1.multiprocess.modules.cxl_shared_tier import (
+    CXLSharedTierModule,
+    CXLTransferResult,
+    InMemoryCXLOperationSink,
+)
 from lmcache.v1.mp_observability.event import Event
 
 
@@ -55,7 +65,10 @@ class _FakeNativeOps:
         self.transfers: list[tuple[object, ...]] = []
         self.fail_transfer = False
 
-    def CudaRegionRegistration(self, shm_name: str, capacity: int) -> _FakeRegistration:
+    def CudaRegionRegistration(
+        self, shm_name: str, capacity: int, data_offset: int = REGION_HEADER_SIZE
+    ) -> _FakeRegistration:
+        del data_offset
         registration = _FakeRegistration(shm_name, capacity)
         self.registrations.append(registration)
         return registration
@@ -71,6 +84,54 @@ class _FakeRuntime:
         del cache_context
         operation()
         return 50
+
+
+class _FakeModelClient:
+    def __init__(self) -> None:
+        self.requests: dict[str, ModeledAccessRequest] = {}
+        self.data_terminals: list[tuple[str, str, int]] = []
+        self.closed = False
+
+    def register_region(self, handle: RegionHandle) -> RegisteredModelRegion:
+        return RegisteredModelRegion(
+            region_id=handle.region_id,
+            server_region_token=17,
+            capacity=handle.capacity,
+            alignment=handle.alignment,
+        )
+
+    def begin_access(self, request: ModeledAccessRequest) -> ModelCompletion:
+        self.requests[request.op_id] = request
+        return ModelCompletion(
+            request.op_id,
+            "pending",
+            len(self.requests),
+            20,
+            100,
+            request.start_ns + 100,
+            None,
+        )
+
+    def data_complete(self, op_id: str, status: str, complete_ns: int) -> None:
+        self.data_terminals.append((op_id, status, complete_ns))
+
+    def await_completion(self, op_id: str) -> ModelCompletion:
+        request = self.requests[op_id]
+        return ModelCompletion(
+            op_id,
+            "ok",
+            len(self.requests),
+            20,
+            100,
+            request.start_ns + 100,
+            None,
+        )
+
+    def cancel(self, op_id: str, reason: str) -> None:
+        del op_id, reason
+
+    def close(self) -> None:
+        self.closed = True
 
 
 @dataclass(frozen=True)
@@ -390,6 +451,7 @@ def _direct_result(status: str = "ok") -> CXLTransferResult:
                 cuda_elapsed_ns=50 if status == "ok" else None,
                 modeled_queue_ns=None,
                 modeled_service_ns=None,
+                error=None if status == "ok" else "injected failure",
             ),
         ),
         payload_bytes=256,
@@ -453,6 +515,74 @@ def _open_module(
             7, cache_context or _CacheContext(), "Qwen2.5-7B-Instruct"
         )
     return module, shm
+
+
+def test_cxlmemsim_modeled_completion_is_used_by_store_and_retrieve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capacity = 4096
+    data_offset = 4096
+    name = f"cxlmemsim-gate-d-{uuid.uuid4().hex}"
+    shm = shared_memory.SharedMemory(
+        name=name, create=True, size=data_offset + capacity
+    )
+    header = struct.pack(
+        "<QQQQQQQ",
+        0x43584C4D454D5348,
+        1,
+        len(shm.buf),
+        data_offset,
+        0,
+        capacity // 64,
+        0,
+    )
+    shm.buf[: len(header)] = header
+    model = _FakeModelClient()
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.modules.cxl_shared_tier."
+        "CXLMemSimModelClient.open",
+        lambda **_: model,
+    )
+    native = _FakeNativeOps()
+    sink = InMemoryCXLOperationSink()
+    module = CXLSharedTierModule.open(
+        CXLSharedTierConfig(
+            enabled=True,
+            provider="cxlmemsim_shm",
+            shm_name=f"/{name}",
+            capacity_bytes=capacity,
+            alignment_bytes=64,
+            model_mode="cxlmemsim",
+            model_client_library="/unused/libmodeled.so",
+        ),
+        native_ops=native,
+        runtime=_FakeRuntime(),
+        clock_ns=lambda: 100,
+        operation_sink=sink,
+    )
+    try:
+        module.register_engine(7, _CacheContext(), "Qwen2.5-7B-Instruct")
+        keys = (_key(b"modeled"),)
+
+        stored = module.store(_request("modeled-store", keys))
+        retrieved = module.retrieve(_request("modeled-retrieve", keys))
+
+        assert stored.completions[0].modeled_status == "ok"
+        assert stored.completions[0].effective_elapsed_ns == 100
+        assert retrieved.completions[0].modeled_status == "ok"
+        assert [item.direction for item in model.requests.values()] == [
+            "store",
+            "retrieve",
+        ]
+        terminal = [event for event in sink.snapshot() if event.terminal]
+        assert terminal[-1].modeled_queue_ns == 20
+        assert terminal[-1].modeled_service_ns == 100
+        assert terminal[-1].effective_elapsed_ns == 100
+    finally:
+        module.close()
+        shm.close()
+        shm.unlink()
+    assert model.closed
 
 
 def test_store_publishes_immutable_chunks_only_after_cuda_success() -> None:

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 # Standard
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Literal, Protocol, Sequence
 import json
 import threading
@@ -16,7 +16,10 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import EncodedObjectKey, ObjectKey
 from lmcache.v1.multiprocess.config import CXLSharedTierConfig
-from lmcache.v1.multiprocess.cxl.completion import NoopModelClient
+from lmcache.v1.multiprocess.cxl.completion import (
+    ModeledCompletionCoordinator,
+    NoopModelClient,
+)
 from lmcache.v1.multiprocess.cxl.contracts import (
     CompositeCompletion,
     ExtentDescriptor,
@@ -31,10 +34,13 @@ from lmcache.v1.multiprocess.cxl.data_plane_adapter import (
     VLLMTransferRequest,
 )
 from lmcache.v1.multiprocess.cxl.layout import layout_fingerprint
+from lmcache.v1.multiprocess.cxl.model_client import CXLMemSimModelClient
 from lmcache.v1.multiprocess.cxl.region_manager import CXLRegionManager
 from lmcache.v1.multiprocess.cxl.region_provider import (
+    CXLMemSimShmRegionProvider,
     PosixShmRegionProvider,
     RegionHandle,
+    RegionProvider,
 )
 from lmcache.v1.multiprocess.cxl.residency import (
     ReadLease,
@@ -72,6 +78,9 @@ class CXLOperationEvent:
     layout_fingerprint: str | None
     payload_checksum: str | None
     cuda_elapsed_ns: int | None
+    modeled_queue_ns: int | None
+    modeled_service_ns: int | None
+    effective_elapsed_ns: int | None
     state: CXLOperationState
     terminal: bool
 
@@ -94,6 +103,9 @@ class CXLOperationEvent:
             "layout_fingerprint": self.layout_fingerprint,
             "payload_checksum": self.payload_checksum,
             "cuda_elapsed_ns": self.cuda_elapsed_ns,
+            "modeled_queue_ns": self.modeled_queue_ns,
+            "modeled_service_ns": self.modeled_service_ns,
+            "effective_elapsed_ns": self.effective_elapsed_ns,
             "state": self.state,
             "terminal": self.terminal,
         }
@@ -204,6 +216,7 @@ class _PendingStore:
 class _ActiveOperation:
     instance_id: int
     cancelled: bool = False
+    modeled_op_ids: set[str] = field(default_factory=set)
 
 
 class _OperationCancelled(RuntimeError):
@@ -218,13 +231,14 @@ class CXLSharedTierModule:
     def __init__(
         self,
         config: CXLSharedTierConfig,
-        provider: PosixShmRegionProvider,
+        provider: RegionProvider,
         handle: RegionHandle,
         *,
         native_ops: Any | None,
         runtime: Any | None,
         clock_ns: Callable[[], int],
         operation_sink: CXLOperationSink,
+        modeled_coordinator: ModeledCompletionCoordinator | None,
     ) -> None:
         self._config = config
         self._provider = provider
@@ -243,6 +257,7 @@ class CXLSharedTierModule:
         self._aliases_by_primary: dict[ObjectKey, tuple[ObjectKey, ...]] = {}
         self._pending_aliases: dict[ObjectKey, str] = {}
         self._model_client = NoopModelClient()
+        self._modeled_coordinator = modeled_coordinator
         self._active_operations: dict[str, _ActiveOperation] = {}
         self._closed = False
         self._closing = False
@@ -278,27 +293,58 @@ class CXLSharedTierModule:
         """
         if not config.enabled:
             raise ValueError("CXL shared tier is disabled")
-        if config.provider != "posix_shm":
-            raise ValueError("Gate B supports only the posix_shm provider")
         if config.shm_name is None or config.capacity_bytes is None:
             raise ValueError("enabled CXL shared tier configuration is incomplete")
-        provider = PosixShmRegionProvider(
-            region_id=f"cxl-posix:{config.shm_name}",
-            shm_name=config.shm_name,
-            expected_capacity=config.capacity_bytes,
-        )
-        handle = provider.provision()
-        return cls(
-            config,
-            provider,
-            handle,
-            native_ops=native_ops,
-            runtime=runtime,
-            clock_ns=clock_ns,
-            operation_sink=(
-                LoggingCXLOperationSink() if operation_sink is None else operation_sink
-            ),
-        )
+        provider: RegionProvider
+        if config.provider == "posix_shm":
+            provider = PosixShmRegionProvider(
+                region_id=f"cxl-posix:{config.shm_name}",
+                shm_name=config.shm_name,
+                expected_capacity=config.capacity_bytes,
+            )
+        elif config.provider == "cxlmemsim_shm":
+            provider = CXLMemSimShmRegionProvider(
+                region_id=f"cxlmemsim:{config.shm_name}",
+                shm_name=config.shm_name,
+                expected_capacity=config.capacity_bytes,
+            )
+        else:
+            raise ValueError("unsupported CXL shared-tier provider")
+        model_client: CXLMemSimModelClient | None = None
+        try:
+            handle = provider.provision()
+            coordinator = None
+            if config.model_mode == "cxlmemsim":
+                assert config.model_client_library is not None
+                model_client = CXLMemSimModelClient.open(
+                    library_path=config.model_client_library,
+                    control_name=config.model_control_name,
+                    timeout_ms=config.model_timeout_ms,
+                    clock_ns=clock_ns,
+                )
+                modeled_region = model_client.register_region(handle)
+                coordinator = ModeledCompletionCoordinator(
+                    model_client, modeled_region, clock_ns=clock_ns
+                )
+            return cls(
+                config,
+                provider,
+                handle,
+                native_ops=native_ops,
+                runtime=runtime,
+                clock_ns=clock_ns,
+                operation_sink=(
+                    LoggingCXLOperationSink()
+                    if operation_sink is None
+                    else operation_sink
+                ),
+                modeled_coordinator=coordinator,
+            )
+        except BaseException:
+            if model_client is not None:
+                model_client.close()
+            provider.close()
+            raise
 
     def register_engine(
         self, instance_id: int, cache_context: Any, model_name: str
@@ -385,6 +431,11 @@ class CXLSharedTierModule:
             if operation is None:
                 return False
             operation.cancelled = True
+            if self._modeled_coordinator is not None:
+                for modeled_op_id in tuple(operation.modeled_op_ids):
+                    self._modeled_coordinator.cancel(
+                        modeled_op_id, "parent operation was cancelled"
+                    )
             return True
 
     def store(self, request: VLLMTransferRequest) -> CXLTransferResult:
@@ -457,12 +508,11 @@ class CXLSharedTierModule:
 
             for plan in plans:
                 self._raise_if_cancelled(request.op_id)
-                data_completion = self._require_executor().submit(plan)
-                completion = self._model_client.join(data_completion)
+                completion = self._execute_plan(request.op_id, plan)
                 completions.append(completion)
                 self._raise_if_cancelled(request.op_id)
                 if completion.cuda_status != "ok":
-                    raise RuntimeError(data_completion.error or "CUDA store failed")
+                    raise RuntimeError(completion.error or "CUDA store failed")
 
             with self._lock:
                 self._raise_if_cancelled(request.op_id)
@@ -498,6 +548,7 @@ class CXLSharedTierModule:
                         cuda_elapsed_ns=completion.cuda_elapsed_ns,
                         state="ready",
                         terminal=True,
+                        completion=completion,
                     )
             return self._result("ok", tuple(completions), payload_bytes=payload_bytes)
         except _OperationCancelled:
@@ -538,6 +589,7 @@ class CXLSharedTierModule:
                             ),
                             state=terminal_state,
                             terminal=True,
+                            completion=terminal_completion,
                         )
                 for item in pending:
                     if self._require_directory().lookup_ready(item.primary_key) is None:
@@ -640,13 +692,12 @@ class CXLSharedTierModule:
                 if descriptor is None:
                     raise RuntimeError("READY residency has no extent")
                 plan = adapter.build_retrieve_plan(chunk, descriptor)
-                data_completion = self._require_executor().submit(plan)
-                completion = self._model_client.join(data_completion)
+                completion = self._execute_plan(request.op_id, plan)
                 completions.append(completion)
                 self._raise_if_cancelled(request.op_id)
                 self._require_live_lease(leases[index])
                 if completion.cuda_status != "ok":
-                    raise RuntimeError(data_completion.error or "CUDA retrieve failed")
+                    raise RuntimeError(completion.error or "CUDA retrieve failed")
                 self._record_event(
                     op_id=chunk.op_id,
                     instance_id=request.instance_id,
@@ -659,6 +710,7 @@ class CXLSharedTierModule:
                     cuda_elapsed_ns=completion.cuda_elapsed_ns,
                     state="ok",
                     terminal=True,
+                    completion=completion,
                 )
                 terminal_indices.add(index)
             return self._result("ok", tuple(completions), payload_bytes=payload_bytes)
@@ -701,6 +753,7 @@ class CXLSharedTierModule:
                             ),
                             state=terminal_state,
                             terminal=True,
+                            completion=terminal_completion,
                         )
                 for lease in leases:
                     self._require_directory().release_read(
@@ -812,6 +865,8 @@ class CXLSharedTierModule:
             self._adapters.clear()
             if self._region_view is not None:
                 self._region_view.close()
+            if self._modeled_coordinator is not None:
+                self._modeled_coordinator.close()
             self._provider.close()
             self._closed = True
 
@@ -859,6 +914,7 @@ class CXLSharedTierModule:
         cuda_elapsed_ns: int | None,
         state: CXLOperationState,
         terminal: bool,
+        completion: CompositeCompletion | None = None,
     ) -> None:
         self._operation_sink.record(
             CXLOperationEvent(
@@ -876,6 +932,15 @@ class CXLSharedTierModule:
                 ),
                 payload_checksum=payload_checksum,
                 cuda_elapsed_ns=cuda_elapsed_ns,
+                modeled_queue_ns=(
+                    None if completion is None else completion.modeled_queue_ns
+                ),
+                modeled_service_ns=(
+                    None if completion is None else completion.modeled_service_ns
+                ),
+                effective_elapsed_ns=(
+                    None if completion is None else completion.effective_elapsed_ns
+                ),
                 state=state,
                 terminal=terminal,
             )
@@ -885,6 +950,33 @@ class CXLSharedTierModule:
         if op_id in self._active_operations:
             raise RuntimeError("operation ID is already active")
         self._active_operations[op_id] = _ActiveOperation(instance_id)
+
+    def _execute_plan(
+        self, parent_op_id: str, plan: TransferPlan
+    ) -> CompositeCompletion:
+        coordinator = self._modeled_coordinator
+        if coordinator is None:
+            return self._model_client.join(self._require_executor().submit(plan))
+        with self._lock:
+            operation = self._active_operations[parent_op_id]
+            operation.modeled_op_ids.add(plan.op_id)
+        try:
+            return coordinator.run(
+                op_id=plan.op_id,
+                instance_id=plan.instance_id + 1,
+                direction=plan.direction,
+                offset=plan.extent.offset,
+                bytes=plan.extent.length,
+                launch=lambda: self._require_executor().submit(plan),
+            )
+        except BaseException:
+            self._raise_if_cancelled(parent_op_id)
+            raise
+        finally:
+            with self._lock:
+                active = self._active_operations.get(parent_op_id)
+                if active is not None:
+                    active.modeled_op_ids.discard(plan.op_id)
 
     def _finish_operation(self, op_id: str) -> None:
         with self._condition:

@@ -262,22 +262,54 @@ class CompositeCompletion:
 
     op_id: str
     cuda_status: Literal["pending", "ok", "error"]
-    modeled_status: Literal["pending", "ok", "error", "not_required"]
+    modeled_status: Literal[
+        "pending", "ok", "error", "cancelled", "not_required"
+    ]
     cuda_elapsed_ns: int | None
     modeled_queue_ns: int | None
     modeled_service_ns: int | None
+    cuda_complete_ns: int | None = None
+    modeled_complete_ns: int | None = None
+    effective_complete_ns: int | None = None
+    effective_elapsed_ns: int | None = None
+    error: str | None = None
 
     def __post_init__(self) -> None:
         if not self.op_id:
             raise ValueError("op_id must not be empty")
         if self.cuda_status not in ("pending", "ok", "error"):
             raise ValueError("invalid CUDA completion status")
-        if self.modeled_status not in ("pending", "ok", "error", "not_required"):
+        if self.modeled_status not in (
+            "pending",
+            "ok",
+            "error",
+            "cancelled",
+            "not_required",
+        ):
             raise ValueError("invalid modeled completion status")
         for value in (
             self.cuda_elapsed_ns,
             self.modeled_queue_ns,
             self.modeled_service_ns,
+            self.cuda_complete_ns,
+            self.modeled_complete_ns,
+            self.effective_complete_ns,
+            self.effective_elapsed_ns,
         ):
             if value is not None and value < 0:
                 raise ValueError("completion durations must be non-negative")
+        if self.effective_complete_ns is not None and (
+            self.cuda_status != "ok"
+            or self.modeled_status not in ("ok", "not_required")
+        ):
+            raise ValueError("effective completion requires successful branches")
+        if self.effective_elapsed_ns is not None and self.effective_complete_ns is None:
+            raise ValueError("effective elapsed requires an effective completion")
+        failed = self.cuda_status == "error" or self.modeled_status in (
+            "error",
+            "cancelled",
+        )
+        if failed and not self.error:
+            raise ValueError("failed composite completion requires an error")
+        if not failed and self.error is not None:
+            raise ValueError("successful composite completion cannot have an error")

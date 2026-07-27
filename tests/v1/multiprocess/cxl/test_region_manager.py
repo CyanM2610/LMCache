@@ -2,6 +2,7 @@
 
 # Standard
 from multiprocessing import shared_memory
+import struct
 import uuid
 
 # Third Party
@@ -11,6 +12,7 @@ import pytest
 from lmcache.v1.multiprocess.cxl.region_manager import CXLRegionManager
 from lmcache.v1.multiprocess.cxl.region_provider import (
     REGION_HEADER_SIZE,
+    CXLMemSimShmRegionProvider,
     PosixShmRegionProvider,
     RegionHandle,
     pack_region_header,
@@ -144,6 +146,74 @@ def test_posix_provider_fails_closed_on_invalid_header() -> None:
         )
 
         with pytest.raises(RuntimeError, match="header"):
+            provider.provision()
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+def test_cxlmemsim_provider_uses_advertised_page_aligned_data_region() -> None:
+    name = f"cxlmemsim-test-{uuid.uuid4().hex}"
+    data_offset = 4096
+    capacity = 8192
+    shm = shared_memory.SharedMemory(
+        name=name, create=True, size=data_offset + capacity
+    )
+    try:
+        header = struct.pack(
+            "<QQQQQQQ",
+            0x43584C4D454D5348,
+            1,
+            len(shm.buf),
+            data_offset,
+            0,
+            capacity // 64,
+            0,
+        )
+        shm.buf[: len(header)] = header
+        provider = CXLMemSimShmRegionProvider(
+            region_id="cxlmemsim:/test",
+            shm_name=f"/{name}",
+            expected_capacity=capacity,
+        )
+
+        handle = provider.provision()
+
+        assert handle.data_offset == data_offset
+        assert handle.capacity == capacity
+        assert handle.capabilities == frozenset(
+            {"cuda_host_register_v1", "cxlmemsim_region_v1"}
+        )
+        provider.close()
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+def test_cxlmemsim_provider_rejects_unaligned_data_region() -> None:
+    name = f"cxlmemsim-test-{uuid.uuid4().hex}"
+    data_offset = 64
+    capacity = 4096
+    shm = shared_memory.SharedMemory(
+        name=name, create=True, size=data_offset + capacity
+    )
+    try:
+        header = struct.pack(
+            "<QQQQQQQ",
+            0x43584C4D454D5348,
+            1,
+            len(shm.buf),
+            data_offset,
+            0,
+            capacity // 64,
+            0,
+        )
+        shm.buf[: len(header)] = header
+        provider = CXLMemSimShmRegionProvider(
+            region_id="cxlmemsim:/test", shm_name=f"/{name}"
+        )
+
+        with pytest.raises(RuntimeError, match="incompatible"):
             provider.provision()
     finally:
         shm.close()

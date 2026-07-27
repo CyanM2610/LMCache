@@ -11,7 +11,8 @@
 
 class CudaRegionRegistration {
  public:
-  CudaRegionRegistration(const std::string& shm_name, size_t expected_capacity);
+  CudaRegionRegistration(const std::string& shm_name, size_t expected_capacity,
+                         size_t payload_offset = 4096);
   ~CudaRegionRegistration();
 
   CudaRegionRegistration(const CudaRegionRegistration&) = delete;

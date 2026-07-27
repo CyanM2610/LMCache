@@ -103,8 +103,12 @@ class _FakeNativeOps:
         self.fail_transfer = False
 
     def CudaRegionRegistration(
-        self, shm_name: str, expected_capacity: int
+        self,
+        shm_name: str,
+        expected_capacity: int,
+        data_offset: int = REGION_HEADER_SIZE,
     ) -> _FakeRegistration:
+        del data_offset
         registration = _FakeRegistration(shm_name, expected_capacity)
         self.registrations.append(registration)
         return registration
@@ -320,9 +324,12 @@ def test_executor_reports_cuda_error_without_fallback_copy() -> None:
 def test_registration_failure_propagates_without_launching_a_copy() -> None:
     class _FailingNativeOps(_FakeNativeOps):
         def CudaRegionRegistration(
-            self, shm_name: str, expected_capacity: int
+            self,
+            shm_name: str,
+            expected_capacity: int,
+            data_offset: int = REGION_HEADER_SIZE,
         ) -> _FakeRegistration:
-            del shm_name, expected_capacity
+            del shm_name, expected_capacity, data_offset
             raise RuntimeError("cudaHostRegister failed")
 
     native = _FailingNativeOps()

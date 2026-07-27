@@ -15,6 +15,9 @@ REGION_HEADER_SIZE = 4096
 _REGION_HEADER = struct.Struct("<8sIIQQ")
 _REGION_MAGIC = b"BLGCXLRG"
 _REGION_VERSION = 1
+_CXLMEMSIM_HEADER = struct.Struct("<QQQQQQQ")
+_CXLMEMSIM_MAGIC = 0x43584C4D454D5348
+_CXLMEMSIM_VERSION = 1
 
 
 def pack_region_header(capacity: int, alignment: int) -> bytes:
@@ -52,6 +55,7 @@ class RegionHandle:
     capacity: int
     alignment: int
     capabilities: frozenset[str]
+    data_offset: int = REGION_HEADER_SIZE
 
     def __post_init__(self) -> None:
         if not self.region_id or not self.shm_name:
@@ -60,6 +64,8 @@ class RegionHandle:
             raise ValueError("region capacity must be positive")
         if self.alignment <= 0 or self.alignment & (self.alignment - 1):
             raise ValueError("region alignment must be a power of two")
+        if self.data_offset < 0:
+            raise ValueError("region data offset must be non-negative")
 
 
 class RegionProvider(Protocol):
@@ -150,6 +156,7 @@ class PosixShmRegionProvider:
                 capacity=capacity,
                 alignment=alignment,
                 capabilities=frozenset({"cuda_host_register_v1"}),
+                data_offset=REGION_HEADER_SIZE,
             )
             return self._handle
         except BaseException:
@@ -158,6 +165,89 @@ class PosixShmRegionProvider:
 
     def close(self) -> None:
         """Close the process-local descriptor without unlinking shared storage."""
+        if self._fd is not None:
+            os.close(self._fd)
+        self._fd = None
+        self._handle = None
+
+
+class CXLMemSimShmRegionProvider:
+    """Validate the data region provisioned by a CXLMemSim SHM server."""
+
+    def __init__(
+        self,
+        *,
+        region_id: str,
+        shm_name: str,
+        expected_capacity: int | None = None,
+    ) -> None:
+        self._region_id = region_id
+        self._shm_name = shm_name
+        self._expected_capacity = expected_capacity
+        self._fd: int | None = None
+        self._handle: RegionHandle | None = None
+
+    def provision(self) -> RegionHandle:
+        """Open a page-aligned CXLMemSim data mapping without fallback."""
+        if self._handle is not None:
+            return self._handle
+        if not self._shm_name.startswith("/") or "/" in self._shm_name[1:]:
+            raise ValueError("shm_name must be a POSIX SHM name")
+        fd = os.open(f"/dev/shm{self._shm_name}", os.O_RDWR)
+        try:
+            size = os.fstat(fd).st_size
+            if size < _CXLMEMSIM_HEADER.size:
+                raise RuntimeError("CXLMemSim shared region header is truncated")
+            encoded = os.pread(fd, _CXLMEMSIM_HEADER.size, 0)
+            if len(encoded) != _CXLMEMSIM_HEADER.size:
+                raise RuntimeError("CXLMemSim shared region header is truncated")
+            (
+                magic,
+                version,
+                total_size,
+                data_offset,
+                _metadata_offset,
+                num_cachelines,
+                _base_addr,
+            ) = _CXLMEMSIM_HEADER.unpack(encoded)
+            capacity = num_cachelines * 64
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if (
+                magic != _CXLMEMSIM_MAGIC
+                or version != _CXLMEMSIM_VERSION
+                or total_size != size
+                or data_offset < _CXLMEMSIM_HEADER.size
+                or data_offset % page_size
+                or capacity <= 0
+                or data_offset > size
+                or capacity > size - data_offset
+            ):
+                raise RuntimeError("CXLMemSim shared region header is incompatible")
+            if (
+                self._expected_capacity is not None
+                and capacity != self._expected_capacity
+            ):
+                raise RuntimeError(
+                    "CXLMemSim shared region capacity does not match config"
+                )
+            self._fd = fd
+            self._handle = RegionHandle(
+                region_id=self._region_id,
+                shm_name=self._shm_name,
+                capacity=capacity,
+                alignment=page_size,
+                capabilities=frozenset(
+                    {"cuda_host_register_v1", "cxlmemsim_region_v1"}
+                ),
+                data_offset=data_offset,
+            )
+            return self._handle
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def close(self) -> None:
+        """Close the descriptor without unlinking CXLMemSim storage."""
         if self._fd is not None:
             os.close(self._fd)
         self._fd = None
