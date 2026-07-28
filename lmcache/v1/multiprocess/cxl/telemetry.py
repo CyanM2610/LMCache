@@ -173,7 +173,7 @@ class LoggingPolicyEventSink:
         self._logger = logger
 
     def record(self, event: PolicyEvent) -> None:
-        self._logger.info(
+        self._logger.debug(
             "gate_e_policy=%s",
             json.dumps(event.to_primitive(), sort_keys=True),
         )
@@ -189,10 +189,10 @@ class PolicyMetrics:
         self._external_tokens = 0
         self._recomputed_tokens = 0
         self._queue_bytes: dict[str, int] = {}
-        self._latencies: dict[str, list[int]] = {
-            "cuda": [],
-            "modeled": [],
-            "effective": [],
+        self._latencies: dict[str, deque[int]] = {
+            "cuda": deque(maxlen=4096),
+            "modeled": deque(maxlen=4096),
+            "effective": deque(maxlen=4096),
         }
         self._fallback_count = 0
         self._ticket_conflicts = 0

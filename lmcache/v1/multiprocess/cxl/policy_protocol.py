@@ -10,7 +10,7 @@ from typing import Literal
 import re
 
 
-GATE_E_PROTOCOL_VERSION = 1
+GATE_E_PROTOCOL_VERSION = 2
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -24,12 +24,17 @@ class GateERequestEnvelope:
     recompute_estimate_ns: int
     layout_fingerprint: str
     ticket_id: str | None = None
+    instance_id: int = 0
 
     def __post_init__(self) -> None:
         if self.protocol_version <= 0:
             raise ValueError("protocol_version must be positive")
         if not self.request_id:
             raise ValueError("request_id must not be empty")
+        if self.instance_id < 0 or (
+            self.protocol_version == GATE_E_PROTOCOL_VERSION and self.instance_id == 0
+        ):
+            raise ValueError("current protocol requires a positive instance_id")
         if self.deadline_ns is not None and self.deadline_ns < 0:
             raise ValueError("deadline_ns must be non-negative")
         if self.recompute_estimate_ns <= 0:

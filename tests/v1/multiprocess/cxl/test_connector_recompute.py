@@ -2,7 +2,6 @@
 
 # Standard
 from unittest.mock import MagicMock, patch
-import threading
 
 # Third Party
 import pytest
@@ -40,6 +39,7 @@ def _envelope(request_id: str = "request") -> GateERequestEnvelope:
     return GateERequestEnvelope(
         protocol_version=GATE_E_PROTOCOL_VERSION,
         request_id=request_id,
+        instance_id=1234,
         deadline_ns=None,
         recompute_estimate_ns=10_000,
         layout_fingerprint="a" * 64,
@@ -47,29 +47,30 @@ def _envelope(request_id: str = "request") -> GateERequestEnvelope:
 
 
 def _adapter(responses: dict[str, GateELookupResponse]) -> LMCacheMPSchedulerAdapter:
-    adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
-    adapter.model_name = "test_model"
-    adapter.lmcache_tokens_per_chunk = 256
-    adapter.blocks_in_chunk = 16
-    adapter.parallel_strategy = ParallelStrategy(False, 2, 0, 2, 1, 1)
-    adapter._server_urls = list(responses)
-    adapter._health_events = {}
-    adapter._mq_timeout = 30.0
-    adapter._heartbeats = {}
-    adapter._heartbeat_lock = threading.Lock()
-
     clients = {}
     for url, response in responses.items():
-        event = threading.Event()
-        event.set()
-        adapter._health_events[url] = event
         client = MagicMock(spec=MessageQueueClient)
         future = MagicMock()
         future.result.return_value = response
         client.submit_request.return_value = future
         clients[url] = client
-    adapter.mq_clients = clients
-    return adapter
+    with (
+        patch(
+            "lmcache.integration.vllm.vllm_multi_process_adapter.MessageQueueClient",
+            side_effect=lambda url, context: clients[url],
+        ),
+        patch(
+            "lmcache.integration.vllm.vllm_multi_process_adapter.get_lmcache_chunk_size",
+            return_value=256,
+        ),
+    ):
+        return LMCacheMPSchedulerAdapter(
+            list(responses),
+            MagicMock(),
+            "test_model",
+            16,
+            ParallelStrategy(False, 2, 0, 2, 1, 1),
+        )
 
 
 def test_positive_external_match_is_returned_only_with_bound_tickets() -> None:
@@ -202,3 +203,12 @@ def test_policy_protocol_is_version_separate_and_ticket_precedes_response() -> N
 
     assert response.status == "fetch" and response.matched_tokens == 16
     assert order == ["bind", "response"]
+
+    legacy = GateERequestEnvelope(
+        protocol_version=1,
+        request_id="request",
+        deadline_ns=None,
+        recompute_estimate_ns=10_000,
+        layout_fingerprint="a" * 64,
+    )
+    assert module.policy_lookup(key, 1, legacy).status == "unsupported"

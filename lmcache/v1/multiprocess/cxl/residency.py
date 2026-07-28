@@ -17,6 +17,7 @@ from lmcache.v1.distributed.api import ObjectKey
 
 # Local
 from .contracts import ExtentDescriptor
+from .bounded import BoundedSet
 from .region_manager import CXLRegionManager
 
 
@@ -73,7 +74,7 @@ class SingleResidencyDirectory:
         self._by_key: dict[ObjectKey, _ResidencyEntry] = {}
         self._by_id: dict[str, _ResidencyEntry] = {}
         self._leases: dict[str, tuple[_ResidencyEntry, ReadLease]] = {}
-        self._retired_leases: set[str] = set()
+        self._retired_leases: BoundedSet[str] = BoundedSet()
         self._lock = threading.RLock()
 
     def reserve_store(

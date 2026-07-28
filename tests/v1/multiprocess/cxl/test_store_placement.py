@@ -2,6 +2,7 @@
 
 # Standard
 from dataclasses import dataclass
+import threading
 
 # Third Party
 import pytest
@@ -105,3 +106,50 @@ def test_independent_required_optional_store_targets(
     assert {item.tier for item in result.failed_targets} == {
         tier for tier, ok in outcomes.items() if not ok
     }
+
+
+def test_source_hbm_is_retained_until_last_target_completes() -> None:
+    directory = _directory()
+    source = _Source()
+    second_started = threading.Event()
+    allow_second = threading.Event()
+
+    class BlockingExecutor:
+        def transfer(
+            self, target: TargetSpec, residency: object, actual_source: object
+        ) -> TargetTransferCompletion:
+            del residency
+            assert actual_source is source
+            assert not source.released
+            if target.tier == "cxl":
+                second_started.set()
+                assert allow_second.wait(2)
+            return TargetTransferCompletion(target.tier, True, None)
+
+    result = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            StoreCoordinator(directory, BlockingExecutor()).execute(
+                StorePlacementPlan(
+                    _key(),
+                    (
+                        TargetSpec("dram", True, "first"),
+                        TargetSpec("cxl", True, "second"),
+                    ),
+                    "barrier",
+                ),
+                source,
+                length=256,
+                alignment=64,
+            )
+        )
+    )
+    thread.start()
+    assert second_started.wait(2)
+    assert not source.released
+    allow_second.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert source.released
+    assert len(result) == 1 and result[0].required_satisfied

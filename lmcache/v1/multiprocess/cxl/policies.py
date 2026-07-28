@@ -24,9 +24,27 @@ from .observations import PlacementSnapshot, ResidencyObservation, TierObservati
 class PlacementPolicy(Protocol):
     """Stable policy seam containing domain objects only."""
 
-    def plan_store(self, snapshot: PlacementSnapshot) -> StorePlacementPlan: ...
+    def plan_store(self, snapshot: PlacementSnapshot) -> StorePlacementPlan:
+        """Choose independent STORE targets for one request.
 
-    def decide_lookup(self, snapshot: PlacementSnapshot) -> LookupDecision: ...
+        Args:
+            snapshot: Current request, residency, and tier observations.
+
+        Returns:
+            Validated required and optional STORE targets.
+        """
+        ...
+
+    def decide_lookup(self, snapshot: PlacementSnapshot) -> LookupDecision:
+        """Choose one residency fetch or explicit recompute.
+
+        Args:
+            snapshot: Current request, residency, and tier observations.
+
+        Returns:
+            A fetch decision or explicit recompute decision.
+        """
+        ...
 
 
 def _duration_ns(byte_count: int, bytes_per_second: int) -> int:
@@ -55,16 +73,27 @@ def _eligible(
 
 
 class _BasePolicy:
-    def __init__(self, store_tier: Tier = "cxl") -> None:
+    def __init__(
+        self,
+        store_tier: Tier = "cxl",
+        *,
+        store_targets: tuple[TargetSpec, ...] | None = None,
+    ) -> None:
         if store_tier not in ("dram", "cxl"):
             raise ValueError("store_tier is unsupported")
-        self._store_tier = store_tier
+        self._store_targets = store_targets or (
+            TargetSpec(store_tier, True, "policy baseline"),
+        )
+        tiers = [target.tier for target in self._store_targets]
+        if len(set(tiers)) != len(tiers):
+            raise ValueError("store targets contain a duplicate tier")
 
     def plan_store(self, snapshot: PlacementSnapshot) -> StorePlacementPlan:
+        """Return the configured STORE target set for a request."""
         return StorePlacementPlan(
             snapshot.request.object_key,
-            (TargetSpec(self._store_tier, True, "policy baseline"),),
-            f"required {self._store_tier} baseline",
+            self._store_targets,
+            "configured STORE placement",
         )
 
 
@@ -72,6 +101,7 @@ class FixedL1FirstPolicy(_BasePolicy):
     """Explicit DRAM-first baseline independent of estimated cost."""
 
     def decide_lookup(self, snapshot: PlacementSnapshot) -> LookupDecision:
+        """Choose DRAM, then CXL, without comparing estimated costs."""
         candidates, rejections = _eligible(snapshot)
         for tier in ("dram", "cxl"):
             found = next((item for item in candidates if item.tier == tier), None)
@@ -100,6 +130,7 @@ class AlwaysRecomputePolicy(_BasePolicy):
     """Explicit no-external-fetch baseline."""
 
     def decide_lookup(self, snapshot: PlacementSnapshot) -> LookupDecision:
+        """Return recompute for every lookup."""
         del snapshot
         return RecomputeDecision("always_recompute baseline")
 
@@ -113,14 +144,16 @@ class CostAwarePolicy(_BasePolicy):
         cuda_bandwidth_bytes_per_s: int = 25_000_000_000,
         cuda_latency_ns: int = 0,
         store_tier: Tier = "cxl",
+        store_targets: tuple[TargetSpec, ...] | None = None,
     ) -> None:
-        super().__init__(store_tier)
+        super().__init__(store_tier, store_targets=store_targets)
         if cuda_bandwidth_bytes_per_s <= 0 or cuda_latency_ns < 0:
             raise ValueError("CUDA estimates must be positive/non-negative")
         self._cuda_bandwidth = cuda_bandwidth_bytes_per_s
         self._cuda_latency_ns = cuda_latency_ns
 
     def decide_lookup(self, snapshot: PlacementSnapshot) -> LookupDecision:
+        """Choose the lowest feasible fetch or recompute estimate."""
         candidates, rejections = _eligible(snapshot)
         tier_by_name = {tier.tier: tier for tier in snapshot.tiers}
         estimates: dict[str, int] = {
@@ -184,6 +217,7 @@ class AlwaysFetchPolicy(CostAwarePolicy):
     """Fetch the lowest raw eligible source even when recompute is cheaper."""
 
     def decide_lookup(self, snapshot: PlacementSnapshot) -> LookupDecision:
+        """Choose the lowest-cost eligible residency when one exists."""
         candidates, rejections = _eligible(snapshot)
         if not candidates:
             return RecomputeDecision(

@@ -109,21 +109,35 @@ class ModelCompletion:
 class CXLModelClient(Protocol):
     """Completion-model boundary used by the CXL data plane."""
 
-    def capabilities(self) -> frozenset[str]: ...
+    def capabilities(self) -> frozenset[str]:
+        """Return negotiated capability names."""
+        ...
 
-    def register_region(self, handle: RegionHandle) -> RegisteredModelRegion: ...
+    def register_region(self, handle: RegionHandle) -> RegisteredModelRegion:
+        """Register a validated process-independent region."""
+        ...
 
-    def begin_access(self, request: ModeledAccessRequest) -> ModelCompletion: ...
+    def begin_access(self, request: ModeledAccessRequest) -> ModelCompletion:
+        """Reserve modeled service before launching CUDA."""
+        ...
 
     def data_complete(
         self, op_id: str, cuda_status: Literal["ok", "error"], complete_ns: int
-    ) -> None: ...
+    ) -> None:
+        """Publish the CUDA branch terminal state."""
+        ...
 
-    def await_completion(self, op_id: str) -> ModelCompletion: ...
+    def await_completion(self, op_id: str) -> ModelCompletion:
+        """Wait for modeled service to reach a terminal state."""
+        ...
 
-    def cancel(self, op_id: str, reason: str) -> None: ...
+    def cancel(self, op_id: str, reason: str) -> None:
+        """Cancel a known modeled operation idempotently."""
+        ...
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Close the modeled client."""
+        ...
 
 
 class _ModelTransport(Protocol):
@@ -298,8 +312,21 @@ class CXLMemSimModelClient:
                     result.error,
                 )
             with self._lock:
+                if op_id not in self._operations:
+                    return ModelCompletion(
+                        op_id,
+                        "cancelled",
+                        operation.access_token,
+                        result.queue_ns,
+                        result.service_ns,
+                        result.modeled_complete_ns,
+                        None,
+                    )
                 self._operations[op_id] = result
             if result.status in ("ok", "error", "cancelled"):
+                with self._lock:
+                    self._operations.pop(op_id, None)
+                    self._data_terminals.pop(op_id, None)
                 return result
             if self._clock_ns() >= deadline:
                 raise TimeoutError(f"modeled access {op_id} timed out")
@@ -314,15 +341,8 @@ class CXLMemSimModelClient:
             if operation is None or operation.status == "cancelled":
                 return
             self._transport.cancel_access(operation.access_token, reason)
-            self._operations[op_id] = ModelCompletion(
-                op_id,
-                "cancelled",
-                operation.access_token,
-                operation.queue_ns,
-                operation.service_ns,
-                operation.modeled_complete_ns,
-                None,
-            )
+            self._operations.pop(op_id, None)
+            self._data_terminals.pop(op_id, None)
 
     def close(self) -> None:
         """Close the native modeled transport once."""
@@ -549,9 +569,7 @@ class _CtypesModelTransport:
                 "invalid modeled-access response"
             ) from protocol_error
         diagnostic = (
-            f"modeled-access error {result.error_code}"
-            if state == "error"
-            else None
+            f"modeled-access error {result.error_code}" if state == "error" else None
         )
         return ModelCompletion(
             op_id,

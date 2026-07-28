@@ -272,6 +272,19 @@ class CompositeCompletion:
     effective_elapsed_ns: int | None = None
     error: str | None = None
 
+    @property
+    def success(self) -> bool:
+        """Return whether every required completion branch succeeded.
+
+        Returns:
+            True when CUDA succeeded and modeled access either succeeded or
+            was not required.
+        """
+        return self.cuda_status == "ok" and self.modeled_status in (
+            "ok",
+            "not_required",
+        )
+
     def __post_init__(self) -> None:
         if not self.op_id:
             raise ValueError("op_id must not be empty")

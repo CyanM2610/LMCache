@@ -72,9 +72,7 @@ def _handle(capacity: int = 4096, alignment: int = 64) -> RegionHandle:
         shm_name="/cxlmemsim_shared",
         capacity=capacity,
         alignment=alignment,
-        capabilities=frozenset(
-            {"cuda_host_register_v1", "cxlmemsim_region_v1"}
-        ),
+        capabilities=frozenset({"cuda_host_register_v1", "cxlmemsim_region_v1"}),
         data_offset=4096,
     )
 
@@ -157,9 +155,7 @@ def test_client_preserves_model_fields_and_terminal_idempotency() -> None:
     completed = client.await_completion("op-1")
 
     assert pending.modeled_complete_ns == 1500
-    assert completed == ModelCompletion(
-        "op-1", "ok", 23, 10, 500, 1500, None
-    )
+    assert completed == ModelCompletion("op-1", "ok", 23, 10, 500, 1500, None)
     assert [event[0] for event in transport.events].count("data") == 1
 
 

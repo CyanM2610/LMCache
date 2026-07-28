@@ -376,6 +376,19 @@ def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     assert event_ref() is None
 
 
+def test_failed_retrieve_marks_destination_blocks_for_recompute(fake_adapter):
+    adapter, _send_mock, _future = fake_adapter
+    failed_future = MagicMock(name="failed_retrieve")
+    failed_future.query.return_value = True
+    failed_future.result.return_value = False
+    adapter.retrieve_futures["req-1"] = (failed_future, [7, 8])
+
+    _stores, retrieves = adapter.get_finished(set())
+
+    assert retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {7, 8}
+
+
 def test_instance_id_is_uuid_derived_63_bit_int(fake_adapter) -> None:
     """instance_id is a 63-bit int, not the PID, and unique per adapter."""
     adapter, _send_mock, _ = fake_adapter

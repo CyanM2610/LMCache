@@ -12,6 +12,7 @@ import time
 
 # Local
 from .contracts import CompositeCompletion, DataCompletion
+from .bounded import BoundedSet
 from .model_client import (
     CXLModelClient,
     ModelCompletion,
@@ -42,9 +43,7 @@ class NoopModelClient:
             modeled_service_ns=None,
             cuda_complete_ns=data_completion.complete_ns,
             modeled_complete_ns=None,
-            effective_complete_ns=(
-                data_completion.complete_ns if success else None
-            ),
+            effective_complete_ns=(data_completion.complete_ns if success else None),
             effective_elapsed_ns=data_completion.elapsed_ns if success else None,
             error=data_completion.error,
         )
@@ -121,7 +120,8 @@ class ModeledCompletionCoordinator:
         self._client = client
         self._region = region
         self._clock_ns = clock_ns
-        self._cancelled: set[str] = set()
+        self._cancelled: BoundedSet[str] = BoundedSet()
+        self._states: dict[str, Literal["pending", "active"]] = {}
         self._lock = threading.RLock()
 
     def run(
@@ -150,34 +150,55 @@ class ModeledCompletionCoordinator:
         with self._lock:
             if op_id in self._cancelled:
                 raise RuntimeError(f"modeled operation {op_id} was cancelled")
+            if op_id in self._states:
+                raise RuntimeError(f"modeled operation {op_id} is already active")
+            self._states[op_id] = "pending"
         start_ns = self._clock_ns()
-        self._client.begin_access(
-            ModeledAccessRequest(
-                op_id=op_id,
-                client_id=instance_id,
-                direction=direction,
-                server_region_token=self._region.server_region_token,
-                offset=offset,
-                bytes=bytes,
-                start_ns=start_ns,
+        try:
+            self._client.begin_access(
+                ModeledAccessRequest(
+                    op_id=op_id,
+                    client_id=instance_id,
+                    direction=direction,
+                    server_region_token=self._region.server_region_token,
+                    offset=offset,
+                    bytes=bytes,
+                    start_ns=start_ns,
+                )
             )
-        )
-        try:
-            data_completion = launch()
         except BaseException:
-            self._client.cancel(op_id, "CUDA launch raised before terminal state")
+            with self._lock:
+                self._states.pop(op_id, None)
             raise
-        complete_ns = data_completion.complete_ns or self._clock_ns()
-        cuda_status: Literal["ok", "error"] = (
-            "ok" if data_completion.status == "ok" else "error"
-        )
-        self._client.data_complete(op_id, cuda_status, complete_ns)
+        with self._lock:
+            cancelled = op_id in self._cancelled
+            if not cancelled:
+                self._states[op_id] = "active"
+        if cancelled:
+            self._client.cancel(op_id, "cancelled while modeled access registered")
+            with self._lock:
+                self._states.pop(op_id, None)
+            raise RuntimeError(f"modeled operation {op_id} was cancelled")
         try:
-            model_completion = self._client.await_completion(op_id)
-        except BaseException:
-            self._client.cancel(op_id, "modeled completion failed")
-            raise
-        return compose_completion(start_ns, data_completion, model_completion)
+            try:
+                data_completion = launch()
+            except BaseException:
+                self._client.cancel(op_id, "CUDA launch raised before terminal state")
+                raise
+            complete_ns = data_completion.complete_ns or self._clock_ns()
+            cuda_status: Literal["ok", "error"] = (
+                "ok" if data_completion.status == "ok" else "error"
+            )
+            self._client.data_complete(op_id, cuda_status, complete_ns)
+            try:
+                model_completion = self._client.await_completion(op_id)
+            except BaseException:
+                self._client.cancel(op_id, "modeled completion failed")
+                raise
+            return compose_completion(start_ns, data_completion, model_completion)
+        finally:
+            with self._lock:
+                self._states.pop(op_id, None)
 
     def cancel(self, op_id: str, reason: str) -> None:
         """Cancel before launch or forward cancellation to an active model op."""
@@ -185,7 +206,9 @@ class ModeledCompletionCoordinator:
             raise ValueError("cancellation identity and reason are required")
         with self._lock:
             self._cancelled.add(op_id)
-        self._client.cancel(op_id, reason)
+            active = self._states.get(op_id) == "active"
+        if active:
+            self._client.cancel(op_id, reason)
 
     def close(self) -> None:
         """Close the underlying modeled client."""

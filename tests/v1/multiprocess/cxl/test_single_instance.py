@@ -2,7 +2,7 @@
 
 # Standard
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from types import SimpleNamespace
 from typing import Callable, Iterator
@@ -36,6 +36,7 @@ from lmcache.v1.multiprocess.cxl.policy_protocol import (
     GateERequestEnvelope,
 )
 from lmcache.v1.multiprocess.cxl.residency import ResidencyState
+from lmcache.v1.multiprocess.cxl.telemetry import InMemoryPolicyEventSink
 from lmcache.v1.multiprocess.modules.cxl_shared_tier import (
     CXLSharedTierModule,
     CXLTransferResult,
@@ -45,15 +46,16 @@ from lmcache.v1.mp_observability.event import Event
 
 
 class _FakeRegistration:
-    def __init__(self, shm_name: str, capacity: int) -> None:
+    def __init__(self, shm_name: str, capacity: int, base_address: int) -> None:
         self.shm_name = shm_name
         self.capacity = capacity
+        self.base_address = base_address
         self.closed = False
 
     def device_address(self, offset: int, length: int) -> int:
         assert offset >= 0
         assert length > 0
-        return 0x100000 + offset
+        return self.base_address + offset
 
     def close(self) -> None:
         self.closed = True
@@ -68,18 +70,30 @@ class _FakeNativeOps:
         self.registrations: list[_FakeRegistration] = []
         self.transfers: list[tuple[object, ...]] = []
         self.fail_transfer = False
+        self.fail_h2d_bases: set[int] = set()
 
     def CudaRegionRegistration(
         self, shm_name: str, capacity: int, data_offset: int = REGION_HEADER_SIZE
     ) -> _FakeRegistration:
         del data_offset
-        registration = _FakeRegistration(shm_name, capacity)
+        registration = _FakeRegistration(
+            shm_name, capacity, 0x100000 * (len(self.registrations) + 1)
+        )
         self.registrations.append(registration)
         return registration
 
     def cxl_region_block_kv_transfer(self, *args: object) -> None:
         if self.fail_transfer:
             raise RuntimeError("injected CUDA failure")
+        pointers = args[1]
+        direction = args[5]
+        if (
+            direction == self.TransferDirection.H2D
+            and isinstance(pointers, list)
+            and pointers
+            and pointers[0] in self.fail_h2d_bases
+        ):
+            raise RuntimeError("injected tier-specific CUDA failure")
         self.transfers.append(args)
 
 
@@ -91,10 +105,11 @@ class _FakeRuntime:
 
 
 class _FakeModelClient:
-    def __init__(self) -> None:
+    def __init__(self, status: str = "ok") -> None:
         self.requests: dict[str, ModeledAccessRequest] = {}
         self.data_terminals: list[tuple[str, str, int]] = []
         self.closed = False
+        self.status = status
 
     def register_region(self, handle: RegionHandle) -> RegisteredModelRegion:
         return RegisteredModelRegion(
@@ -123,12 +138,12 @@ class _FakeModelClient:
         request = self.requests[op_id]
         return ModelCompletion(
             op_id,
-            "ok",
+            self.status,  # type: ignore[arg-type]
             len(self.requests),
             20,
             100,
             request.start_ns + 100,
-            None,
+            "injected modeled failure" if self.status == "error" else None,
         )
 
     def cancel(self, op_id: str, reason: str) -> None:
@@ -493,6 +508,10 @@ def _open_module(
     cache_context: _CacheContext | None = None,
     *,
     register_engine: bool = True,
+    policy_event_sink: InMemoryPolicyEventSink | None = None,
+    dram_capacity_bytes: int = 0,
+    policy_store_mode: str = "cxl_required",
+    policy_dram_bandwidth_bytes_per_s: int = 50_000_000_000,
 ) -> tuple[CXLSharedTierModule, shared_memory.SharedMemory]:
     capacity = 4096
     name = f"beluga-gate-b-{uuid.uuid4().hex}"
@@ -507,12 +526,16 @@ def _open_module(
             provider="posix_shm",
             shm_name=f"/{name}",
             capacity_bytes=capacity,
+            dram_capacity_bytes=dram_capacity_bytes,
             alignment_bytes=64,
             layout_id="packed_kv_v1",
+            policy_store_mode=policy_store_mode,
+            policy_dram_bandwidth_bytes_per_s=(policy_dram_bandwidth_bytes_per_s),
         ),
         native_ops=native,
         runtime=_FakeRuntime(),
         clock_ns=lambda: 100,
+        policy_event_sink=policy_event_sink,
     )
     if register_engine:
         module.register_engine(
@@ -581,6 +604,16 @@ def test_cxlmemsim_modeled_completion_is_used_by_store_and_retrieve(
         assert terminal[-1].modeled_queue_ns == 20
         assert terminal[-1].modeled_service_ns == 100
         assert terminal[-1].effective_elapsed_ns == 100
+
+        model.status = "error"
+        failed_retrieve = module.retrieve(_request("modeled-retrieve-error", keys))
+        failed_key = _key(b"modeled-store-error")
+        failed_store = module.store(_request("modeled-store-error", (failed_key,)))
+
+        assert failed_retrieve.status == "error"
+        assert failed_retrieve.completions[0].modeled_status == "error"
+        assert failed_store.status == "error"
+        assert module.lookup_ready(failed_key) is None
     finally:
         module.close()
         shm.close()
@@ -615,35 +648,214 @@ def test_store_publishes_immutable_chunks_only_after_cuda_success() -> None:
 
 def test_gate_e_policy_binds_before_hit_and_recompute_returns_no_ticket() -> None:
     native = _FakeNativeOps()
-    module, shm = _open_module(native)
+    policy_sink = InMemoryPolicyEventSink()
+    module, shm = _open_module(native, policy_event_sink=policy_sink)
     keys = (_key(b"policy-a"), _key(b"policy-b"))
     try:
         assert module.store(_request("store-policy", keys)).status == "ok"
         fingerprint = module.lookup_ready(keys[0]).descriptor.layout_fingerprint
         fetch = GateERequestEnvelope(
-            GATE_E_PROTOCOL_VERSION,
-            "request",
-            None,
-            1_000_000_000,
-            fingerprint,
+            protocol_version=GATE_E_PROTOCOL_VERSION,
+            request_id="request",
+            deadline_ns=None,
+            recompute_estimate_ns=1_000_000_000,
+            layout_fingerprint=fingerprint,
+            instance_id=71,
         )
 
         assert module.policy_bind_ready_prefix("request", keys, 1, fetch) == 2
         assert len(module.get_bound_ticket_ids("request")) == 2
+        assert policy_sink.snapshot()[0].instance_id == 71
         module.release_lookup_tickets("request", "APC overlap", object_keys=(keys[0],))
         assert len(module.get_bound_ticket_ids("request")) == 1
         module.release_lookup_tickets("request", "lookup replaced")
 
         recompute = GateERequestEnvelope(
-            GATE_E_PROTOCOL_VERSION,
-            "request",
-            None,
-            1,
-            fingerprint,
+            protocol_version=GATE_E_PROTOCOL_VERSION,
+            request_id="request",
+            deadline_ns=None,
+            recompute_estimate_ns=1,
+            layout_fingerprint=fingerprint,
+            instance_id=71,
         )
         assert module.policy_bind_ready_prefix("request", keys, 1, recompute) == 0
         assert module.get_bound_ticket_ids("request") == ()
         assert '"winner": "recompute"' in module.get_lookup_decision_reason("request")
+    finally:
+        module.close()
+        shm.close()
+        shm.unlink()
+
+
+def test_online_store_and_lookup_use_independent_dram_and_cxl_residencies() -> None:
+    native = _FakeNativeOps()
+    policy_sink = InMemoryPolicyEventSink()
+    module, shm = _open_module(
+        native,
+        policy_event_sink=policy_sink,
+        dram_capacity_bytes=4096,
+        policy_store_mode="dram_required_cxl_optional",
+        policy_dram_bandwidth_bytes_per_s=1_000_000,
+    )
+    key = _key(b"online-multi-residency")
+    try:
+        stored = module.store(_request("multi-store", (key,)))
+
+        residencies = module.list_residencies(key)
+        assert stored.status == "ok"
+        assert stored.path == "multi_direct"
+        assert {item.tier for item in residencies} == {"dram", "cxl"}
+        assert all(item.state == ResidencyState.READY for item in residencies)
+        assert len(native.registrations) == 2
+        assert [transfer[5] for transfer in native.transfers] == ["d2h", "d2h"]
+        assert native.transfers[0][1] != native.transfers[1][1]
+
+        descriptor = residencies[0].descriptor
+        assert descriptor is not None
+        fingerprint = descriptor.layout_fingerprint
+        envelope = GateERequestEnvelope(
+            protocol_version=GATE_E_PROTOCOL_VERSION,
+            request_id="multi-lookup",
+            deadline_ns=None,
+            recompute_estimate_ns=1_000_000_000,
+            layout_fingerprint=fingerprint,
+            instance_id=9901,
+        )
+        assert module.policy_bind_ready_prefix("multi-lookup", (key,), 1, envelope) == 1
+        assert policy_sink.snapshot()[-1].tier == "dram"
+
+        cxl_envelope = replace(envelope, request_id="cxl-lookup")
+        assert (
+            module.policy_bind_ready_prefix("cxl-lookup", (key,), 1, cxl_envelope) == 1
+        )
+        assert policy_sink.snapshot()[-1].tier == "cxl"
+        module.release_lookup_tickets("cxl-lookup", "test completed")
+
+        retrieve_request = replace(
+            _request("multi-retrieve", (key,)),
+            external_request_id="multi-lookup",
+        )
+        retrieved = module.retrieve(retrieve_request)
+        assert retrieved.status == "ok"
+        assert retrieved.path == "dram_direct"
+        assert retrieved.completions[0].modeled_status == "not_required"
+        assert native.transfers[-1][5] == "h2d"
+    finally:
+        module.close()
+        shm.close()
+        shm.unlink()
+
+
+def test_online_retrieve_falls_back_once_to_alternate_residency() -> None:
+    native = _FakeNativeOps()
+    policy_sink = InMemoryPolicyEventSink()
+    module, shm = _open_module(
+        native,
+        policy_event_sink=policy_sink,
+        dram_capacity_bytes=4096,
+        policy_store_mode="both_required",
+        policy_dram_bandwidth_bytes_per_s=1_000_000,
+    )
+    key = _key(b"online-fallback")
+    try:
+        assert module.store(_request("fallback-store", (key,))).status == "ok"
+        residencies = {item.tier: item for item in module.list_residencies(key)}
+        descriptor = residencies["cxl"].descriptor
+        assert descriptor is not None
+        envelope = GateERequestEnvelope(
+            protocol_version=GATE_E_PROTOCOL_VERSION,
+            request_id="hold-dram",
+            deadline_ns=None,
+            recompute_estimate_ns=1_000_000_000,
+            layout_fingerprint=descriptor.layout_fingerprint,
+            instance_id=71,
+        )
+        assert module.policy_bind_ready_prefix("hold-dram", (key,), 1, envelope) == 1
+        cxl_envelope = replace(envelope, request_id="fallback-retrieve")
+        assert (
+            module.policy_bind_ready_prefix(
+                "fallback-retrieve", (key,), 1, cxl_envelope
+            )
+            == 1
+        )
+        module.release_lookup_tickets("hold-dram", "allow fallback")
+
+        native.fail_h2d_bases.add(native.registrations[0].base_address)
+        result = module.retrieve(
+            replace(
+                _request("fallback-retrieve-op", (key,)),
+                external_request_id="fallback-retrieve",
+            )
+        )
+
+        assert result.status == "ok"
+        assert result.path == "dram_direct"
+        assert len(result.completions) == 2
+        fallback = policy_sink.snapshot()[-1]
+        assert fallback.event == "fallback"
+        assert fallback.fallback_from == "cxl"
+        assert fallback.fallback_to == "dram"
+        assert fallback.chosen_action == "fetch"
+        assert fallback.invalidated_blocks == 0
+    finally:
+        module.close()
+        shm.close()
+        shm.unlink()
+
+
+def test_online_retrieve_second_failure_delegates_to_recompute() -> None:
+    native = _FakeNativeOps()
+    policy_sink = InMemoryPolicyEventSink()
+    module, shm = _open_module(
+        native,
+        policy_event_sink=policy_sink,
+        dram_capacity_bytes=4096,
+        policy_store_mode="both_required",
+        policy_dram_bandwidth_bytes_per_s=1_000_000,
+    )
+    key = _key(b"online-recompute")
+    try:
+        assert module.store(_request("recompute-store", (key,))).status == "ok"
+        residencies = module.list_residencies(key)
+        descriptor = residencies[0].descriptor
+        assert descriptor is not None
+        envelope = GateERequestEnvelope(
+            protocol_version=GATE_E_PROTOCOL_VERSION,
+            request_id="hold-dram-recompute",
+            deadline_ns=None,
+            recompute_estimate_ns=1_000_000_000,
+            layout_fingerprint=descriptor.layout_fingerprint,
+            instance_id=71,
+        )
+        assert (
+            module.policy_bind_ready_prefix("hold-dram-recompute", (key,), 1, envelope)
+            == 1
+        )
+        failed_envelope = replace(envelope, request_id="recompute-retrieve")
+        assert (
+            module.policy_bind_ready_prefix(
+                "recompute-retrieve", (key,), 1, failed_envelope
+            )
+            == 1
+        )
+        module.release_lookup_tickets("hold-dram-recompute", "allow fallback")
+        native.fail_h2d_bases.update(
+            registration.base_address for registration in native.registrations
+        )
+
+        result = module.retrieve(
+            replace(
+                _request("recompute-retrieve-op", (key,)),
+                external_request_id="recompute-retrieve",
+            )
+        )
+
+        assert result.status == "error"
+        assert len(result.completions) == 2
+        fallback = policy_sink.snapshot()[-1]
+        assert fallback.event == "fallback"
+        assert fallback.chosen_action == "recompute"
+        assert fallback.invalidated_blocks == 1
     finally:
         module.close()
         shm.close()

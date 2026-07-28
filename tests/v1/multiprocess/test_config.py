@@ -147,10 +147,14 @@ def test_cxl_shared_tier_parses_complete_opt_in_configuration():
             "/beluga-cxl",
             "--cxl-shared-tier-capacity-bytes",
             "1048576",
+            "--cxl-shared-tier-dram-capacity-bytes",
+            "524288",
             "--cxl-shared-tier-alignment-bytes",
             "4096",
             "--cxl-shared-tier-layout-id",
             "packed_kv_v1",
+            "--cxl-shared-tier-policy-store-mode",
+            "dram_required_cxl_optional",
         ]
     )
 
@@ -159,8 +163,10 @@ def test_cxl_shared_tier_parses_complete_opt_in_configuration():
         provider="posix_shm",
         shm_name="/beluga-cxl",
         capacity_bytes=1048576,
+        dram_capacity_bytes=524288,
         alignment_bytes=4096,
         layout_id="packed_kv_v1",
+        policy_store_mode="dram_required_cxl_optional",
     )
 
 

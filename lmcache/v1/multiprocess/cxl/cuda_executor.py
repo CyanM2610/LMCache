@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import reduce
 from operator import mul
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 import importlib
 import threading
 import time
@@ -17,9 +17,28 @@ import time
 # Third Party
 import torch
 
+# First Party
+from lmcache.v1.platform.base.cache_context import BaseCacheContext
+
 # Local
+from .bounded import BoundedSet
 from .contracts import DataCompletion, ExtentDescriptor, TransferPlan
 from .region_provider import RegionHandle
+
+
+class _RegionRegistration(Protocol):
+    capacity: int
+
+    def device_address(self, offset: int, length: int) -> int: ...
+
+    def close(self) -> None: ...
+
+
+class _NativeOps(Protocol):
+    CudaRegionRegistration: Callable[..., _RegionRegistration]
+    TransferDirection: Any
+
+    def cxl_region_block_kv_transfer(self, *args: object) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -30,13 +49,17 @@ class _KernelPlacement:
 
 
 class _ExecutionRuntime(Protocol):
-    def execute(self, cache_context: Any, operation: Callable[[], None]) -> int:
+    def execute(
+        self, cache_context: BaseCacheContext, operation: Callable[[], None]
+    ) -> int:
         """Run one operation on the context stream and return elapsed ns."""
         ...
 
 
 class _TorchCudaRuntime:
-    def execute(self, cache_context: Any, operation: Callable[[], None]) -> int:
+    def execute(
+        self, cache_context: BaseCacheContext, operation: Callable[[], None]
+    ) -> int:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         with (
@@ -56,7 +79,7 @@ class RegisteredRegionView:
     def __init__(
         self,
         handle: RegionHandle,
-        registration: Any,
+        registration: _RegionRegistration,
         *,
         descriptor_validator: Callable[[ExtentDescriptor], None],
         expected_layout_fingerprint: str | None = None,
@@ -75,7 +98,7 @@ class RegisteredRegionView:
         handle: RegionHandle,
         *,
         descriptor_validator: Callable[[ExtentDescriptor], None],
-        native_ops: Any | None = None,
+        native_ops: _NativeOps | None = None,
         expected_layout_fingerprint: str | None = None,
     ) -> RegisteredRegionView:
         """Register a provisioned region once for CUDA mapped access.
@@ -95,7 +118,10 @@ class RegisteredRegionView:
         """
         if "cuda_host_register_v1" not in handle.capabilities:
             raise RuntimeError("region is not CUDA-registerable")
-        ops = native_ops or importlib.import_module("lmcache.c_ops")
+        ops = cast(
+            _NativeOps,
+            native_ops or importlib.import_module("lmcache.c_ops"),
+        )
         try:
             registration = ops.CudaRegionRegistration(
                 handle.shm_name, handle.capacity, handle.data_offset
@@ -103,9 +129,7 @@ class RegisteredRegionView:
         except TypeError:
             if handle.data_offset != 4096:
                 raise
-            registration = ops.CudaRegionRegistration(
-                handle.shm_name, handle.capacity
-            )
+            registration = ops.CudaRegionRegistration(handle.shm_name, handle.capacity)
         return cls(
             handle,
             registration,
@@ -156,7 +180,7 @@ class LMCacheIPCTransferExecutor:
         self,
         region_view: RegisteredRegionView,
         *,
-        native_ops: Any | None = None,
+        native_ops: _NativeOps | None = None,
         runtime: _ExecutionRuntime | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
@@ -164,11 +188,13 @@ class LMCacheIPCTransferExecutor:
         self._native_ops = native_ops
         self._runtime = runtime or _TorchCudaRuntime()
         self._clock_ns = clock_ns
-        self._contexts: dict[int, Any] = {}
-        self._cancelled: set[str] = set()
+        self._contexts: dict[int, BaseCacheContext] = {}
+        self._cancelled: BoundedSet[str] = BoundedSet()
         self._lock = threading.RLock()
 
-    def register_engine(self, instance_id: int, cache_context: Any) -> None:
+    def register_engine(
+        self, instance_id: int, cache_context: BaseCacheContext
+    ) -> None:
         """Register one imported vLLM CUDA cache context.
 
         Args:
@@ -218,6 +244,7 @@ class LMCacheIPCTransferExecutor:
             except KeyError as error:
                 raise KeyError("engine instance is not registered") from error
             if plan.op_id in self._cancelled:
+                self._cancelled.discard(plan.op_id)
                 raise RuntimeError("operation was cancelled before submission")
         base_address = self._region_view.resolve(plan.extent)
         kernel_pointers = self._resolve_kernel_pointers(
@@ -269,7 +296,7 @@ class LMCacheIPCTransferExecutor:
             self._cancelled.add(op_id)
 
     def _resolve_kernel_pointers(
-        self, cache_context: Any, plan: TransferPlan, base_address: int
+        self, cache_context: BaseCacheContext, plan: TransferPlan, base_address: int
     ) -> dict[int, list[int]]:
         layouts = self._object_group_layouts(cache_context)
         pointers: dict[int, list[int]] = {
@@ -297,7 +324,7 @@ class LMCacheIPCTransferExecutor:
 
     @staticmethod
     def _object_group_layouts(
-        cache_context: Any,
+        cache_context: BaseCacheContext,
     ) -> dict[int, tuple[int, tuple[_KernelPlacement, ...]]]:
         layouts: dict[int, tuple[int, tuple[_KernelPlacement, ...]]] = {}
         manager = cache_context.kv_layer_groups_manager
@@ -317,7 +344,7 @@ class LMCacheIPCTransferExecutor:
 
     @staticmethod
     def _stage_block_ids(
-        cache_context: Any,
+        cache_context: BaseCacheContext,
         plan: TransferPlan,
         kernel_pointers: dict[int, list[int]],
     ) -> tuple[list[Any], dict[int, int]]:
@@ -343,13 +370,16 @@ class LMCacheIPCTransferExecutor:
 
     def _launch(
         self,
-        cache_context: Any,
+        cache_context: BaseCacheContext,
         plan: TransferPlan,
         kernel_pointers: dict[int, list[int]],
         staged_block_ids: list[Any],
         skip_blocks: dict[int, int],
     ) -> None:
-        native_ops = self._native_ops or importlib.import_module("lmcache.c_ops")
+        native_ops = cast(
+            _NativeOps,
+            self._native_ops or importlib.import_module("lmcache.c_ops"),
+        )
         direction = (
             native_ops.TransferDirection.D2H
             if plan.direction == "store"

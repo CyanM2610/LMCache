@@ -8,13 +8,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from functools import reduce
 from operator import mul
-from typing import Any, Protocol
+from typing import Protocol
 
 # Third Party
 import torch
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     downsample_block_ids,
     recalculate_blocks_to_skip,
@@ -99,7 +100,9 @@ class DataPlaneAdapter(Protocol):
         """
         ...
 
-    def validate_context(self, cache_context: Any, layout: PackedLayoutSpec) -> None:
+    def validate_context(
+        self, cache_context: BaseCacheContext, layout: PackedLayoutSpec
+    ) -> None:
         """Reject an engine context incompatible with packed bytes.
 
         Args:
@@ -120,7 +123,7 @@ class VLLMDataPlaneAdapter:
     layout_id = "packed_kv_v1"
     layout_version = 1
 
-    def __init__(self, cache_context: Any) -> None:
+    def __init__(self, cache_context: BaseCacheContext) -> None:
         self._cache_context = cache_context
 
     def describe_layout(self, model_name: str, token_count: int) -> PackedLayoutSpec:
@@ -175,7 +178,9 @@ class VLLMDataPlaneAdapter:
         """
         return layout_fingerprint(layout)
 
-    def validate_context(self, cache_context: Any, layout: PackedLayoutSpec) -> None:
+    def validate_context(
+        self, cache_context: BaseCacheContext, layout: PackedLayoutSpec
+    ) -> None:
         """Reject a cache context with a different packed layout.
 
         Args:

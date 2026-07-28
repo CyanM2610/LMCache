@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Protocol
 import os
 import struct
+import uuid
 
 
 REGION_HEADER_SIZE = 4096
@@ -169,6 +170,76 @@ class PosixShmRegionProvider:
             os.close(self._fd)
         self._fd = None
         self._handle = None
+
+
+class LocalDRAMRegionProvider:
+    """Create one server-owned POSIX SHM region backed by local DRAM."""
+
+    def __init__(self, *, capacity: int, alignment: int) -> None:
+        """Configure a local CUDA-registerable DRAM region.
+
+        Args:
+            capacity: Positive payload capacity in bytes.
+            alignment: Positive power-of-two extent alignment.
+
+        Raises:
+            ValueError: If capacity or alignment is invalid.
+        """
+        if capacity <= 0:
+            raise ValueError("DRAM region capacity must be positive")
+        if alignment <= 0 or alignment & (alignment - 1):
+            raise ValueError("DRAM region alignment must be a power of two")
+        self._capacity = capacity
+        self._alignment = alignment
+        self._shm_name = f"/lmcache-dram-{os.getpid()}-{uuid.uuid4().hex}"
+        self._fd: int | None = None
+        self._handle: RegionHandle | None = None
+
+    def provision(self) -> RegionHandle:
+        """Create and initialize the local DRAM backing region.
+
+        Returns:
+            Stable process-independent metadata for CUDA registration.
+
+        Raises:
+            OSError: If exclusive POSIX SHM creation or initialization fails.
+        """
+        if self._handle is not None:
+            return self._handle
+        path = f"/dev/shm{self._shm_name}"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.ftruncate(fd, REGION_HEADER_SIZE + self._capacity)
+            header = pack_region_header(self._capacity, self._alignment)
+            if os.pwrite(fd, header, 0) != len(header):
+                raise OSError("local DRAM region header write was incomplete")
+            self._fd = fd
+            self._handle = RegionHandle(
+                region_id=f"dram-local:{self._shm_name}",
+                shm_name=self._shm_name,
+                capacity=self._capacity,
+                alignment=self._alignment,
+                capabilities=frozenset({"cuda_host_register_v1", "local_dram_v1"}),
+            )
+            return self._handle
+        except BaseException:
+            os.close(fd)
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def close(self) -> None:
+        """Close and unlink the server-owned DRAM region."""
+        if self._fd is not None:
+            os.close(self._fd)
+        self._fd = None
+        self._handle = None
+        try:
+            os.unlink(f"/dev/shm{self._shm_name}")
+        except FileNotFoundError:
+            pass
 
 
 class CXLMemSimShmRegionProvider:

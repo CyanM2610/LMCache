@@ -29,6 +29,9 @@ class CXLSharedTierConfig:
     capacity_bytes: int | None = None
     """Expected payload capacity declared by the region header."""
 
+    dram_capacity_bytes: int = 0
+    """Server-owned GPU-visible DRAM residency capacity; zero disables it."""
+
     alignment_bytes: int = 4096
     """Required power-of-two extent alignment."""
 
@@ -56,6 +59,12 @@ class CXLSharedTierConfig:
     policy_cuda_bandwidth_bytes_per_s: int = 25_000_000_000
     """Gate E host-to-device copy-bandwidth estimate."""
 
+    policy_dram_bandwidth_bytes_per_s: int = 50_000_000_000
+    """Gate E local DRAM queue-drain estimate."""
+
+    policy_store_mode: str = "cxl_required"
+    """Gate E STORE target set and required/optional semantics."""
+
     def __post_init__(self) -> None:
         """Validate a complete enabled configuration.
 
@@ -79,6 +88,8 @@ class CXLSharedTierConfig:
             )
         if self.capacity_bytes is None or self.capacity_bytes <= 0:
             raise ValueError("cxl_shared_tier.capacity_bytes must be positive")
+        if self.dram_capacity_bytes < 0:
+            raise ValueError("cxl_shared_tier.dram_capacity_bytes must be non-negative")
         if self.alignment_bytes <= 0 or self.alignment_bytes & (
             self.alignment_bytes - 1
         ):
@@ -93,12 +104,25 @@ class CXLSharedTierConfig:
             min(
                 self.policy_cxl_bandwidth_bytes_per_s,
                 self.policy_cuda_bandwidth_bytes_per_s,
+                self.policy_dram_bandwidth_bytes_per_s,
             )
             <= 0
         ):
             raise ValueError("Gate E bandwidth estimates must be positive")
         if self.policy_cxl_latency_ns < 0:
             raise ValueError("Gate E CXL latency estimate must be non-negative")
+        valid_store_modes = {
+            "cxl_required",
+            "dram_required",
+            "dram_required_cxl_optional",
+            "both_required",
+        }
+        if self.policy_store_mode not in valid_store_modes:
+            raise ValueError("cxl_shared_tier.policy_store_mode is unsupported")
+        if self.policy_store_mode != "cxl_required" and self.dram_capacity_bytes == 0:
+            raise ValueError(
+                "cxl_shared_tier policy store mode requires a DRAM capacity"
+            )
         if self.model_mode == "cxlmemsim":
             if self.provider != "cxlmemsim_shm":
                 raise ValueError(
@@ -451,6 +475,12 @@ def add_mp_server_args(
         help="Expected CXL proxy payload capacity in bytes.",
     )
     mp_group.add_argument(
+        "--cxl-shared-tier-dram-capacity-bytes",
+        type=int,
+        default=0,
+        help="GPU-visible local DRAM residency capacity; zero disables it.",
+    )
+    mp_group.add_argument(
         "--cxl-shared-tier-alignment-bytes",
         type=int,
         default=4096,
@@ -504,6 +534,23 @@ def add_mp_server_args(
         type=int,
         default=25_000_000_000,
         help="Gate E host-to-device copy-bandwidth estimate.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-policy-dram-bandwidth-bytes-per-s",
+        type=int,
+        default=50_000_000_000,
+        help="Gate E local DRAM queue-drain estimate.",
+    )
+    mp_group.add_argument(
+        "--cxl-shared-tier-policy-store-mode",
+        choices=[
+            "cxl_required",
+            "dram_required",
+            "dram_required_cxl_optional",
+            "both_required",
+        ],
+        default="cxl_required",
+        help="Gate E required/optional STORE placement.",
     )
     mp_group.add_argument(
         "--runtime-plugin-locations",
@@ -609,6 +656,7 @@ def parse_args_to_mp_server_config(
             provider=args.cxl_shared_tier_provider,
             shm_name=args.cxl_shared_tier_shm_name,
             capacity_bytes=args.cxl_shared_tier_capacity_bytes,
+            dram_capacity_bytes=args.cxl_shared_tier_dram_capacity_bytes,
             alignment_bytes=args.cxl_shared_tier_alignment_bytes,
             layout_id=args.cxl_shared_tier_layout_id,
             model_mode=args.cxl_shared_tier_model_mode,
@@ -622,6 +670,10 @@ def parse_args_to_mp_server_config(
             policy_cuda_bandwidth_bytes_per_s=(
                 args.cxl_shared_tier_policy_cuda_bandwidth_bytes_per_s
             ),
+            policy_dram_bandwidth_bytes_per_s=(
+                args.cxl_shared_tier_policy_dram_bandwidth_bytes_per_s
+            ),
+            policy_store_mode=args.cxl_shared_tier_policy_store_mode,
         ),
         runtime_plugin_config=RuntimePluginConfig(
             locations=(args.runtime_plugin_locations or []),

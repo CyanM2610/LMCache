@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
+# Future
+from __future__ import annotations
+
 # Standard
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Generator, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Generator, Protocol, Sequence
 import threading
 import time
 
@@ -60,19 +63,24 @@ _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
     lmc_ops, "execute_object_group_transfer"
 )
 
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.multiprocess.cxl.data_plane_adapter import VLLMTransferRequest
+    from lmcache.v1.multiprocess.modules.cxl_shared_tier import CXLTransferResult
+
 
 class _CXLSharedTier(Protocol):
     def register_engine(
-        self, instance_id: int, cache_context: Any, model_name: str
+        self, instance_id: int, cache_context: BaseCacheContext, model_name: str
     ) -> None: ...
 
     def unregister_engine(self, instance_id: int) -> None: ...
 
-    def store(self, request: Any) -> Any: ...
+    def store(self, request: VLLMTransferRequest) -> CXLTransferResult: ...
 
-    def contains(self, request: Any) -> bool: ...
+    def contains(self, request: VLLMTransferRequest) -> bool: ...
 
-    def retrieve(self, request: Any) -> Any: ...
+    def retrieve(self, request: VLLMTransferRequest) -> CXLTransferResult: ...
 
     def close(self) -> None: ...
 
@@ -1264,6 +1272,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             VLLMTransferRequest,
         )
 
+        shared_tier = self._cxl_shared_tier
+        if shared_tier is None:
+            raise RuntimeError("direct shared-tier STORE is not configured")
+        path_getter = getattr(shared_tier, "store_path", None)
+        direct_path = path_getter() if callable(path_getter) else "cxl_direct"
         producer_event = event_backend.import_event(
             event_ipc_handle, cache_context.device
         )
@@ -1274,7 +1287,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 session_id=key.request_id,
                 metadata={
                     "device": str(cache_context.device),
-                    "path": "cxl_direct",
+                    "path": direct_path,
                 },
             )
         )
@@ -1287,7 +1300,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "device": str(cache_context.device),
                     "engine_id": instance_id,
                     "model_name": model_name,
-                    "path": "cxl_direct",
+                    "path": direct_path,
                 },
             ),
         )
@@ -1303,13 +1316,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ),
             block_ids_by_group=tuple(tuple(block_ids) for block_ids in gpu_block_ids),
         )
-        shared_tier = self._cxl_shared_tier
-        if shared_tier is None:
-            raise RuntimeError("CXL direct STORE is not configured")
         result = shared_tier.store(request)
         succeeded = result.status == "ok"
         if not succeeded:
-            logger.error("CXL direct STORE failed: %s", result.error)
+            logger.error("Direct shared-tier STORE failed: %s", result.error)
         event_backend.record_event(event, cache_context.stream)
         stored_count = (
             sum(len(keys) for keys in obj_keys_per_obj_group) if succeeded else 0
@@ -1326,7 +1336,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "model_name": model_name,
                     "total_bytes": result.payload_bytes,
                     "num_tokens": num_chunks * self._ctx.chunk_size if succeeded else 0,
-                    "path": "cxl_direct",
+                    "path": result.path,
                 },
             ),
         )
@@ -1596,6 +1606,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             Exported completion event and terminal success flag.
         """
+        shared_tier = self._cxl_shared_tier
+        if shared_tier is None:
+            raise RuntimeError("direct shared-tier RETRIEVE is not configured")
+        path_getter = getattr(shared_tier, "retrieve_path", None)
+        direct_path = path_getter(request) if callable(path_getter) else "cxl_direct"
         producer_event = event_backend.import_event(
             event_ipc_handle, cache_context.device
         )
@@ -1606,7 +1621,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 session_id=key.request_id,
                 metadata={
                     "device": str(cache_context.device),
-                    "path": "cxl_direct",
+                    "path": direct_path,
                 },
             )
         )
@@ -1619,17 +1634,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "device": str(cache_context.device),
                     "engine_id": instance_id,
                     "model_name": model_name,
-                    "path": "cxl_direct",
+                    "path": direct_path,
                 },
             ),
         )
-        shared_tier = self._cxl_shared_tier
-        if shared_tier is None:
-            raise RuntimeError("CXL direct RETRIEVE is not configured")
         result = shared_tier.retrieve(request)
         succeeded = result.status == "ok"
         if not succeeded:
-            logger.error("CXL direct RETRIEVE failed: %s", result.error)
+            logger.error("Direct shared-tier RETRIEVE failed: %s", result.error)
         event_backend.record_event(event, cache_context.stream)
         retrieved_count = num_chunks * num_object_groups if succeeded else 0
         self._ctx.event_bus.publish_on_stream(
@@ -1645,7 +1657,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "cache_salt": key.cache_salt,
                     "total_bytes": result.payload_bytes,
                     "num_tokens": num_chunks * self._ctx.chunk_size if succeeded else 0,
-                    "path": "cxl_direct",
+                    "path": result.path,
                 },
             ),
         )

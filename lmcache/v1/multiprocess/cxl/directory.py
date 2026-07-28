@@ -17,6 +17,7 @@ from lmcache.v1.distributed.api import ObjectKey
 
 # Local
 from .actions import TargetSpec, Tier
+from .bounded import BoundedSet
 from .contracts import ExtentDescriptor
 from .region_manager import CXLRegionManager
 from .residency import ReadLease
@@ -72,7 +73,7 @@ class MultiResidencyDirectory:
         self._by_key: dict[ObjectKey, dict[str, _Entry]] = {}
         self._by_id: dict[str, _Entry] = {}
         self._leases: dict[str, tuple[_Entry, ReadLease]] = {}
-        self._retired_leases: set[str] = set()
+        self._retired_leases: BoundedSet[str] = BoundedSet()
         self._lock = threading.RLock()
 
     @property

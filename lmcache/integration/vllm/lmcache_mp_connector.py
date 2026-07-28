@@ -8,6 +8,7 @@ import enum
 import math
 import re
 import sys
+import time
 
 # Third Party
 from vllm.config import VllmConfig
@@ -718,6 +719,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 default_estimate_ns=default_recompute_ns
             )
             self._recompute_device = str(vllm_config.device_config.device)
+            self._recompute_prefill_started: dict[str, tuple[int, int]] = {}
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
             # Global ranks are assigned to nodes in contiguous blocks:
@@ -1059,11 +1061,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 token_ids = tracker.get_token_ids()
                 key = self._recompute_key(len(token_ids))
                 envelope = GateERequestEnvelope(
-                    GATE_E_PROTOCOL_VERSION,
-                    request.request_id,
-                    self._request_deadline_ns(request),
-                    self._recompute_estimator.estimate(key),
-                    self._layout_fingerprint,
+                    protocol_version=GATE_E_PROTOCOL_VERSION,
+                    request_id=request.request_id,
+                    deadline_ns=self._request_deadline_ns(request),
+                    recompute_estimate_ns=self._recompute_estimator.estimate(key),
+                    layout_fingerprint=self._layout_fingerprint,
+                    instance_id=self.scheduler_adapter.instance_id,
                 )
                 response = self.scheduler_adapter.policy_lookup(
                     request.request_id,
@@ -1204,6 +1207,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
+        self._observe_completed_recomputes(scheduler_output)
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
@@ -1262,6 +1266,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_lmcache_cached_tokens": num_lmcache,
                 "num_lmcache_extra_cached_tokens": max(0, num_lmcache - num_vllm),
             }
+
+        self._finish_recompute_observation(request.request_id)
 
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
@@ -1373,6 +1379,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
+
+            if (
+                self._policy_mode == "gate_e"
+                and request_tracker.num_vllm_hit_tokens == 0
+                and request_tracker.num_lmcache_hit_tokens == 0
+                and new_request.num_computed_tokens == 0
+            ):
+                self._recompute_prefill_started.setdefault(
+                    new_request.req_id,
+                    (len(request_tracker.get_token_ids()), time.monotonic_ns()),
+                )
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
@@ -1520,6 +1537,31 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_id,
             )
         self._gate_e_lookup_results.pop(request_id, None)
+        self._recompute_prefill_started.pop(request_id, None)
+
+    def _observe_completed_recomputes(self, scheduler_output: SchedulerOutput) -> None:
+        """Record cold prefills before their first decode scheduling step."""
+        if self._policy_mode != "gate_e":
+            return
+        cached = scheduler_output.scheduled_cached_reqs
+        for request_id, output_tokens in zip(
+            cached.req_ids, cached.num_output_tokens, strict=True
+        ):
+            if output_tokens > 0:
+                self._finish_recompute_observation(request_id)
+
+    def _finish_recompute_observation(self, request_id: str) -> None:
+        """Complete one pending cold-prefill wall-time observation."""
+        pending = self._recompute_prefill_started.pop(request_id, None)
+        if pending is None:
+            return
+        prompt_tokens, started_ns = pending
+        elapsed_ns = time.monotonic_ns() - started_ns
+        if elapsed_ns > 0:
+            self.record_recompute_observation(
+                prompt_tokens=prompt_tokens,
+                elapsed_ns=elapsed_ns,
+            )
 
     def _recompute_key(self, prompt_tokens: int) -> RecomputeCalibrationKey:
         return RecomputeCalibrationKey(
