@@ -8,15 +8,10 @@ This module provides the initialize_protocols() function that:
 3. Ensures all enum members have definitions and vice versa
 """
 
+# Standard
+from importlib import import_module
+
 # First Party
-from lmcache.v1.multiprocess.protocols import (
-    blend,
-    controller,
-    debug,
-    engine,
-    observability,
-    p2p,
-)
 from lmcache.v1.multiprocess.protocols.base import (
     HandlerType,
     ProtocolDefinition,
@@ -30,14 +25,15 @@ class ProtocolInitializationError(Exception):
     pass
 
 
-_PROTOCOL_MODULES = [
-    ("engine", engine),
-    ("controller", controller),
-    ("debug", debug),
-    ("blend", blend),
-    ("observability", observability),
-    ("p2p", p2p),
-]
+_PROTOCOL_MODULE_NAMES = (
+    "engine",
+    "hotprefix",
+    "controller",
+    "debug",
+    "blend",
+    "observability",
+    "p2p",
+)
 
 
 def initialize_protocols() -> dict[RequestType, ProtocolDefinition]:
@@ -59,15 +55,13 @@ def initialize_protocols() -> dict[RequestType, ProtocolDefinition]:
         ProtocolInitializationError: If there are mismatches between enum and
         definitions
     """
-    # Protocol modules to load
-    global _PROTOCOL_MODULES
-
     # Step 1: Collect protocol definitions from all modules
     protocol_definitions = {}
     defined_names = set()
     name_to_module: dict[str, str] = {}
 
-    for module_name, module in _PROTOCOL_MODULES:
+    for module_name in _PROTOCOL_MODULE_NAMES:
+        module = import_module(f"lmcache.v1.multiprocess.protocols.{module_name}")
         module_defs = module.get_protocol_definitions()
 
         # Check for duplicates across modules

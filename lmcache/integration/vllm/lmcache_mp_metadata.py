@@ -391,6 +391,9 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_store_requests: dict[str, int]
+    failed_store_requests: set[str] = field(default_factory=set)
+    completed_promotion_requests: dict[str, int] = field(default_factory=dict)
+    failed_promotion_requests: set[str] = field(default_factory=set)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -399,4 +402,22 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
         merged = dict(self.completed_store_requests)
         for k, v in other.completed_store_requests.items():
             merged[k] = merged.get(k, 0) + v
-        return LMCacheMPWorkerMetadata(completed_store_requests=merged)
+        return LMCacheMPWorkerMetadata(
+            completed_store_requests=merged,
+            failed_store_requests=(
+                self.failed_store_requests | other.failed_store_requests
+            ),
+            completed_promotion_requests={
+                key: (
+                    self.completed_promotion_requests.get(key, 0)
+                    + other.completed_promotion_requests.get(key, 0)
+                )
+                for key in (
+                    self.completed_promotion_requests.keys()
+                    | other.completed_promotion_requests.keys()
+                )
+            },
+            failed_promotion_requests=(
+                self.failed_promotion_requests | other.failed_promotion_requests
+            ),
+        )
