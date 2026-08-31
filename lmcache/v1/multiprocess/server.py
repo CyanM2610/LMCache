@@ -56,6 +56,7 @@ from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
 )
 from lmcache.v1.multiprocess.modules.experimental import EXPERIMENTAL_TRANSFER
 from lmcache.v1.multiprocess.modules.experimental.qstore import QStoreModule
+from lmcache.v1.multiprocess.modules.hotprefix import HotPrefixModule
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
@@ -194,6 +195,13 @@ def _build_modules(
         supported_transfer_mode="engine_driven".
     """
     lookup_module = LookupModule(ctx)
+    hotprefix_module = HotPrefixModule(
+        ctx,
+        aging_interval=mp_config.hotprefix_aging_interval,
+        host_capacity_bytes=mp_config.hotprefix_host_capacity_bytes,
+        frequency_threshold=mp_config.hotprefix_frequency_threshold,
+        lease_ttl_seconds=mp_config.hotprefix_lease_ttl_seconds,
+    )
     p2p_controller = P2PController(
         ctx,
         mp_config.p2p_config,
@@ -312,6 +320,7 @@ def _build_modules(
     blend_modules = [blend_module] if blend_module is not None else []
     return [
         lookup_module,
+        hotprefix_module,
         p2p_controller,
         management,
         *transfer_modules,

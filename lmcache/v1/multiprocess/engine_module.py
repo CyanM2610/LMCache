@@ -10,7 +10,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, Protocol
 
 # First Party
-from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.protocols.base import RequestType
 
 if TYPE_CHECKING:
     # First Party

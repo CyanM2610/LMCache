@@ -92,6 +92,18 @@ class RequestType(enum.Enum):
     # Experimental transfer intermediate tensor
     GET_EXPERIMENTAL = enum.auto()
 
+    # Multi-instance HotPrefix control plane. Keep extension values at the end
+    # so existing numeric wire values remain stable for older MP clients.
+    HOT_PREFIX_ACCESS = enum.auto()
+    HOT_PREFIX_ADMIT = enum.auto()
+    HOT_PREFIX_PUBLISH = enum.auto()
+    HOT_PREFIX_ABORT = enum.auto()
+    HOT_PREFIX_CANDIDATES = enum.auto()
+    HOT_PREFIX_ACQUIRE = enum.auto()
+    HOT_PREFIX_RELEASE = enum.auto()
+    HOT_PREFIX_RENEW = enum.auto()
+    HOT_PREFIX_INVALIDATE = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

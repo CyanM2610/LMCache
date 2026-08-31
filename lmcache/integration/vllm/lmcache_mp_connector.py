@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Future
+from __future__ import annotations
+
 # Standard
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 import math
 import sys
@@ -26,10 +30,14 @@ except ImportError:
 
 
 # Third Party
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.core.hotprefix import make_hotprefix_namespace
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 import torch
 import zmq
 
@@ -59,12 +67,20 @@ from lmcache.integration.vllm.utils import (
     vllm_layout_hints,
 )
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.multiprocess.protocols.hotprefix import (
+    HOTPREFIX_PROMOTION_REQUEST_PREFIX,
+    HOTPREFIX_STORE_REQUEST_PREFIX,
+    HotPrefixHostCandidate,
+    HotPrefixTransferTicket,
+    is_hotprefix_store_request,
+)
 
 try:
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
+        LoadStoreOp,
         ParallelStrategy,
         send_lmcache_request,
     )
@@ -84,6 +100,7 @@ except ImportError:
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration import (  # type: ignore[no-redef]
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
+        LoadStoreOp,
         ParallelStrategy,
     )
 
@@ -103,11 +120,41 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.hotprefix import EvictionStoreCandidate
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+
+@dataclass
+class _HotPrefixStoreTransaction:
+    request_id: str
+    candidate: EvictionStoreCandidate
+    generation: int
+    metadata: LMCacheMPRequestMetadata
+    submitted: bool = False
+    failed: bool = False
+
+
+@dataclass
+class _HotPrefixPromotionTransaction:
+    namespace: bytes
+    cache_salt: str
+    token_ids: tuple[int, ...]
+    prefix_id: bytes
+    ticket: HotPrefixTransferTicket
+    target_block_ids: tuple[int, ...]
+    hash_block_size: int
+    block_size: int
+    page_size_bytes: int
+    request_id: str = ""
+    metadata: LMCacheMPRequestMetadata | None = None
+    next_block_index: int = 0
+    sequence: int = 0
+    submitted: bool = False
+    failed: bool = False
 
 
 # Helper functions
@@ -296,7 +343,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig | None" = None,
-    ):
+    ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
 
         # Fail fast, before the server handshake below.
@@ -388,9 +435,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         if self.role == KVConnectorRole.SCHEDULER:
+            if kv_cache_config is None:
+                raise ValueError("scheduler HotPrefix requires KVCacheConfig")
             # Banner from the scheduler role only, so tensor-parallel
             # deployments print it once rather than once per worker.
             print_banner_once(sys.stderr)
+            hotprefix_namespace = make_hotprefix_namespace(
+                model=vllm_config.model_config.model,
+                revision=(
+                    vllm_config.model_config.revision
+                    or getattr(vllm_config.model_config.hf_config, "_commit_hash", None)
+                ),
+                kv_layout=kv_cache_config.kv_cache_layout,
+                group_specs=tuple(
+                    repr(group.kv_cache_spec)
+                    for group in kv_cache_config.kv_cache_groups
+                ),
+            )
+            self._hotprefix_namespace_prefix = hotprefix_namespace
             self.scheduler_adapter = LMCacheMPSchedulerAdapter(
                 server_urls=server_urls,
                 context=zmq_context,
@@ -398,8 +460,44 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_block_size=vllm_config.cache_config.block_size * dcp_size,
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                hotprefix_namespace_prefix=hotprefix_namespace,
             )
+            if (
+                self.scheduler_adapter.hotprefix_enabled
+                and self.scheduler_adapter.lmcache_tokens_per_chunk
+                != vllm_config.cache_config.block_size * dcp_size
+            ):
+                self.scheduler_adapter.shutdown()
+                raise ValueError(
+                    "canonical HotPrefix currently requires LMCache chunk_size "
+                    "to equal the vLLM scheduler block size"
+                )
+            if (
+                self.scheduler_adapter.hotprefix_enabled
+                and getattr(
+                    vllm_config.cache_config,
+                    "prefix_cache_eviction_policy",
+                    "lru",
+                )
+                != "hotprefix"
+            ):
+                self.scheduler_adapter.shutdown()
+                raise ValueError(
+                    "lmcache.mp.hotprefix_enabled requires vLLM "
+                    "--prefix-cache-eviction-policy=hotprefix"
+                )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            self._hotprefix_host_candidates: dict[
+                bytes, list[HotPrefixHostCandidate]
+            ] = {}
+            self._hotprefix_store_transactions: dict[
+                str, _HotPrefixStoreTransaction
+            ] = {}
+            self._hotprefix_promotion_transactions: dict[
+                str, _HotPrefixPromotionTransaction
+            ] = {}
+            self._hotprefix_kv_cache_manager: "KVCacheManager | None" = None
+            self._hotprefix_allow_promotion_transfer = False
 
             # GPU block pool reference
             self._gpu_block_pool: "BlockPool | None" = None
@@ -583,14 +681,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             ops.append(meta.op)
             cache_salts.append(meta.cache_salt)
 
-        if len(request_ids) == 0:
-            return
-
-        event = self.worker_adapter.create_recorded_event()
-
-        self.worker_adapter.batched_submit_retrieve_requests(
-            request_ids, ops, event, cache_salts=cache_salts
-        )
+        hotprefix_stores = [
+            meta
+            for meta in metadata.requests
+            if meta.direction == "STORE" and is_hotprefix_store_request(meta.request_id)
+        ]
+        if request_ids:
+            event = self.worker_adapter.create_recorded_event()
+            self.worker_adapter.batched_submit_retrieve_requests(
+                request_ids, ops, event, cache_salts=cache_salts
+            )
+        if hotprefix_stores:
+            store_event = self.worker_adapter.create_recorded_event()
+            self.worker_adapter.batched_submit_store_requests(
+                [meta.request_id for meta in hotprefix_stores],
+                [meta.op for meta in hotprefix_stores],
+                store_event,
+                cache_salts=[meta.cache_salt for meta in hotprefix_stores],
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -635,7 +743,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return
 
-    def wait_for_save(self):
+    def wait_for_save(self) -> None:
         """
         Block until all the save operations is done. This is called
         as the forward context exits to ensure that the async saving
@@ -651,6 +759,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         cache_salts = []
         for meta in metadata.requests:
             if meta.direction != "STORE":
+                continue
+            if is_hotprefix_store_request(meta.request_id):
                 continue
             request_ids.append(meta.request_id)
             ops.append(meta.op)
@@ -715,16 +825,35 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
 
-    def build_connector_worker_meta(self):
-        if not self.lazy_offload:
-            return None
+    def build_connector_worker_meta(self) -> LMCacheMPWorkerMetadata | None:
         completed_store_requests = self.worker_adapter.get_completed_store_requests()
-        if completed_store_requests:
+        get_failed = getattr(self.worker_adapter, "get_failed_store_requests", None)
+        failed_store_requests = get_failed() if get_failed is not None else set()
+        get_completed_promotions = getattr(
+            self.worker_adapter, "get_completed_promotion_requests", None
+        )
+        completed_promotions = (
+            get_completed_promotions() if get_completed_promotions is not None else None
+        )
+        get_failed_promotions = getattr(
+            self.worker_adapter, "get_failed_promotion_requests", None
+        )
+        failed_promotions = (
+            get_failed_promotions() if get_failed_promotions is not None else set()
+        )
+        if (
+            completed_store_requests
+            or failed_store_requests
+            or completed_promotions
+            or failed_promotions
+        ):
             return LMCacheMPWorkerMetadata(
-                completed_store_requests=completed_store_requests
+                completed_store_requests=completed_store_requests or {},
+                failed_store_requests=failed_store_requests,
+                completed_promotion_requests=completed_promotions or {},
+                failed_promotion_requests=failed_promotions,
             )
-        else:
-            return None
+        return None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -746,12 +875,34 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         return self.worker_adapter.get_block_ids_with_load_errors()
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """
         Shutdown the connector. This is called when the worker process
         is shutting down to ensure that all the async operations are
         completed and the connector is cleaned up properly.
         """
+        if hasattr(self, "_hotprefix_store_transactions"):
+            manager = self._hotprefix_kv_cache_manager
+            for promotion_transaction in tuple(
+                self._hotprefix_promotion_transactions.values()
+            ):
+                self.scheduler_adapter.hotprefix_release(
+                    promotion_transaction.namespace,
+                    promotion_transaction.ticket,
+                )
+                if manager is not None:
+                    manager.fail_hotprefix_promotion(promotion_transaction.prefix_id)
+            self._hotprefix_promotion_transactions.clear()
+            for store_transaction in tuple(self._hotprefix_store_transactions.values()):
+                self.scheduler_adapter.hotprefix_abort(
+                    store_transaction.candidate.namespace,
+                    store_transaction.candidate.prefix_id,
+                )
+                if manager is not None:
+                    manager.release_hotprefix_eviction_store(
+                        store_transaction.candidate
+                    )
+            self._hotprefix_store_transactions.clear()
         if hasattr(self, "worker_adapter"):
             self.worker_adapter.shutdown()
         if hasattr(self, "scheduler_adapter"):
@@ -776,6 +927,217 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             self._gpu_block_pool = gpu_block_pool
             if self.lazy_offload:
                 self._pending_store.bind_gpu_block_pool(gpu_block_pool)
+
+    def set_background_transfer_context(self, *, has_decode_work: bool) -> None:
+        """Allow promotion chunks only on steps carrying decode work."""
+        if self.role == KVConnectorRole.SCHEDULER:
+            self._hotprefix_allow_promotion_transfer = has_decode_work
+
+    def plan_background_transfers(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_cache_manager: "KVCacheManager",
+        *,
+        has_decode_work: bool,
+    ) -> None:
+        """Resolve promotion sources during vLLM's CPU/GPU overlap window.
+
+        It intersects READY Host generations across all MP servers and records
+        promotion candidates in target-local hotness order. It may also pin one
+        cold, free HBM prefix and reserve shared Host admission for a later-step
+        eviction STORE; foreground allocations have already completed.
+        """
+        del scheduler_output
+        if (
+            self.role != KVConnectorRole.SCHEDULER
+            or not self.scheduler_adapter.hotprefix_enabled
+        ):
+            return
+
+        for transaction in self._hotprefix_promotion_transactions.values():
+            if transaction.failed:
+                continue
+            if not self.scheduler_adapter.hotprefix_renew(
+                transaction.namespace,
+                transaction.ticket,
+            ):
+                transaction.failed = True
+        if not has_decode_work:
+            if not self._hotprefix_store_transactions:
+                self._plan_hotprefix_eviction_store(kv_cache_manager)
+            return
+
+        candidates: dict[bytes, list[HotPrefixHostCandidate]] = {}
+        promotion_sources: list[tuple[bytes, Any, HotPrefixHostCandidate]] = []
+        for namespace, nodes in kv_cache_manager.get_hotprefix_promotion_nodes():
+            ready = self.scheduler_adapter.hotprefix_candidates(
+                namespace,
+                [node.prefix_id for node in nodes],
+            )
+            if ready:
+                candidates[namespace] = ready
+                nodes_by_id = {node.prefix_id: node for node in nodes}
+                promotion_sources.extend(
+                    (namespace, nodes_by_id[item.prefix_id], item)
+                    for item in ready
+                    if item.prefix_id in nodes_by_id
+                )
+        self._hotprefix_host_candidates = candidates
+        if not self._hotprefix_promotion_transactions:
+            self._plan_hotprefix_promotion(
+                kv_cache_manager,
+                promotion_sources,
+            )
+        if not self._hotprefix_store_transactions:
+            self._plan_hotprefix_eviction_store(kv_cache_manager)
+
+    def _plan_hotprefix_promotion(
+        self,
+        kv_cache_manager: "KVCacheManager",
+        sources: list[tuple[bytes, Any, HotPrefixHostCandidate]],
+    ) -> None:
+        for namespace, node, source in sources:
+            transaction = kv_cache_manager.reserve_hotprefix_promotion(
+                prefix_id=source.prefix_id,
+                token_ids=node.full_prefix,
+                total_bytes=source.size_bytes,
+                min_free_blocks=max(1, kv_cache_manager.watermark_blocks),
+            )
+            if transaction is None:
+                continue
+            ticket = self.scheduler_adapter.hotprefix_acquire(namespace, source)
+            if ticket is None:
+                kv_cache_manager.fail_hotprefix_promotion(source.prefix_id)
+                continue
+            try:
+                cache_salt = self._cache_salt_from_namespace(namespace)
+                target_block_ids = tuple(transaction.target_block_ids)
+                if source.size_bytes % len(target_block_ids) != 0:
+                    raise RuntimeError("promotion size is not block divisible")
+                promotion = _HotPrefixPromotionTransaction(
+                    namespace=namespace,
+                    cache_salt=cache_salt,
+                    token_ids=tuple(node.full_prefix),
+                    prefix_id=source.prefix_id,
+                    ticket=ticket,
+                    target_block_ids=target_block_ids,
+                    hash_block_size=kv_cache_manager.hotprefix_hash_block_size,
+                    block_size=kv_cache_manager.hotprefix_block_size,
+                    page_size_bytes=source.size_bytes // len(target_block_ids),
+                )
+                self._queue_next_hotprefix_promotion_chunk(promotion)
+                self._hotprefix_kv_cache_manager = kv_cache_manager
+                return
+            except Exception:
+                self.scheduler_adapter.hotprefix_release(namespace, ticket)
+                kv_cache_manager.fail_hotprefix_promotion(source.prefix_id)
+                raise
+
+    def _queue_next_hotprefix_promotion_chunk(
+        self, transaction: _HotPrefixPromotionTransaction
+    ) -> None:
+        blocks_per_chunk = self.scheduler_adapter.blocks_in_chunk
+        budget_blocks = max(
+            blocks_per_chunk,
+            self.scheduler_adapter.hotprefix_promotion_budget_bytes
+            // transaction.page_size_bytes,
+        )
+        budget_blocks = budget_blocks // blocks_per_chunk * blocks_per_chunk
+        start_block = transaction.next_block_index
+        end_block = min(
+            len(transaction.target_block_ids),
+            start_block + budget_blocks,
+        )
+        if start_block >= end_block:
+            raise RuntimeError("promotion chunk made no progress")
+        request_id = (
+            f"{HOTPREFIX_PROMOTION_REQUEST_PREFIX}{transaction.ticket.ticket_id.hex()}:"
+            f"{transaction.sequence}"
+        )
+        transaction.request_id = request_id
+        transaction.metadata = LMCacheMPRequestMetadata(
+            request_id=request_id,
+            direction="RETRIEVE",
+            op=LoadStoreOp(
+                token_ids=list(transaction.token_ids),
+                block_ids=[list(transaction.target_block_ids[start_block:end_block])],
+                start=start_block * transaction.block_size,
+                end=end_block * transaction.block_size,
+            ),
+            cache_salt=transaction.cache_salt,
+        )
+        transaction.next_block_index = end_block
+        transaction.sequence += 1
+        transaction.submitted = False
+        self._hotprefix_promotion_transactions[request_id] = transaction
+
+    def _plan_hotprefix_eviction_store(
+        self, kv_cache_manager: "KVCacheManager"
+    ) -> None:
+        source = kv_cache_manager.reserve_hotprefix_eviction_store(
+            transfer_chunk_tokens=self.scheduler_adapter.lmcache_tokens_per_chunk,
+            min_free_blocks=0,
+        )
+        if source is None:
+            return
+        try:
+            admission = self.scheduler_adapter.hotprefix_admit(
+                source.namespace,
+                source.prefix_id,
+                source.size_bytes,
+            )
+        except Exception:
+            kv_cache_manager.release_hotprefix_eviction_store(source)
+            raise
+        if admission is None or admission.action != "accept":
+            kv_cache_manager.release_hotprefix_eviction_store(source)
+            return
+        if admission.generation is None:
+            self.scheduler_adapter.hotprefix_abort(source.namespace, source.prefix_id)
+            kv_cache_manager.release_hotprefix_eviction_store(source)
+            raise RuntimeError("accepted HotPrefix admission has no generation")
+
+        try:
+            cache_salt = self._cache_salt_from_namespace(source.namespace)
+        except Exception:
+            self.scheduler_adapter.hotprefix_abort(source.namespace, source.prefix_id)
+            kv_cache_manager.release_hotprefix_eviction_store(source)
+            raise
+
+        request_id = (
+            f"{HOTPREFIX_STORE_REQUEST_PREFIX}{admission.generation}:"
+            f"{source.prefix_id.hex()}"
+        )
+        metadata = LMCacheMPRequestMetadata(
+            request_id=request_id,
+            direction="STORE",
+            op=LoadStoreOp(
+                token_ids=list(source.token_ids),
+                block_ids=[list(source.block_ids)],
+                start=0,
+                end=len(source.token_ids),
+            ),
+            cache_salt=cache_salt,
+        )
+        self._hotprefix_store_transactions[request_id] = _HotPrefixStoreTransaction(
+            request_id,
+            source,
+            admission.generation,
+            metadata,
+        )
+        self._hotprefix_kv_cache_manager = kv_cache_manager
+
+    def _cache_salt_from_namespace(self, namespace: bytes) -> str:
+        namespace_prefix = self._hotprefix_namespace_prefix
+        if not namespace.startswith(namespace_prefix):
+            raise RuntimeError("HotPrefix source namespace does not match model")
+        return namespace[len(namespace_prefix) :].decode()
+
+    def has_pending_push_work(self) -> bool:
+        """Keep EngineCore stepping until pinned eviction STOREs terminate."""
+        return bool(
+            self._hotprefix_store_transactions or self._hotprefix_promotion_transactions
+        )
 
     def get_num_new_matched_tokens(
         self,
@@ -807,8 +1169,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tokens for which KV cache is actually available at the time of the
             call. If the cache cannot be loaded for some tokens (e.g., due to
             connectivity issues or eviction), those tokens must not be taken
-            into account.
+                into account.
         """
+        for transaction in self._hotprefix_promotion_transactions.values():
+            if transaction.failed or transaction.cache_salt != (
+                request.cache_salt or ""
+            ):
+                continue
+            prefix_length = len(transaction.token_ids)
+            if tuple(request.all_token_ids[:prefix_length]) != transaction.token_ids:
+                continue
+            manager = self._hotprefix_kv_cache_manager
+            promotion_manager = (
+                manager.hotprefix_promotion_manager if manager is not None else None
+            )
+            if promotion_manager is not None and promotion_manager.coalesce(
+                request.request_id,
+                transaction.prefix_id,
+            ):
+                # Scheduler retries local APC before polling the connector again.
+                return None, True
+
         tracker = self._get_or_create_request_tracker(request)
         # TODO: support loading KV for preempted requests in the future
         if request.status == RequestStatus.PREEMPTED:
@@ -852,6 +1233,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request.request_id,
             token_ids=tracker.get_token_ids(),
             cache_salt=tracker.cache_salt,
+            local_matched_tokens=num_computed_tokens,
         )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
@@ -1011,6 +1393,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
+        for store_transaction in self._hotprefix_store_transactions.values():
+            if store_transaction.submitted:
+                continue
+            metadata.add_request_metadata(store_transaction.metadata)
+            store_transaction.submitted = True
+        for promotion_transaction in self._hotprefix_promotion_transactions.values():
+            if (
+                promotion_transaction.submitted
+                or not self._hotprefix_allow_promotion_transfer
+            ):
+                continue
+            if promotion_transaction.metadata is None:
+                raise RuntimeError("HotPrefix promotion chunk has no metadata")
+            metadata.add_request_metadata(promotion_transaction.metadata)
+            promotion_transaction.submitted = True
+
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
@@ -1023,7 +1421,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         return metadata
 
-    def update_connector_output(self, connector_output: KVConnectorOutput):
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """
         Update KVConnector state from worker-side connectors output.
 
@@ -1031,21 +1429,121 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
-        if not self.lazy_offload:
-            return
-        if not self._gpu_block_pool:
-            raise ValueError("Lazy offload is enabled but gpu block pool is not binded")
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, LMCacheMPWorkerMetadata):
             return
+        for req_id in meta.failed_promotion_requests:
+            promotion_transaction = self._hotprefix_promotion_transactions.get(req_id)
+            if promotion_transaction is not None:
+                promotion_transaction.failed = True
+        for req_id, count in meta.completed_promotion_requests.items():
+            if not self.scheduler_adapter.update_pending_store_count(req_id, count):
+                continue
+            if req_id in self._hotprefix_promotion_transactions:
+                self._finish_hotprefix_promotion(req_id)
+        for req_id in meta.failed_store_requests:
+            store_transaction = self._hotprefix_store_transactions.get(req_id)
+            if store_transaction is not None:
+                store_transaction.failed = True
         for req_id, count in meta.completed_store_requests.items():
-            if self.scheduler_adapter.update_pending_store_count(req_id, count):
+            if not self.scheduler_adapter.update_pending_store_count(req_id, count):
+                continue
+            if req_id in self._hotprefix_store_transactions:
+                self._finish_hotprefix_store(req_id)
+                continue
+            if self.lazy_offload:
+                if not self._gpu_block_pool:
+                    raise ValueError(
+                        "Lazy offload is enabled but gpu block pool is not binded"
+                    )
                 gpu_block_ids = self._pending_store.get_request_gpu_block_ids(req_id)
                 self._gpu_block_pool.free_blocks(
                     [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
                 )
                 self._pending_store.remove_request_gpu_block_ids(req_id)
                 self.scheduler_adapter.end_session(req_id)
+
+    def _finish_hotprefix_store(self, request_id: str) -> None:
+        transaction = self._hotprefix_store_transactions.pop(request_id)
+        manager = self._hotprefix_kv_cache_manager
+        if manager is None:
+            raise RuntimeError("HotPrefix STORE has no KVCacheManager owner")
+        try:
+            if transaction.failed:
+                self.scheduler_adapter.hotprefix_abort(
+                    transaction.candidate.namespace,
+                    transaction.candidate.prefix_id,
+                )
+                return
+            published = self.scheduler_adapter.hotprefix_publish(
+                transaction.candidate.namespace,
+                transaction.candidate.prefix_id,
+            )
+            if not published:
+                self.scheduler_adapter.hotprefix_abort(
+                    transaction.candidate.namespace,
+                    transaction.candidate.prefix_id,
+                )
+                raise RuntimeError("HotPrefix STORE publication failed")
+        finally:
+            manager.release_hotprefix_eviction_store(transaction.candidate)
+
+    def _finish_hotprefix_promotion(self, request_id: str) -> None:
+        transaction = self._hotprefix_promotion_transactions.pop(request_id)
+        manager = self._hotprefix_kv_cache_manager
+        if manager is None:
+            raise RuntimeError("HotPrefix promotion has no KVCacheManager owner")
+        terminal = True
+        try:
+            if transaction.failed:
+                manager.fail_hotprefix_promotion(transaction.prefix_id)
+            else:
+                if transaction.metadata is None:
+                    raise RuntimeError("completed promotion chunk has no metadata")
+                copied_bytes = (
+                    len(transaction.metadata.op.flat_block_ids)
+                    * transaction.page_size_bytes
+                )
+                ready = manager.advance_hotprefix_promotion(
+                    transaction.prefix_id,
+                    copied_bytes=copied_bytes,
+                )
+                if not ready:
+                    self._queue_next_hotprefix_promotion_chunk(transaction)
+                    terminal = False
+                    return
+                hash_fn = get_hash_fn_by_name(
+                    self._vllm_config.cache_config.prefix_caching_hash_algo
+                )
+                request = Request(
+                    request_id,
+                    list(transaction.token_ids),
+                    SamplingParams(max_tokens=1),
+                    None,
+                    cache_salt=transaction.cache_salt,
+                    block_hasher=get_request_block_hasher(
+                        transaction.hash_block_size,
+                        hash_fn,
+                    ),
+                )
+                manager.publish_hotprefix_promotion(request, transaction.prefix_id)
+        except Exception:
+            active = manager.hotprefix_promotion_manager
+            if active is not None and active.get(transaction.prefix_id) is not None:
+                manager.fail_hotprefix_promotion(transaction.prefix_id)
+            raise
+        finally:
+            if terminal:
+                self.scheduler_adapter.hotprefix_release(
+                    transaction.namespace,
+                    transaction.ticket,
+                )
+        if transaction.failed:
+            self.scheduler_adapter.hotprefix_invalidate(
+                transaction.namespace,
+                transaction.prefix_id,
+                transaction.ticket.generation,
+            )
 
     def request_finished(
         self,
@@ -1091,6 +1589,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id)
 
+        if self.scheduler_adapter.hotprefix_enabled:
+            return False, (return_params or None)
         if self.lazy_offload:
             self._pending_store.mark_req_finished(request.request_id)
             return False, (return_params or None)
@@ -1197,6 +1697,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            # Canonical HotPrefix stores payload only after a real HBM eviction
+            # passes shared-tier admission.  Keep request/block bookkeeping for
+            # that later transaction, but suppress normal incremental STORE.
+            if self.scheduler_adapter.hotprefix_enabled:
+                continue
+
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,
@@ -1213,7 +1719,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # in `execute_model`, which will result in lose some store ops.
         # So we only trigger lazy offload when
         # scheduler_output.total_num_scheduled_tokens > 0
-        if scheduler_output.total_num_scheduled_tokens:
+        if (
+            scheduler_output.total_num_scheduled_tokens
+            and not self.scheduler_adapter.hotprefix_enabled
+        ):
             self._process_lazy_offload_store_requests(metadata)
 
     def _process_cached_requests(
@@ -1237,6 +1746,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            if self.scheduler_adapter.hotprefix_enabled:
+                continue
+
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,
@@ -1254,7 +1766,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # in `execute_model`, which will result in lose some store ops.
         # So we only trigger lazy offload when
         # scheduler_output.total_num_scheduled_tokens > 0
-        if scheduler_output.total_num_scheduled_tokens:
+        if (
+            scheduler_output.total_num_scheduled_tokens
+            and not self.scheduler_adapter.hotprefix_enabled
+        ):
             self._process_lazy_offload_store_requests(metadata)
 
     def _process_lazy_offload_store_requests(

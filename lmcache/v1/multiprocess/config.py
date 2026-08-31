@@ -116,6 +116,18 @@ class MPServerConfig:
     """List of experimental transfer modules to enable. Options: transfer_query
     (see lmcache.v1.multiprocess.modules.experimental.__init___.py)."""
 
+    hotprefix_host_capacity_bytes: int = 1 << 30
+    """Capacity reserved by the active HotPrefix Host tier."""
+
+    hotprefix_frequency_threshold: int = 10
+    """Minimum Global frequency eligible for HotPrefix Host admission."""
+
+    hotprefix_aging_interval: int = 50
+    """Fleet observations between Global HotPrefix clock aging passes."""
+
+    hotprefix_lease_ttl_seconds: float = 30.0
+    """Server-side expiry for generation-bound promotion read leases."""
+
     def __post_init__(self) -> None:
         """Validate the worker-reaping timeouts.
 
@@ -137,6 +149,17 @@ class MPServerConfig:
                 "worker registration grace must be >= the worker reap timeout "
                 f"({reap}s); got {grace}"
             )
+        if self.hotprefix_host_capacity_bytes <= 0:
+            raise ValueError("hotprefix_host_capacity_bytes must be positive")
+        if self.hotprefix_frequency_threshold < 0:
+            raise ValueError("hotprefix_frequency_threshold must be non-negative")
+        if self.hotprefix_aging_interval <= 0:
+            raise ValueError("hotprefix_aging_interval must be positive")
+        if (
+            not math.isfinite(self.hotprefix_lease_ttl_seconds)
+            or self.hotprefix_lease_ttl_seconds <= 0
+        ):
+            raise ValueError("hotprefix_lease_ttl_seconds must be finite and positive")
 
 
 @dataclass
@@ -432,6 +455,30 @@ def add_mp_server_args(
         "Options: transfer_query (see lmcache.v1.multiprocess.modules."
         "experimental.__init___.py).",
     )
+    mp_group.add_argument(
+        "--hotprefix-host-capacity-bytes",
+        type=int,
+        default=1 << 30,
+        help="Shared Host capacity controlled by HotPrefix (default: 1 GiB).",
+    )
+    mp_group.add_argument(
+        "--hotprefix-frequency-threshold",
+        type=int,
+        default=10,
+        help="Minimum Global frequency admitted to the HotPrefix Host tier.",
+    )
+    mp_group.add_argument(
+        "--hotprefix-aging-interval",
+        type=int,
+        default=50,
+        help="Fleet access observations between Global clock aging passes.",
+    )
+    mp_group.add_argument(
+        "--hotprefix-lease-ttl-seconds",
+        type=float,
+        default=30.0,
+        help="Expiry for HotPrefix promotion read leases.",
+    )
     return parser
 
 
@@ -479,6 +526,10 @@ def parse_args_to_mp_server_config(
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         enable=args.enable or [],
+        hotprefix_host_capacity_bytes=args.hotprefix_host_capacity_bytes,
+        hotprefix_frequency_threshold=args.hotprefix_frequency_threshold,
+        hotprefix_aging_interval=args.hotprefix_aging_interval,
+        hotprefix_lease_ttl_seconds=args.hotprefix_lease_ttl_seconds,
     )
 
 

@@ -31,6 +31,14 @@ from lmcache.v1.multiprocess.group_view import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.protocols.hotprefix import (
+    HotPrefixAccessResponse,
+    HotPrefixAdmissionResponse,
+    HotPrefixHostCandidate,
+    HotPrefixTransferTicket,
+    is_hotprefix_promotion_request,
+    is_hotprefix_store_request,
+)
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
@@ -77,6 +85,12 @@ class ExtraConfigDefault(enum.Enum):
     # lmcache/v1/platform/isolated_ipc.py. Must match the LMCache server's
     # ``--isolated-ipc`` setting.
     isolated_ipc = False
+    # Enable one fleet-wide HotPrefix access observation per initial lookup.
+    hotprefix_enabled = False
+    # Stable scheduler identity. Negative values request a generated identity.
+    hotprefix_instance_id = -1
+    # Maximum Host-to-HBM promotion bytes submitted by one scheduler step.
+    hotprefix_promotion_budget_bytes = 64 << 20
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -601,7 +615,8 @@ class LMCacheMPSchedulerAdapter:
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
-    ):
+        hotprefix_namespace_prefix: bytes | None = None,
+    ) -> None:
         """
         Args:
             server_urls: The servers URL for the LMCache message queue
@@ -621,6 +636,8 @@ class LMCacheMPSchedulerAdapter:
             extra_config: Optional dict with keys starting with
                 ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
+            hotprefix_namespace_prefix: Canonical model/revision/layout identity
+                before the per-request cache salt is appended.
         """
         vllm_block_size, parallel_strategy, mq_timeout = _normalize_adapter_init_args(
             vllm_block_size,
@@ -633,10 +650,9 @@ class LMCacheMPSchedulerAdapter:
         self.mq_clients: dict[str, MessageQueueClient] = {
             url: MessageQueueClient(url, context) for url in self._server_urls
         }
-        if extra_config is not None:
-            cfg = _resolve_extra_config(extra_config)
-            mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
-            heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
+        cfg = _resolve_extra_config(extra_config)
+        mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
+        heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -650,6 +666,26 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results: dict[str, int] = {}
         self._per_server_hits: dict[str, dict[str, int]] = {}
         self._lookup_params: dict[str, tuple[list[int], str]] = {}
+        self._hotprefix_enabled = bool(cfg[ExtraConfigDefault.hotprefix_enabled.name])
+        self._hotprefix_promotion_budget_bytes = int(
+            cfg[ExtraConfigDefault.hotprefix_promotion_budget_bytes.name]
+        )
+        if self._hotprefix_promotion_budget_bytes <= 0:
+            raise ValueError("hotprefix promotion budget must be positive")
+        self._hotprefix_namespace_prefix = (
+            hotprefix_namespace_prefix
+            if hotprefix_namespace_prefix is not None
+            else f"{model_name}\0".encode()
+        )
+        configured_instance = int(cfg[ExtraConfigDefault.hotprefix_instance_id.name])
+        self._hotprefix_instance_id = (
+            configured_instance
+            if configured_instance >= 0
+            else uuid.uuid4().int & ((1 << 63) - 1)
+        )
+        self._hotprefix_event_seq = 0
+        self._hotprefix_request_sequences: dict[str, int] = {}
+        self._hotprefix_results: dict[str, dict[str, HotPrefixAccessResponse]] = {}
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -711,6 +747,16 @@ class LMCacheMPSchedulerAdapter:
         return self.parallel_strategy.kv_world_size
 
     @property
+    def hotprefix_enabled(self) -> bool:
+        """Whether canonical eviction-triggered HotPrefix mode is active."""
+        return self._hotprefix_enabled
+
+    @property
+    def hotprefix_promotion_budget_bytes(self) -> int:
+        """Return the configured per-step promotion transfer budget."""
+        return self._hotprefix_promotion_budget_bytes
+
+    @property
     def tp_size(self) -> int:
         """The tensor parallel size."""
         return self.parallel_strategy.kv_tp_size
@@ -742,7 +788,8 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         token_ids: list[int],
         cache_salt: str = "",
-    ):
+        local_matched_tokens: int = 0,
+    ) -> None:
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
 
@@ -756,6 +803,7 @@ class LMCacheMPSchedulerAdapter:
             token_ids: Token IDs to lookup from LMCache
             cache_salt: Per-user isolation salt. Requests with different
                 cache_salt values produce separate cache entries.
+            local_matched_tokens: Tokens reused by vLLM native APC.
 
         Returns:
             None
@@ -774,6 +822,14 @@ class LMCacheMPSchedulerAdapter:
 
         if request_id in self._pending_lookups:
             # Skip if there is already a lookup request
+            return
+
+        if not self._submit_hotprefix_access(
+            request_id,
+            token_ids,
+            cache_salt,
+            local_matched_tokens,
+        ):
             return
 
         aligned_end = (
@@ -812,6 +868,57 @@ class LMCacheMPSchedulerAdapter:
 
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt)
+
+    def _submit_hotprefix_access(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        cache_salt: str,
+        local_matched_tokens: int,
+    ) -> bool:
+        if not self._hotprefix_enabled:
+            return True
+        if request_id in self._hotprefix_request_sequences:
+            return True
+        self._hotprefix_event_seq += 1
+        event_seq = self._hotprefix_event_seq
+        namespace = self._hotprefix_namespace_prefix + cache_salt.encode()
+        futures: dict[str, MessagingFuture[Any]] = {
+            url: send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.HOT_PREFIX_ACCESS,
+                [
+                    self._hotprefix_instance_id,
+                    event_seq,
+                    namespace,
+                    token_ids,
+                    local_matched_tokens,
+                ],
+            )
+            for url in self._server_urls
+        }
+        responses: dict[str, HotPrefixAccessResponse] = {}
+        for url, future in futures.items():
+            try:
+                response = future.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "HOT_PREFIX_ACCESS to %s timed out after %ss.",
+                    url,
+                    self._mq_timeout,
+                )
+                self._health_events[url].clear()
+                return False
+            if not isinstance(response, HotPrefixAccessResponse):
+                logger.warning(
+                    "HOT_PREFIX_ACCESS from %s returned %s", url, type(response)
+                )
+                self._health_events[url].clear()
+                return False
+            responses[url] = response
+        self._hotprefix_request_sequences[request_id] = event_seq
+        self._hotprefix_results[request_id] = responses
+        return True
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -948,6 +1055,327 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
         self._lookup_params.pop(request_id, None)
+        self._hotprefix_request_sequences.pop(request_id, None)
+        self._hotprefix_results.pop(request_id, None)
+
+    def hotprefix_admit(
+        self,
+        namespace: bytes,
+        prefix_id: bytes,
+        size_bytes: int,
+    ) -> HotPrefixAdmissionResponse | None:
+        """Reserve shared Host capacity for an HBM eviction candidate.
+
+        Args:
+            namespace: Canonical LogicalPrefix namespace.
+            prefix_id: Actual HBM victim prefix.
+            size_bytes: Complete payload size on each server.
+
+        Returns:
+            Cross-server consensus response, or ``None`` when unavailable.
+
+        Raises:
+            RuntimeError: If MP servers disagree after rollback.
+        """
+        if not self._hotprefix_enabled or not self.is_healthy:
+            return None
+        proposed_generation = uuid.uuid4().int & ((1 << 63) - 1)
+        responses: list[HotPrefixAdmissionResponse] = []
+        accepted_urls: list[str] = []
+        for url in self._server_urls:
+            future = send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.HOT_PREFIX_ADMIT,
+                [namespace, prefix_id, size_bytes, proposed_generation],
+            )
+            try:
+                response = future.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                self._rollback_hotprefix_admission(
+                    namespace, prefix_id, [*accepted_urls, url]
+                )
+                self._health_events[url].clear()
+                return None
+            if not isinstance(response, HotPrefixAdmissionResponse):
+                self._rollback_hotprefix_admission(
+                    namespace, prefix_id, [*accepted_urls, url]
+                )
+                self._health_events[url].clear()
+                return None
+            responses.append(response)
+            if response.action == "accept":
+                accepted_urls.append(url)
+        if not responses:
+            return None
+        first = responses[0]
+        if any(response != first for response in responses[1:]):
+            self._rollback_hotprefix_admission(namespace, prefix_id, accepted_urls)
+            raise RuntimeError("HotPrefix admission disagreed across LMCache servers")
+        return first
+
+    def _rollback_hotprefix_admission(
+        self,
+        namespace: bytes,
+        prefix_id: bytes,
+        accepted_urls: list[str],
+    ) -> None:
+        for url in accepted_urls:
+            future = send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.HOT_PREFIX_ABORT,
+                [namespace, prefix_id],
+            )
+            try:
+                future.result(timeout=self._mq_timeout)
+            except Exception:
+                self._health_events[url].clear()
+
+    def hotprefix_candidates(
+        self,
+        namespace: bytes,
+        prefix_ids: list[bytes],
+    ) -> list[HotPrefixHostCandidate]:
+        """Return shared Host sources that are READY on every MP server.
+
+        A multi-server LMCache deployment may shard a model's KV tensors across
+        servers.  A promotion is executable only when each shard can provide the
+        same logical residency generation, so this method deliberately returns
+        the intersection rather than the union of server responses.
+
+        Args:
+            namespace: Canonical LogicalPrefix namespace.
+            prefix_ids: Target-local missing prefixes in desired order.
+
+        Returns:
+            READY candidates present with identical generation/size everywhere.
+        """
+        if not self._hotprefix_enabled or not self.is_healthy or not prefix_ids:
+            return []
+
+        responses: list[list[HotPrefixHostCandidate]] = []
+        for url in self._server_urls:
+            future = send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.HOT_PREFIX_CANDIDATES,
+                [namespace, prefix_ids],
+            )
+            try:
+                response = future.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                self._health_events[url].clear()
+                return []
+            if not isinstance(response, list) or any(
+                not isinstance(item, HotPrefixHostCandidate) for item in response
+            ):
+                self._health_events[url].clear()
+                return []
+            responses.append(response)
+
+        if not responses:
+            return []
+        common = {
+            (item.prefix_id, item.generation, item.size_bytes): item
+            for item in responses[0]
+        }
+        for response in responses[1:]:
+            available = {
+                (item.prefix_id, item.generation, item.size_bytes) for item in response
+            }
+            common = {key: item for key, item in common.items() if key in available}
+
+        requested_order = {
+            prefix_id: index for index, prefix_id in enumerate(prefix_ids)
+        }
+        return sorted(
+            common.values(),
+            key=lambda item: requested_order.get(item.prefix_id, len(prefix_ids)),
+        )
+
+    def hotprefix_acquire(
+        self,
+        namespace: bytes,
+        candidate: HotPrefixHostCandidate,
+    ) -> HotPrefixTransferTicket | None:
+        """Atomically acquire the same generation from every MP server.
+
+        Args:
+            namespace: Candidate namespace.
+            candidate: READY source selected by the target-local planner.
+
+        Returns:
+            A common renewable ticket, or ``None`` after rollback on failure.
+        """
+        if not self._hotprefix_enabled or not self.is_healthy:
+            return None
+        ticket_id = uuid.uuid4().bytes
+        acquired_urls: list[str] = []
+        tickets: list[HotPrefixTransferTicket] = []
+        for url in self._server_urls:
+            future = send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.HOT_PREFIX_ACQUIRE,
+                [
+                    namespace,
+                    candidate.prefix_id,
+                    candidate.generation,
+                    ticket_id,
+                ],
+            )
+            try:
+                response = future.result(timeout=self._mq_timeout)
+            except Exception:
+                self._rollback_hotprefix_acquire(
+                    namespace, ticket_id, [*acquired_urls, url]
+                )
+                self._health_events[url].clear()
+                return None
+            if not isinstance(response, HotPrefixTransferTicket):
+                self._rollback_hotprefix_acquire(
+                    namespace, ticket_id, [*acquired_urls, url]
+                )
+                self._health_events[url].clear()
+                return None
+            acquired_urls.append(url)
+            tickets.append(response)
+
+        first = tickets[0] if tickets else None
+        if first is None or any(ticket != first for ticket in tickets[1:]):
+            self._rollback_hotprefix_acquire(namespace, ticket_id, acquired_urls)
+            return None
+        return first
+
+    def hotprefix_release(
+        self,
+        namespace: bytes,
+        ticket: HotPrefixTransferTicket,
+    ) -> bool:
+        """Release a promotion ticket on all MP servers.
+
+        Args:
+            namespace: Ticket namespace.
+            ticket: Terminal promotion ticket.
+
+        Returns:
+            ``True`` only when every server acknowledges release.
+        """
+        return self._hotprefix_finish(
+            RequestType.HOT_PREFIX_RELEASE,
+            namespace,
+            ticket.ticket_id,
+        )
+
+    def hotprefix_renew(
+        self,
+        namespace: bytes,
+        ticket: HotPrefixTransferTicket,
+    ) -> bool:
+        """Renew a promotion ticket on all MP servers.
+
+        Args:
+            namespace: Ticket namespace.
+            ticket: In-flight promotion ticket.
+
+        Returns:
+            ``True`` only when every server extends the lease.
+        """
+        return self._hotprefix_finish(
+            RequestType.HOT_PREFIX_RENEW,
+            namespace,
+            ticket.ticket_id,
+        )
+
+    def _rollback_hotprefix_acquire(
+        self,
+        namespace: bytes,
+        ticket_id: bytes,
+        acquired_urls: list[str],
+    ) -> None:
+        for url in acquired_urls:
+            future = send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.HOT_PREFIX_RELEASE,
+                [namespace, ticket_id],
+            )
+            try:
+                future.result(timeout=self._mq_timeout)
+            except Exception:
+                self._health_events[url].clear()
+
+    def hotprefix_publish(self, namespace: bytes, prefix_id: bytes) -> bool:
+        """Publish a completely stored HotPrefix Host residency.
+
+        Args:
+            namespace: Residency namespace.
+            prefix_id: Fully stored LogicalPrefix.
+
+        Returns:
+            ``True`` only when every MP server publishes it.
+        """
+        return self._hotprefix_finish(
+            RequestType.HOT_PREFIX_PUBLISH, namespace, prefix_id
+        )
+
+    def hotprefix_abort(self, namespace: bytes, prefix_id: bytes) -> bool:
+        """Abort an incomplete HotPrefix Host residency.
+
+        Args:
+            namespace: Residency namespace.
+            prefix_id: Failed LogicalPrefix reservation.
+
+        Returns:
+            ``True`` only when every server completes rollback.
+        """
+        return self._hotprefix_finish(
+            RequestType.HOT_PREFIX_ABORT, namespace, prefix_id
+        )
+
+    def hotprefix_invalidate(
+        self,
+        namespace: bytes,
+        prefix_id: bytes,
+        generation: int,
+    ) -> bool:
+        """Invalidate a stale physical residency on every MP server.
+
+        Args:
+            namespace: Residency namespace.
+            prefix_id: LogicalPrefix whose retrieve failed.
+            generation: Exact failed generation.
+
+        Returns:
+            ``True`` only when every server acknowledges invalidation.
+        """
+        return self._hotprefix_all_server_bool(
+            RequestType.HOT_PREFIX_INVALIDATE,
+            [namespace, prefix_id, generation],
+        )
+
+    def _hotprefix_finish(
+        self, request_type: RequestType, namespace: bytes, prefix_id: bytes
+    ) -> bool:
+        return self._hotprefix_all_server_bool(
+            request_type,
+            [namespace, prefix_id],
+        )
+
+    def _hotprefix_all_server_bool(
+        self,
+        request_type: RequestType,
+        payloads: list[Any],
+    ) -> bool:
+        if not self._hotprefix_enabled or not self.is_healthy:
+            return False
+        for url in self._server_urls:
+            future = send_lmcache_request(self.mq_clients[url], request_type, payloads)
+            try:
+                response = future.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                self._health_events[url].clear()
+                return False
+            if response is not True:
+                self._health_events[url].clear()
+                return False
+        return True
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""
@@ -1282,6 +1710,9 @@ class LMCacheMPWorkerAdapter:
 
         # Completed store requests to report via build_connector_worker_meta
         self._completed_store_requests: dict[str, int] = {}
+        self._failed_store_requests: set[str] = set()
+        self._completed_promotion_requests: dict[str, int] = {}
+        self._failed_promotion_requests: set[str] = set()
 
     @property
     def is_healthy(self) -> bool:
@@ -1576,7 +2007,8 @@ class LMCacheMPWorkerAdapter:
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
-            self.error_block_ids.update(op.flat_block_ids)
+            if not is_hotprefix_promotion_request(request_id):
+                self.error_block_ids.update(op.flat_block_ids)
             self._dropped_retrieves.add(request_id)
             return
 
@@ -1664,7 +2096,11 @@ class LMCacheMPWorkerAdapter:
         finished_req_ids_from_engine: set[str],
     ) -> set[str]:
         """Merge LMCache-side and engine-side finished store info."""
-        self.finished_stores.update(finished_req_ids_from_lmcache)
+        self.finished_stores.update(
+            request_id
+            for request_id in finished_req_ids_from_lmcache
+            if not is_hotprefix_store_request(request_id)
+        )
         ret_stores = set()
         for req_id in finished_req_ids_from_engine:
             if req_id in self._returned_finished:
@@ -1715,7 +2151,8 @@ class LMCacheMPWorkerAdapter:
                 r_block_ids,
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
+                if not is_hotprefix_promotion_request(request_id):
+                    self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -1729,10 +2166,18 @@ class LMCacheMPWorkerAdapter:
             dropped = self._dropped_retrieves
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
+            self._record_hotprefix_promotion_results(
+                finished_retrieves,
+                failed_request_ids=set(finished_retrieves),
+            )
 
             ret_stores = self._process_finished_stores(
                 finished_stores, finished_req_ids_from_engine
             )
+            for request_id in finished_stores:
+                if is_hotprefix_store_request(request_id):
+                    self._completed_store_requests[request_id] = 1
+                    self._failed_store_requests.add(request_id)
             # A request may have a pending retrieve AND appear in
             # finished_req_ids_from_engine (it ran without loading KV after
             # the server died).  The scheduler processes finished_recving
@@ -1743,6 +2188,7 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = set()
         finished_retrieves = set()
+        failed_retrieves = set()
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
@@ -1750,7 +2196,12 @@ class LMCacheMPWorkerAdapter:
             s_result = s_future.result(timeout=60)
             finished_stores.add(request_id)
 
+            if is_hotprefix_store_request(request_id):
+                self._completed_store_requests[request_id] = 1
+
             if not s_result:
+                if is_hotprefix_store_request(request_id):
+                    self._failed_store_requests.add(request_id)
                 logger.error(
                     "Something went wrong when processing the "
                     "store request for request_id=%s",
@@ -1765,7 +2216,9 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
-                self.error_block_ids.update(r_block_ids)
+                failed_retrieves.add(request_id)
+                if not is_hotprefix_promotion_request(request_id):
+                    self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -1790,6 +2243,11 @@ class LMCacheMPWorkerAdapter:
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
+        failed_retrieves.update(dropped)
+        self._record_hotprefix_promotion_results(
+            finished_retrieves,
+            failed_request_ids=failed_retrieves,
+        )
 
         # Update the internal states
         ret_stores = self._process_finished_stores(
@@ -1843,7 +2301,8 @@ class LMCacheMPWorkerAdapter:
                 r_block_ids,
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
+                if not is_hotprefix_promotion_request(request_id):
+                    self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -1857,13 +2316,20 @@ class LMCacheMPWorkerAdapter:
             dropped = self._dropped_retrieves
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
+            self._record_hotprefix_promotion_results(
+                finished_retrieves,
+                failed_request_ids=set(finished_retrieves),
+            )
 
             for req_id in finished_stores:
                 self._completed_store_requests[req_id] = 1
+                if is_hotprefix_store_request(req_id):
+                    self._failed_store_requests.add(req_id)
             return None, finished_retrieves
 
         finished_stores = set()
         finished_retrieves = set()
+        failed_retrieves = set()
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
@@ -1872,6 +2338,8 @@ class LMCacheMPWorkerAdapter:
             finished_stores.add(request_id)
 
             if not s_result:
+                if is_hotprefix_store_request(request_id):
+                    self._failed_store_requests.add(request_id)
                 logger.error(
                     "Something went wrong when processing the "
                     "store request for request_id=%s",
@@ -1886,7 +2354,9 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
-                self.error_block_ids.update(r_block_ids)
+                failed_retrieves.add(request_id)
+                if not is_hotprefix_promotion_request(request_id):
+                    self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -1911,6 +2381,11 @@ class LMCacheMPWorkerAdapter:
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
+        failed_retrieves.update(dropped)
+        self._record_hotprefix_promotion_results(
+            finished_retrieves,
+            failed_request_ids=failed_retrieves,
+        )
 
         # the invocation of `get_finished` means that
         # these requests' KV caches are already fully stored.
@@ -1928,12 +2403,65 @@ class LMCacheMPWorkerAdapter:
         return None, finished_retrieves
 
     def get_completed_store_requests(self) -> dict[str, int] | None:
-        """Return completed store requests since the last call."""
+        """Return completed store requests since the last call.
+
+        Returns:
+            Per-request worker completion counts, or ``None`` when empty.
+        """
         if not self._completed_store_requests:
             return None
         completed_store_requests = self._completed_store_requests
         self._completed_store_requests = {}
         return completed_store_requests
+
+    def get_failed_store_requests(self) -> set[str]:
+        """Return failed store requests since the last call.
+
+        Returns:
+            Store request IDs with at least one failed worker.
+        """
+        failed = self._failed_store_requests
+        self._failed_store_requests = set()
+        return failed
+
+    def get_completed_promotion_requests(self) -> dict[str, int] | None:
+        """Return completed background promotion retrieves.
+
+        Returns:
+            Per-chunk worker completion counts, or ``None`` when empty.
+        """
+        if not self._completed_promotion_requests:
+            return None
+        completed = self._completed_promotion_requests
+        self._completed_promotion_requests = {}
+        return completed
+
+    def get_failed_promotion_requests(self) -> set[str]:
+        """Return failed background promotion retrieves.
+
+        Returns:
+            Promotion chunk IDs with at least one failed worker.
+        """
+        failed = self._failed_promotion_requests
+        self._failed_promotion_requests = set()
+        return failed
+
+    def _record_hotprefix_promotion_results(
+        self,
+        finished_request_ids: set[str],
+        *,
+        failed_request_ids: set[str],
+    ) -> None:
+        promotions = {
+            request_id
+            for request_id in finished_request_ids
+            if is_hotprefix_promotion_request(request_id)
+        }
+        for request_id in promotions:
+            self._completed_promotion_requests[request_id] = 1
+            if request_id in failed_request_ids:
+                self._failed_promotion_requests.add(request_id)
+        finished_request_ids.difference_update(promotions)
 
     def num_blocks_per_chunk(self) -> int:
         """
