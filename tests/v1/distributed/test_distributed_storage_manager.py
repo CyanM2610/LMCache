@@ -1122,3 +1122,42 @@ class TestStorageManagerDelete:
         assert storage_manager._l1_manager.get_object_state(key) is None
 
         storage_manager.close()
+
+
+class TestHotPrefixPhysicalResidency:
+    """Native StorageManager integration for HotPrefix object ownership."""
+
+    def test_generation_pins_objects_until_explicit_eviction(
+        self, basic_storage_manager_config, basic_layout
+    ) -> None:
+        storage_manager = StorageManager(basic_storage_manager_config)
+        keys = [make_object_key(101), make_object_key(102)]
+        reserved = storage_manager.reserve_write(keys, basic_layout, mode="new")
+        assert set(reserved) == set(keys)
+
+        assert storage_manager.finish_hotprefix_write(b"prefix", 1, keys, keys)
+        l1_status = storage_manager.report_status()["l1_manager"]
+        assert l1_status["retention_pinned_count"] == 2
+        assert storage_manager.delete_l1_keys(keys) == (0, 2)
+
+        assert storage_manager.evict_generation(b"prefix", 1)
+        assert all(
+            storage_manager._l1_manager.get_object_state(key) is None for key in keys
+        )
+        storage_manager.close()
+
+    def test_force_delete_reports_exact_generation_tombstone(
+        self, basic_storage_manager_config, basic_layout
+    ) -> None:
+        storage_manager = StorageManager(basic_storage_manager_config)
+        keys = [make_object_key(201), make_object_key(202)]
+        reserved = storage_manager.reserve_write(keys, basic_layout, mode="new")
+        assert set(reserved) == set(keys)
+        assert storage_manager.finish_hotprefix_write(b"prefix", 2, keys, keys)
+
+        assert storage_manager.delete_l1_keys([keys[0]], force=True) == (1, 0)
+        assert storage_manager.take_invalidated_generations() == ((b"prefix", 2),)
+
+        assert storage_manager.evict_generation(b"prefix", 2)
+        assert storage_manager._l1_manager.get_object_state(keys[1]) is None
+        storage_manager.close()

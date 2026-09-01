@@ -361,6 +361,7 @@ def test_adapter_free_lookup_locks_key_matches_lookup():
     adapter._heartbeats: dict[str, object] = {}
     adapter._heartbeat_lock = threading.Lock()
     adapter._heartbeat_interval = 5.0
+    adapter._hotprefix_enabled = False
 
     mock_client = MagicMock(spec=MessageQueueClient)
     mock_future = MagicMock()
@@ -405,6 +406,43 @@ def test_adapter_free_lookup_locks_key_matches_lookup():
     assert lookup_key.end == free_key.end
     assert lookup_key.request_id == free_key.request_id
     assert lookup_key.token_ids == free_key.token_ids
+
+
+def test_hotprefix_access_uses_chunk_aligned_residency_identity() -> None:
+    """Global access paths must match Local tree publication endpoints."""
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        LMCacheMPSchedulerAdapter,
+    )
+    from lmcache.v1.multiprocess.protocols.hotprefix import HotPrefixAccessResponse
+
+    adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
+    adapter._hotprefix_enabled = True
+    adapter._hotprefix_request_sequences = {}
+    adapter._hotprefix_results = {}
+    adapter._hotprefix_event_seq = 0
+    adapter._hotprefix_instance_id = 7
+    adapter._hotprefix_namespace_prefix = b"namespace\0"
+    adapter.lmcache_tokens_per_chunk = 16
+    adapter._server_urls = ["tcp://test:0"]
+    adapter._mq_timeout = 30.0
+    adapter._health_events = {"tcp://test:0": threading.Event()}
+    adapter._health_events["tcp://test:0"].set()
+
+    mock_client = MagicMock(spec=MessageQueueClient)
+    mock_future = MagicMock()
+    mock_future.result.return_value = HotPrefixAccessResponse(1, 16, [b"prefix"])
+    mock_client.submit_request.return_value = mock_future
+    adapter.mq_clients = {"tcp://test:0": mock_client}
+
+    assert adapter._submit_hotprefix_access(
+        "req-1", list(range(19)), "", local_matched_tokens=18
+    )
+
+    request_type, payloads, _response_class = mock_client.submit_request.call_args[0]
+    assert request_type is RequestType.HOT_PREFIX_ACCESS
+    assert payloads[3] == list(range(16))
+    assert payloads[4] == 16
 
 
 def test_server_free_lookup_locks_honors_the_session_lock_model():

@@ -31,6 +31,10 @@ from lmcache.v1.distributed.config import (
     get_configured_capacity_bytes,
 )
 from lmcache.v1.distributed.error import L1Error, strerror
+from lmcache.v1.distributed.hotprefix_residency import (
+    HotPrefixPhysicalResidencyManager,
+    PhysicalGeneration,
+)
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
@@ -79,6 +83,10 @@ class StorageManager:
         # size is a pure function of it.
         self._l1_config = config.l1_manager_config
         self._event_bus = get_event_bus()
+        self._hotprefix_residencies = HotPrefixPhysicalResidencyManager(
+            self._l1_manager
+        )
+        self._l1_manager.register_listener(self._hotprefix_residencies)
 
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
@@ -246,20 +254,160 @@ class StorageManager:
         Args:
             keys (list[ObjectKey]): List of object keys that have been written.
         """
-        finish_result = self._l1_manager.finish_write(keys)
-        successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
-        failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
-        self._event_bus.publish(
-            Event(
-                event_type=EventType.SM_WRITE_FINISHED,
-                metadata={
-                    "succeeded_keys": successful_keys,
-                    "failed_keys": failed_keys,
-                },
-            )
+        self._finish_write(keys)
+
+    def finish_hotprefix_write(
+        self,
+        prefix_id: bytes,
+        generation: int,
+        written_keys: list[ObjectKey],
+        physical_object_keys: list[ObjectKey],
+    ) -> bool:
+        """Finish a canonical STORE and bind all physical generation keys.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact reserved Host generation.
+            written_keys: Newly allocated keys completed by this STORE.
+            physical_object_keys: Complete chunk/object-group key set, including
+                deduplicated keys that were already present.
+
+        Returns:
+            ``True`` only when all writes finish and the complete physical
+            generation is retention-pinned.
+        """
+        finish_result = self._finish_write(written_keys)
+        if any(error is not L1Error.SUCCESS for error in finish_result.values()):
+            self.mark_residency_publication_failed(prefix_id, generation)
+            self._hotprefix_residencies.delete_unbound_objects(written_keys)
+            return False
+        published = self.publish_residency(
+            prefix_id,
+            generation,
+            physical_object_keys,
+        )
+        if not published:
+            self._hotprefix_residencies.delete_unbound_objects(written_keys)
+        return published
+
+    def abort_hotprefix_write(
+        self,
+        prefix_id: bytes,
+        generation: int,
+        written_keys: list[ObjectKey],
+    ) -> None:
+        """Discard partially copied objects from a failed canonical STORE.
+
+        This method runs from the device-stream completion dispatcher, after
+        every previously enqueued copy is terminal.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact failed Host generation.
+            written_keys: Newly allocated, still write-locked object keys.
+        """
+        self._l1_manager.delete(written_keys, force=True)
+        self.mark_residency_publication_failed(prefix_id, generation)
+
+    def publish_residency(
+        self,
+        prefix_id: bytes,
+        generation: int,
+        physical_object_keys: list[ObjectKey],
+    ) -> bool:
+        """Bind a HotPrefix generation to all local physical object keys.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact reserved Host generation.
+            physical_object_keys: Every chunk/object-group key on this server.
+
+        Returns:
+            ``True`` when the complete generation is bound and retention-pinned.
+        """
+        return self._hotprefix_residencies.publish_residency(
+            prefix_id,
+            generation,
+            physical_object_keys,
         )
 
-        # TODO: global key states update
+    def pin_generation(self, prefix_id: bytes, generation: int) -> bool:
+        """Ensure an exact HotPrefix generation remains retention-pinned.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact physical generation.
+
+        Returns:
+            ``True`` only when the complete generation exists and is pinned.
+        """
+        return self._hotprefix_residencies.pin_generation(prefix_id, generation)
+
+    def unpin_generation(self, prefix_id: bytes, generation: int) -> bool:
+        """Release one HotPrefix generation's retention pins.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact physical generation.
+
+        Returns:
+            ``True`` when the generation exists, including an idempotent retry.
+        """
+        return self._hotprefix_residencies.unpin_generation(prefix_id, generation)
+
+    def evict_generation(self, prefix_id: bytes, generation: int) -> bool:
+        """Retire a HotPrefix generation and delete its unshared objects.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact physical generation.
+
+        Returns:
+            ``True`` when a physical binding was retired. Missing generations
+            are safe no-ops that return ``False`` and reject late publication.
+        """
+        return self._hotprefix_residencies.evict_generation(prefix_id, generation)
+
+    def mark_residency_publication_failed(
+        self, prefix_id: bytes, generation: int
+    ) -> None:
+        """Notify logical publication that the physical STORE failed.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact failed physical generation.
+        """
+        self._hotprefix_residencies.mark_publication_failed(prefix_id, generation)
+
+    def wait_for_residency(
+        self,
+        prefix_id: bytes,
+        generation: int,
+        timeout_seconds: float,
+    ) -> bool:
+        """Wait for stream-ordered physical generation publication.
+
+        Args:
+            prefix_id: Canonical LogicalPrefix identifier.
+            generation: Exact expected physical generation.
+            timeout_seconds: Maximum wait duration.
+
+        Returns:
+            ``True`` only when the complete generation is valid and pinned.
+        """
+        return self._hotprefix_residencies.wait_for_residency(
+            prefix_id,
+            generation,
+            timeout_seconds,
+        )
+
+    def take_invalidated_generations(self) -> tuple[PhysicalGeneration, ...]:
+        """Drain generations affected by physical object eviction callbacks.
+
+        Returns:
+            Deterministically ordered ``(prefix_id, generation)`` tombstones.
+        """
+        return self._hotprefix_residencies.take_invalidated_generations()
 
     @contextmanager
     def read_prefetched_results(
@@ -1168,6 +1316,21 @@ class StorageManager:
             True if memory is consistent, False otherwise.
         """
         return self._l1_manager.memcheck()
+
+    def _finish_write(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        finish_result = self._l1_manager.finish_write(keys)
+        successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
+        failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_WRITE_FINISHED,
+                metadata={
+                    "succeeded_keys": successful_keys,
+                    "failed_keys": failed_keys,
+                },
+            )
+        )
+        return finish_result
 
     def _snapshot_adapters(
         self,

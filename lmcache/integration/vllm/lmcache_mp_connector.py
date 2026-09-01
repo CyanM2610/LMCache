@@ -72,6 +72,7 @@ from lmcache.v1.multiprocess.protocols.hotprefix import (
     HOTPREFIX_STORE_REQUEST_PREFIX,
     HotPrefixHostCandidate,
     HotPrefixTransferTicket,
+    is_hotprefix_promotion_request,
     is_hotprefix_store_request,
 )
 
@@ -822,6 +823,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             val = self.worker_adapter.get_finished_with_lazy_offload()
         else:
             val = self.worker_adapter.get_finished(finished_req_ids)
+        if self.worker_adapter.hotprefix_enabled:
+            _finished_sending, finished_recving = val
+            if finished_recving is not None:
+                finished_recving = {
+                    request_id
+                    for request_id in finished_recving
+                    if not is_hotprefix_promotion_request(request_id)
+                }
+            return None, finished_recving
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
 
@@ -1398,7 +1408,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             metadata.add_request_metadata(store_transaction.metadata)
             store_transaction.submitted = True
-        for promotion_transaction in self._hotprefix_promotion_transactions.values():
+        for promotion_transaction in list(
+            self._hotprefix_promotion_transactions.values()
+        ):
             if (
                 promotion_transaction.submitted
                 or not self._hotprefix_allow_promotion_transfer
@@ -1406,6 +1418,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             if promotion_transaction.metadata is None:
                 raise RuntimeError("HotPrefix promotion chunk has no metadata")
+            op = promotion_transaction.metadata.op
+            if not self.scheduler_adapter.prepare_hotprefix_retrieve(
+                promotion_transaction.request_id,
+                op.token_ids,
+                op.start,
+                op.end,
+                promotion_transaction.cache_salt,
+            ):
+                promotion_transaction.failed = True
+                self._finish_hotprefix_promotion(promotion_transaction.request_id)
+                continue
             metadata.add_request_metadata(promotion_transaction.metadata)
             promotion_transaction.submitted = True
 
@@ -1493,6 +1516,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         manager = self._hotprefix_kv_cache_manager
         if manager is None:
             raise RuntimeError("HotPrefix promotion has no KVCacheManager owner")
+        if transaction.submitted:
+            self.scheduler_adapter.end_session(request_id)
         terminal = True
         try:
             if transaction.failed:

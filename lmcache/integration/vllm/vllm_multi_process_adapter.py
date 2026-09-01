@@ -58,20 +58,29 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True, eq=False)
+class _ExtraConfigDefaultValue:
+    """Identity-distinct wrapper for one extra-config default value."""
+
+    default: Any
+
+
 class ExtraConfigDefault(enum.Enum):
     """Centralized default values for extra_config keys.
 
     Each member's *name* is the key used in the extra_config dict,
-    and its *value* is the default.
+    and its :attr:`default` is the user-facing default. The wrapper values are
+    identity-distinct so equal defaults such as two ``False`` booleans do not
+    become Enum aliases.
     """
 
     # Timeout (seconds) for blocking MQ requests: initial
     # chunk-size query, KV cache registration/unregistration,
     # and other synchronous operations.
-    mq_timeout = 300.0
+    mq_timeout = _ExtraConfigDefaultValue(300.0)
     # Interval (seconds) between periodic heartbeat pings
     # to the server.
-    heartbeat_interval = 10.0
+    heartbeat_interval = _ExtraConfigDefaultValue(10.0)
     # Routing mode for ``create_transfer_context``: ``auto`` keeps the
     # historical CUDA -> lmcache_driven / others -> engine_driven dispatch;
     # ``lmcache_driven`` forces the IPC / SHM zero-copy path where the
@@ -79,24 +88,29 @@ class ExtraConfigDefault(enum.Enum):
     # ``engine_driven`` forces the worker-side gather/scatter copy path.
     # Mirrors the ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config
     # key wins when both are set.
-    mp_transfer_mode = "auto"
+    mp_transfer_mode = _ExtraConfigDefaultValue("auto")
     # Whether IPC mechanisms must work across isolated containers (no
     # shared host IPC namespace or /dev/shm); see
     # lmcache/v1/platform/isolated_ipc.py. Must match the LMCache server's
     # ``--isolated-ipc`` setting.
-    isolated_ipc = False
+    isolated_ipc = _ExtraConfigDefaultValue(False)
     # Enable one fleet-wide HotPrefix access observation per initial lookup.
-    hotprefix_enabled = False
+    hotprefix_enabled = _ExtraConfigDefaultValue(False)
     # Stable scheduler identity. Negative values request a generated identity.
-    hotprefix_instance_id = -1
+    hotprefix_instance_id = _ExtraConfigDefaultValue(-1)
     # Maximum Host-to-HBM promotion bytes submitted by one scheduler step.
-    hotprefix_promotion_budget_bytes = 64 << 20
+    hotprefix_promotion_budget_bytes = _ExtraConfigDefaultValue(64 << 20)
+
+    @property
+    def default(self) -> Any:
+        """Return the user-facing default value for this config key."""
+        return self.value.default
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
 # entry point, which still passes these as positional/keyword args.
-DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.value
-DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.value
+DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.default
+DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.default
 
 _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
 
@@ -110,7 +124,7 @@ def _coerce_extra_config_value(default: Any, raw: Any) -> Any:
     """Coerce a user-provided extra_config value to its default's type.
 
     Args:
-        default: The :class:`ExtraConfigDefault` member value, defining the
+        default: The :class:`ExtraConfigDefault` member default, defining the
             target type.
         raw: The user-provided value (typed when the connector config came
             from JSON, a string when it came from a CLI passthrough).
@@ -156,7 +170,7 @@ def _resolve_extra_config(
 
     resolved: dict[str, Any] = {}
     for item in ExtraConfigDefault:
-        default = item.value
+        default = item.default
         raw = stripped.get(item.name)
         value = _coerce_extra_config_value(default, raw) if raw is not None else default
         if value != default:
@@ -768,10 +782,10 @@ class LMCacheMPSchedulerAdapter:
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""
-        if self._heartbeats is not None:
+        if self._heartbeats:
             return
         with self._heartbeat_lock:
-            if self._heartbeats is not None:
+            if self._heartbeats:
                 return
             for url, client in self.mq_clients.items():
                 hb = HeartbeatThread(
@@ -880,6 +894,14 @@ class LMCacheMPSchedulerAdapter:
             return True
         if request_id in self._hotprefix_request_sequences:
             return True
+        aligned_end = (
+            len(token_ids) // self.lmcache_tokens_per_chunk
+        ) * self.lmcache_tokens_per_chunk
+        if aligned_end == 0:
+            self._hotprefix_request_sequences[request_id] = self._hotprefix_event_seq
+            return True
+        cacheable_token_ids = token_ids[:aligned_end]
+        cacheable_matched_tokens = min(local_matched_tokens, aligned_end)
         self._hotprefix_event_seq += 1
         event_seq = self._hotprefix_event_seq
         namespace = self._hotprefix_namespace_prefix + cache_salt.encode()
@@ -891,8 +913,8 @@ class LMCacheMPSchedulerAdapter:
                     self._hotprefix_instance_id,
                     event_seq,
                     namespace,
-                    token_ids,
-                    local_matched_tokens,
+                    cacheable_token_ids,
+                    cacheable_matched_tokens,
                 ],
             )
             for url in self._server_urls
@@ -919,6 +941,121 @@ class LMCacheMPSchedulerAdapter:
         self._hotprefix_request_sequences[request_id] = event_seq
         self._hotprefix_results[request_id] = responses
         return True
+
+    def prepare_hotprefix_retrieve(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        start: int,
+        end: int,
+        cache_salt: str = "",
+    ) -> bool:
+        """Acquire standard L1 read locks for one promotion transfer range.
+
+        A HotPrefix generation lease prevents policy replacement, but the
+        existing RETRIEVE executor still requires the same per-object read
+        locks as an on-demand fetch. Background promotions do not pass through
+        ``get_num_new_matched_tokens``, so they must perform this range-scoped
+        LOOKUP explicitly before worker metadata is published.
+
+        Returns:
+            ``True`` only when every server retained every requested chunk.
+            Partial locks and lookup sessions are released on failure.
+        """
+        self._ensure_heartbeat_started()
+        if not self._hotprefix_enabled or not self.is_healthy:
+            return False
+        if (
+            start < 0
+            or end <= start
+            or end > len(token_ids)
+            or start % self.lmcache_tokens_per_chunk != 0
+            or end % self.lmcache_tokens_per_chunk != 0
+        ):
+            raise ValueError("HotPrefix retrieve range must be non-empty and aligned")
+
+        key = self._create_key(
+            token_ids,
+            start=start,
+            end=end,
+            request_id=request_id,
+            cache_salt=cache_salt,
+        ).no_worker_id_version()
+        lookup_futures = {
+            url: send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.LOOKUP,
+                [key, self.tp_size],
+            )
+            for url in self._server_urls
+        }
+        for url, future in lookup_futures.items():
+            try:
+                future.result(timeout=self._mq_timeout)
+            except Exception:
+                logger.warning(
+                    "HotPrefix promotion LOOKUP failed on %s", url, exc_info=True
+                )
+                self._health_events[url].clear()
+                self._cleanup_hotprefix_lookup(key)
+                return False
+
+        wait_futures = {
+            url: send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.WAIT_PREFETCH_STATUS,
+                [request_id, float(self._mq_timeout)],
+            )
+            for url in self._server_urls
+        }
+        expected_chunks = (end - start) // self.lmcache_tokens_per_chunk
+        hit_chunks: dict[str, int] = {}
+        for url, future in wait_futures.items():
+            try:
+                response = future.result(timeout=self._mq_timeout + 1.0)
+            except Exception:
+                logger.warning(
+                    "HotPrefix promotion prefetch wait failed on %s",
+                    url,
+                    exc_info=True,
+                )
+                self._health_events[url].clear()
+                self._cleanup_hotprefix_lookup(key)
+                return False
+            if type(response) is not int:
+                self._cleanup_hotprefix_lookup(key)
+                return False
+            hit_chunks[url] = response
+
+        if any(count != expected_chunks for count in hit_chunks.values()):
+            logger.warning(
+                "HotPrefix promotion range retained %s chunks; expected %d on "
+                "every server",
+                hit_chunks,
+                expected_chunks,
+            )
+            self._cleanup_hotprefix_lookup(key)
+            return False
+        return True
+
+    def _cleanup_hotprefix_lookup(self, key: IPCCacheServerKey) -> None:
+        """Synchronously release a failed promotion lookup and its session."""
+        for url in self._server_urls:
+            future = send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.FREE_LOOKUP_LOCKS,
+                [key, self.tp_size],
+            )
+            try:
+                future.result(timeout=self._mq_timeout)
+            except Exception:
+                self._health_events[url].clear()
+        for url in self._server_urls:
+            send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.END_SESSION,
+                [key.request_id],
+            )
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -1568,10 +1705,14 @@ class LMCacheMPWorkerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        self._hotprefix_enabled = False
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
+            self._hotprefix_enabled = bool(
+                cfg[ExtraConfigDefault.hotprefix_enabled.name]
+            )
             # Only treat ``mp_transfer_mode`` as an explicit override when
             # the user actually set it in extra_config; otherwise leave it
             # as ``None`` so ``create_transfer_context`` can still consult
@@ -1724,6 +1865,11 @@ class LMCacheMPWorkerAdapter:
         so this property only reads the shared event.
         """
         return self._health_event.is_set()
+
+    @property
+    def hotprefix_enabled(self) -> bool:
+        """Whether canonical HotPrefix request bookkeeping is active."""
+        return self._hotprefix_enabled
 
     @property
     def world_size(self) -> int:

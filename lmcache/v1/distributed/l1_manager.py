@@ -50,26 +50,34 @@ class L1ObjectState:
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
 
+    retention_pins: int = 0
+    """ Non-expiring policy pins that prevent generic eviction. """
+
+    delete_pending: bool = False
+    """ Whether deletion should finish after active users release the object. """
+
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
 
         Returns:
-            True if the object is not write-locked, False otherwise.
+            True if the object is neither write-locked nor pending deletion.
         """
-        return not self.write_lock.is_locked()
+        return not self.write_lock.is_locked() and not self.delete_pending
 
     def available_for_write(self) -> bool:
         """Check if the object is available for write.
 
         Returns:
-            True if the object is not write-locked and has no read locks
-            and is not a temporary object, False otherwise.
+            True if the object has no write/read/retention locks and is neither
+            temporary nor pending deletion.
         """
 
         return (
             not self.write_lock.is_locked()
             and not self.read_lock.is_locked()
             and not self.is_temporary
+            and self.retention_pins == 0
+            and not self.delete_pending
         )
 
 
@@ -406,7 +414,12 @@ class L1Manager:
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                (entry.is_temporary or entry.delete_pending)
+                and not entry.read_lock.is_locked()
+                and not entry.write_lock.is_locked()
+                and entry.retention_pins == 0
+            ):
                 # NOTE: temporary objects shouldn't have write-locks
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
@@ -675,17 +688,17 @@ class L1Manager:
 
         Args:
             keys: The list of object keys to delete.
-            force: When True, delete even a read/write-locked key. This may free
-                memory a concurrent store/read still uses (same hazard as
-                :meth:`clear` with ``force=True``); use with care.
+            force: When True, delete even a read/write/retention-locked key.
+                This may free memory a concurrent store/read still uses (same
+                hazard as :meth:`clear` with ``force=True``); use with care.
 
         Returns:
             A dictionary mapping each object key to an L1Error.
 
         Errors:
             KEY_NOT_EXIST: The key does not exist.
-            KEY_IS_LOCKED: The key is write-locked or read-locked and cannot be
-                deleted. Never returned when ``force`` is True.
+            KEY_IS_LOCKED: The key is write-, read-, or retention-locked and
+                cannot be deleted. Never returned when ``force`` is True.
         """
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
@@ -697,7 +710,11 @@ class L1Manager:
                 ret[key] = L1Error.KEY_NOT_EXIST
                 continue
 
-            locked = entry.read_lock.is_locked() or entry.write_lock.is_locked()
+            locked = (
+                entry.read_lock.is_locked()
+                or entry.write_lock.is_locked()
+                or entry.retention_pins > 0
+            )
             if locked and not force:
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
@@ -721,6 +738,133 @@ class L1Manager:
             )
         )
         return ret
+
+    @l1_mgr_synchronized
+    def pin_retention(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """Acquire non-expiring policy retention pins atomically.
+
+        Args:
+            keys: Complete object-key set for one physical residency.
+
+        Returns:
+            Per-key results. No pin is acquired when any key is absent,
+            write-locked, temporary, or already pending deletion.
+        """
+        keys = list(dict.fromkeys(keys))
+        results: dict[ObjectKey, L1Error] = {}
+        can_pin = True
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                results[key] = L1Error.KEY_NOT_EXIST
+                can_pin = False
+            elif (
+                entry.write_lock.is_locked()
+                or entry.is_temporary
+                or entry.delete_pending
+            ):
+                results[key] = L1Error.KEY_NOT_READABLE
+                can_pin = False
+            else:
+                results[key] = L1Error.SUCCESS
+        if not can_pin:
+            return results
+        for key in keys:
+            self._objects[key].retention_pins += 1
+        return results
+
+    @l1_mgr_synchronized
+    def unpin_retention(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """Release policy retention pins and finish deferred deletions.
+
+        Args:
+            keys: Object keys whose policy ownership is being released.
+
+        Returns:
+            Per-key results. Missing or unpinned objects are idempotent errors.
+        """
+        keys = list(dict.fromkeys(keys))
+        results: dict[ObjectKey, L1Error] = {}
+        removed_keys: list[ObjectKey] = []
+        removed_objects: list[MemoryObj] = []
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                results[key] = L1Error.KEY_NOT_EXIST
+                continue
+            if entry.retention_pins <= 0:
+                results[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
+            entry.retention_pins -= 1
+            results[key] = L1Error.SUCCESS
+            if (
+                entry.delete_pending
+                and entry.retention_pins == 0
+                and not entry.read_lock.is_locked()
+                and not entry.write_lock.is_locked()
+            ):
+                removed_keys.append(key)
+                removed_objects.append(entry.memory_obj)
+                del self._objects[key]
+
+        removed_meta = [self._object_meta(obj) for obj in removed_objects]
+        self._memory_manager.free(removed_objects)
+        if removed_keys:
+            for listener in self._registered_listeners:
+                listener.on_l1_keys_deleted_by_manager(removed_keys)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_KEYS_EVICTED,
+                    metadata={"keys": removed_keys, "meta": removed_meta},
+                )
+            )
+        return results
+
+    @l1_mgr_synchronized
+    def request_delete(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """Delete objects now or defer until all active users release them.
+
+        Args:
+            keys: Object keys retired by their policy owner.
+
+        Returns:
+            ``SUCCESS`` for immediate deletion, ``KEY_IS_LOCKED`` for accepted
+            deferred deletion, and ``KEY_NOT_EXIST`` for an idempotent miss.
+        """
+        keys = list(dict.fromkeys(keys))
+        results: dict[ObjectKey, L1Error] = {}
+        removed_keys: list[ObjectKey] = []
+        removed_objects: list[MemoryObj] = []
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                results[key] = L1Error.KEY_NOT_EXIST
+                continue
+            if (
+                entry.read_lock.is_locked()
+                or entry.write_lock.is_locked()
+                or entry.retention_pins > 0
+            ):
+                entry.delete_pending = True
+                results[key] = L1Error.KEY_IS_LOCKED
+                continue
+            removed_keys.append(key)
+            removed_objects.append(entry.memory_obj)
+            del self._objects[key]
+            results[key] = L1Error.SUCCESS
+
+        removed_meta = [self._object_meta(obj) for obj in removed_objects]
+        self._memory_manager.free(removed_objects)
+        if removed_keys:
+            for listener in self._registered_listeners:
+                listener.on_l1_keys_deleted_by_manager(removed_keys)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_KEYS_EVICTED,
+                    metadata={"keys": removed_keys, "meta": removed_meta},
+                )
+            )
+        return results
 
     def touch_keys(self, keys: list[ObjectKey]):
         """Touch the given keys, marking the keys as accessed(retrieved or stored).
@@ -746,7 +890,7 @@ class L1Manager:
             force: If True, clear ALL objects including locked ones.
                 This may corrupt in-flight store/prefetch operations.
                 If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+                write-, read-, and retention-locked objects intact.
         """
         if force:
             logger.warning(
@@ -779,7 +923,11 @@ class L1Manager:
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.write_lock.is_locked() or entry.read_lock.is_locked():
+            if (
+                entry.write_lock.is_locked()
+                or entry.read_lock.is_locked()
+                or entry.retention_pins > 0
+            ):
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -818,13 +966,17 @@ class L1Manager:
             key: The object key to check.
 
         Returns:
-            True if the key exists and is not locked (neither read-locked
-            nor write-locked), False otherwise.
+            True if the key exists and has no read, write, or policy retention
+            locks, False otherwise.
         """
         entry = self._objects.get(key, None)
         if entry is None:
             return False
-        return not entry.read_lock.is_locked() and not entry.write_lock.is_locked()
+        return (
+            not entry.read_lock.is_locked()
+            and not entry.write_lock.is_locked()
+            and entry.retention_pins == 0
+        )
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Get the current memory usage of L1 cache.
@@ -857,12 +1009,15 @@ class L1Manager:
         """Return a status dict describing L1 cache state."""
         write_locked = 0
         read_locked = 0
+        retention_pinned = 0
         temporary = 0
         for entry in self._objects.values():
             if entry.write_lock.is_locked():
                 write_locked += 1
             if entry.read_lock.is_locked():
                 read_locked += 1
+            if entry.retention_pins > 0:
+                retention_pinned += 1
             if entry.is_temporary:
                 temporary += 1
         used, total = self._memory_manager.get_memory_usage()
@@ -874,6 +1029,7 @@ class L1Manager:
             "total_object_count": len(self._objects),
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
+            "retention_pinned_count": retention_pinned,
             "temporary_count": temporary,
             "memory_used_bytes": used,
             "memory_total_bytes": total,

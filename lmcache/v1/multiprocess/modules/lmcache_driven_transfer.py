@@ -49,6 +49,10 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.v1.multiprocess.protocols.hotprefix import (
+    is_hotprefix_store_request,
+    parse_hotprefix_store_request,
+)
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -681,6 +685,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
+            "finish_hotprefix_write",
+            self._finish_hotprefix_write,
+            payload_type=tuple[str, list[ObjectKey], list[ObjectKey]],
+        )
+        self._device_host_func_dispatcher.register(
+            "abort_hotprefix_write",
+            self._abort_hotprefix_write,
+            payload_type=tuple[str, list[ObjectKey]],
+        )
+        self._device_host_func_dispatcher.register(
             "finish_read_prefetched",
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
@@ -1194,6 +1208,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             all_dict: dict[ObjectKey, MemoryObj] = {}
+            physical_keys = [
+                obj_key
+                for obj_group_id, obj_keys in enumerate(obj_keys_per_obj_group)
+                for index, obj_key in enumerate(obj_keys)
+                if not skipped_chunks[obj_group_id][index]
+            ]
             total_bytes: int = 0
             store_succeeded = False
             try:
@@ -1243,7 +1263,25 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
-                if stored_count:
+                if not store_succeeded:
+                    total_bytes = 0
+                if is_hotprefix_store_request(key.request_id):
+                    callback_kind = (
+                        "finish_hotprefix_write"
+                        if store_succeeded
+                        else "abort_hotprefix_write"
+                    )
+                    callback_payload = (
+                        (key.request_id, list(all_dict.keys()), physical_keys)
+                        if store_succeeded
+                        else (key.request_id, list(all_dict.keys()))
+                    )
+                    submit_callback_to_stream(
+                        cache_context.cupy_stream,
+                        callback_kind,
+                        callback_payload,
+                    )
+                elif stored_count:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
                         "finish_write",
@@ -1521,6 +1559,36 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return (
             event_backend.export_event(event, cache_context.device),
             retrieve_succeeded,
+        )
+
+    def _finish_hotprefix_write(
+        self,
+        payload: tuple[str, list[ObjectKey], list[ObjectKey]],
+    ) -> None:
+        request_id, written_keys, physical_keys = payload
+        generation, prefix_id = parse_hotprefix_store_request(request_id)
+        if not self._ctx.storage_manager.finish_hotprefix_write(
+            prefix_id,
+            generation,
+            written_keys,
+            physical_keys,
+        ):
+            logger.warning(
+                "HotPrefix physical publication failed for prefix=%s generation=%d",
+                prefix_id.hex(),
+                generation,
+            )
+
+    def _abort_hotprefix_write(
+        self,
+        payload: tuple[str, list[ObjectKey]],
+    ) -> None:
+        request_id, written_keys = payload
+        generation, prefix_id = parse_hotprefix_store_request(request_id)
+        self._ctx.storage_manager.abort_hotprefix_write(
+            prefix_id,
+            generation,
+            written_keys,
         )
 
     def _publish_token_bindings(
