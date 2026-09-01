@@ -52,6 +52,10 @@ class ObservabilityConfig:
     metrics and traces are pushed to an OTel collector.  When ``None``,
     metrics fall back to an in-process Prometheus ``/metrics`` endpoint."""
 
+    traces_otlp_endpoint: str | None = None
+    """Optional trace-only OTLP endpoint. When set, metrics continue using
+    ``otlp_endpoint`` (or Prometheus fallback) while spans use this endpoint."""
+
     prometheus_port: int = 9090
     """Port for the Prometheus /metrics endpoint.  Only used when
     ``otlp_endpoint`` is ``None`` (Prometheus pull fallback)."""
@@ -148,6 +152,15 @@ def add_observability_args(
             "OTLP gRPC endpoint (e.g. http://localhost:4317). "
             "When set, metrics/traces are pushed to an OTel collector. "
             "When unset, falls back to Prometheus pull mode."
+        ),
+    )
+    group.add_argument(
+        "--traces-otlp-endpoint",
+        type=str,
+        default=None,
+        help=(
+            "Trace-only OTLP gRPC endpoint. Metrics continue using "
+            "--otlp-endpoint or the Prometheus fallback."
         ),
     )
     group.add_argument(
@@ -305,6 +318,7 @@ def parse_args_to_observability_config(
         logging_enabled=not args.disable_logging,
         tracing_enabled=args.enable_tracing,
         otlp_endpoint=args.otlp_endpoint,
+        traces_otlp_endpoint=args.traces_otlp_endpoint,
         prometheus_port=args.prometheus_port,
         metrics_sample_rate=args.metrics_sample_rate,
         lookup_hash_log=LookupHashLogConfig(
@@ -324,9 +338,14 @@ def parse_args_to_observability_config(
         trace_output=args.trace_output,
     )
 
-    if config.tracing_enabled and config.otlp_endpoint is None:
+    if (
+        config.tracing_enabled
+        and config.otlp_endpoint is None
+        and config.traces_otlp_endpoint is None
+    ):
         raise ValueError(
-            "--enable-tracing requires --otlp-endpoint to be set. "
+            "--enable-tracing requires --otlp-endpoint or "
+            "--traces-otlp-endpoint to be set. "
             "Tracing needs an OTLP gRPC endpoint to export spans."
         )
 
@@ -389,7 +408,7 @@ def init_observability(
         from lmcache.v1.mp_observability.otel_init import init_otel_tracing
 
         init_otel_tracing(
-            otlp_endpoint=obs_config.otlp_endpoint,
+            otlp_endpoint=(obs_config.traces_otlp_endpoint or obs_config.otlp_endpoint),
             resource_attributes=resource_attrs,
         )
 
@@ -406,6 +425,7 @@ def init_observability(
             BlendMetricsSubscriber,
             EngineMetricsSubscriber,
             EventBusSelfMetricsSubscriber,
+            HotPrefixMetricsSubscriber,
             L0L1ThroughputSubscriber,
             L0LifecycleSubscriber,
             L1EvictionLoopSubscriber,
@@ -437,6 +457,7 @@ def init_observability(
         bus.register_subscriber(BlendMetricsSubscriber())
         bus.register_subscriber(EngineMetricsSubscriber())
         bus.register_subscriber(EventBusSelfMetricsSubscriber(bus))
+        bus.register_subscriber(HotPrefixMetricsSubscriber())
         bus.register_subscriber(TimeoutMetricsSubscriber())
 
     if obs_config.logging_enabled:
@@ -461,6 +482,7 @@ def init_observability(
         # First Party
         from lmcache.v1.mp_observability.subscribers.tracing import (
             BlendTracingSubscriber,
+            HotPrefixTracingSubscriber,
             MPServerTracingSubscriber,
             TimeoutTracingSubscriber,
             get_span_registry,
@@ -470,6 +492,7 @@ def init_observability(
         bus.register_subscriber(MPServerTracingSubscriber(registry))
         bus.register_subscriber(BlendTracingSubscriber(registry))
         bus.register_subscriber(TimeoutTracingSubscriber(registry))
+        bus.register_subscriber(HotPrefixTracingSubscriber())
 
     # Lookup hash file logging (independent of the logging_enabled flag —
     # it has its own enable gate via output_dir).

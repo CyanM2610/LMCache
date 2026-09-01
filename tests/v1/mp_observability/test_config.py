@@ -49,6 +49,20 @@ class TestExtraLoggingArgs:
         with pytest.raises(ValueError, match="extra-logging-interval"):
             _parse(["--enable-extra-logging", "--extra-logging-interval", "0"])
 
+    def test_trace_only_otlp_keeps_metrics_on_prometheus(self):
+        config = _parse(
+            [
+                "--enable-tracing",
+                "--traces-otlp-endpoint",
+                "http://127.0.0.1:4317",
+                "--prometheus-port",
+                "19090",
+            ]
+        )
+        assert config.otlp_endpoint is None
+        assert config.traces_otlp_endpoint == "http://127.0.0.1:4317"
+        assert config.prometheus_port == 19090
+
 
 class _CaptureHandler(logging.Handler):
     def __init__(self) -> None:

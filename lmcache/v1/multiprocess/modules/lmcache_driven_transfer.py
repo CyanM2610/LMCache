@@ -50,6 +50,7 @@ from lmcache.v1.multiprocess.native_completion import (
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.multiprocess.protocols.hotprefix import (
+    is_hotprefix_promotion_request,
     is_hotprefix_store_request,
     parse_hotprefix_store_request,
 )
@@ -65,6 +66,14 @@ logger = init_logger(__name__)
 _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
     device_ops, "execute_object_group_transfer"
 )
+
+
+def _transfer_purpose(request_id: str, direction: str) -> str:
+    if is_hotprefix_store_request(request_id):
+        return "eviction_store"
+    if is_hotprefix_promotion_request(request_id):
+        return "promotion"
+    return "foreground_fetch" if direction == "retrieve" else "foreground_store"
 
 
 def get_layout_desc(
@@ -1180,7 +1189,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 Event(
                     event_type=EventType.MP_STORE_SUBMITTED,
                     session_id=key.request_id,
-                    metadata={"device": str(cache_context.device)},
+                    metadata={
+                        "device": str(cache_context.device),
+                        "purpose": _transfer_purpose(key.request_id, "store"),
+                    },
                 )
             )
 
@@ -1202,6 +1214,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "device": str(cache_context.device),
                         "engine_id": instance_id,
                         "model_name": model_name,
+                        "purpose": _transfer_purpose(key.request_id, "store"),
                     },
                 ),
             )
@@ -1302,6 +1315,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             "model_name": model_name,
                             "total_bytes": total_bytes,
                             "num_tokens": num_tokens,
+                            "purpose": _transfer_purpose(key.request_id, "store"),
                         },
                     ),
                 )
@@ -1392,7 +1406,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             Event(
                 event_type=EventType.MP_RETRIEVE_SUBMITTED,
                 session_id=key.request_id,
-                metadata={"device": str(cache_context.device)},
+                metadata={
+                    "device": str(cache_context.device),
+                    "purpose": _transfer_purpose(key.request_id, "retrieve"),
+                },
             )
         )
 
@@ -1405,6 +1422,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "device": str(cache_context.device),
                     "engine_id": instance_id,
                     "model_name": model_name,
+                    "purpose": _transfer_purpose(key.request_id, "retrieve"),
                 },
             ),
         )
@@ -1544,6 +1562,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             "cache_salt": key.cache_salt,
                             "total_bytes": total_bytes,
                             "num_tokens": num_tokens,
+                            "purpose": _transfer_purpose(key.request_id, "retrieve"),
                         },
                     ),
                 )

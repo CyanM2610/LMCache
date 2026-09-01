@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 import threading
@@ -10,6 +11,7 @@ import pytest
 
 # First Party
 from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_module
+from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPSchedulerAdapter,
 )
@@ -42,6 +44,8 @@ def _scheduler_adapter() -> LMCacheMPSchedulerAdapter:
     for event in adapter._health_events.values():
         event.set()
     adapter.mq_clients = {url: MagicMock(name=url) for url in adapter._server_urls}
+    adapter._hotprefix_control_lock = threading.Lock()
+    adapter._hotprefix_control_observations = []
     adapter.lmcache_tokens_per_chunk = 16
     adapter.model_name = "model"
     adapter.parallel_strategy = MagicMock(
@@ -198,6 +202,12 @@ def test_candidates_are_intersected_by_generation_and_size(
     assert adapter.hotprefix_candidates(b"namespace", [b"mismatch", b"shared"]) == [
         shared
     ]
+    observations = adapter.drain_hotprefix_control_stats()["control_observations"]
+    assert len(observations) == 1
+    assert observations[0]["method"] == "candidates"
+    assert observations[0]["outcome"] == "success"
+    assert float(observations[0]["duration_seconds"]) >= 0
+    assert adapter.drain_hotprefix_control_stats() == {"control_observations": []}
 
 
 def test_partial_acquire_releases_ticket_on_every_contacted_server(
@@ -229,3 +239,17 @@ def test_partial_acquire_releases_ticket_on_every_contacted_server(
         ("server-a", RequestType.HOT_PREFIX_RELEASE),
         ("server-b", RequestType.HOT_PREFIX_RELEASE),
     ]
+
+
+def test_request_finished_cleans_access_only_hotprefix_state() -> None:
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.request_trackers = {}
+    connector.scheduler_adapter = MagicMock(hotprefix_enabled=True)
+    request = SimpleNamespace(request_id="access-only", kv_transfer_params=None)
+
+    assert connector.request_finished(request, []) == (False, None)
+
+    connector.scheduler_adapter.cleanup_lookup_result.assert_called_once_with(
+        "access-only"
+    )
+    connector.scheduler_adapter.end_session.assert_called_once_with("access-only")

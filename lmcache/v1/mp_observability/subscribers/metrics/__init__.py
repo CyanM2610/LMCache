@@ -10,6 +10,9 @@ from lmcache.v1.mp_observability.subscribers.metrics.engine import (
 from lmcache.v1.mp_observability.subscribers.metrics.event_bus import (
     EventBusSelfMetricsSubscriber,
 )
+from lmcache.v1.mp_observability.subscribers.metrics.hotprefix import (
+    HotPrefixMetricsSubscriber,
+)
 from lmcache.v1.mp_observability.subscribers.metrics.l0_l1_throughput import (
     L0L1ThroughputSubscriber,
 )
@@ -50,6 +53,7 @@ __all__ = [
     "BlendMetricsSubscriber",
     "EngineMetricsSubscriber",
     "EventBusSelfMetricsSubscriber",
+    "HotPrefixMetricsSubscriber",
     "L0L1ThroughputSubscriber",
     "L0LifecycleSubscriber",
     "L1EvictionLoopSubscriber",

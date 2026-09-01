@@ -403,6 +403,31 @@ scrape time with `metric_relabel_configs` if storage cost matters).
 
 ---
 
+## HotPrefix Metrics
+
+HotPrefix control handlers use EventBus events for interval counters and
+histograms. Current-state values use pull gauges so an EventBus drop cannot
+permanently skew residency state.
+
+| OTel metric name | Prometheus name | Type | Attributes |
+|---|---|---|---|
+| `lmcache_mp.hotprefix_handler_duration` | `lmcache_mp_hotprefix_handler_duration_milliseconds` | Histogram | `method`, `outcome`, `phase` (`total`, `lock_wait`, `handler_body`) |
+| `lmcache_mp.hotprefix_decisions` | `lmcache_mp_hotprefix_decisions_total` | Counter | `kind`, `action`, bounded `reason` |
+| `lmcache_mp.hotprefix_residency_changes` | `lmcache_mp_hotprefix_residency_changes_total` | Counter | `old_state`, `new_state` |
+| `lmcache_mp.hotprefix_transfer_bytes` | `lmcache_mp_hotprefix_transfer_bytes_total` | Counter | `purpose`, `direction`, `outcome` |
+| `lmcache_mp.hotprefix_residency_bytes` | `lmcache_mp_hotprefix_residency_bytes` | Gauge | `state` |
+| `lmcache_mp.hotprefix_generations` | `lmcache_mp_hotprefix_generations` | Gauge | `state` |
+| `lmcache_mp.hotprefix_active_leases` | `lmcache_mp_hotprefix_active_leases` | Gauge | none |
+| `lmcache_mp.hotprefix_retained_keys` | `lmcache_mp_hotprefix_retained_keys` | Gauge | none |
+| `lmcache_mp.hotprefix_discarded_generations` | `lmcache_mp_hotprefix_discarded_generations` | Gauge | none |
+| `lmcache_mp.hotprefix_failed_publications` | `lmcache_mp_hotprefix_failed_publications` | Gauge | none |
+| `lmcache_mp.hotprefix_invalidated_generations` | `lmcache_mp_hotprefix_invalidated_generations` | Gauge | none |
+
+Handler phase durations overlap by construction: `total` contains both
+`lock_wait` and `handler_body`. Transfer spans can overlap foreground compute.
+Do not sum these values as a disjoint TTFT decomposition; use paired preset
+end-to-end differences for causal attribution.
+
 ## EventBus Self-Monitoring
 
 Health metrics for the EventBus itself. The two gauges are registered

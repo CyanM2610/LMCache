@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, cast
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar, cast
 import threading
+import time
+import uuid
 
 # First Party
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.engine_module import HandlerSpec, ThreadPoolType
 from lmcache.v1.multiprocess.hotprefix.admission import (
     HostAdmissionCandidate,
@@ -36,9 +42,99 @@ if TYPE_CHECKING:
     from lmcache.v1.distributed.storage_manager import StorageManager
     from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 
+_ResultT = TypeVar("_ResultT")
+
+
+def _estimated_wire_bytes(value: Any) -> int:
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, str):
+        return len(value.encode())
+    if isinstance(value, (int, float, bool)) or value is None:
+        return 8
+    if isinstance(value, (list, tuple)):
+        if value and isinstance(value[0], int):
+            return 8 * len(value)
+        return sum(_estimated_wire_bytes(item) for item in value)
+    return 16
+
+
+class _MeasuredLock:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._local = threading.local()
+
+    def __enter__(self) -> None:
+        started_ns = time.monotonic_ns()
+        self._lock.acquire()
+        self._local.wait_ns = time.monotonic_ns() - started_ns
+
+    def __exit__(self, *_args: object) -> None:
+        self._lock.release()
+
+    def last_wait_ns(self) -> int:
+        return int(getattr(self._local, "wait_ns", 0))
+
+
+def _observe_control(
+    method: str,
+) -> Callable[[Callable[..., _ResultT]], Callable[..., _ResultT]]:
+    def decorator(function: Callable[..., _ResultT]) -> Callable[..., _ResultT]:
+        @wraps(function)
+        def wrapper(self: "HotPrefixModule", *args: Any, **kwargs: Any) -> _ResultT:
+            if not (
+                self._event_bus.has_subscribers(EventType.HOTPREFIX_CONTROL_START)
+                or self._event_bus.has_subscribers(EventType.HOTPREFIX_CONTROL_END)
+            ):
+                return function(self, *args, **kwargs)
+            operation_id = f"hotprefix-{uuid.uuid4().hex}"
+            started_ns = time.monotonic_ns()
+            request_bytes = _estimated_wire_bytes(args) + _estimated_wire_bytes(kwargs)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.HOTPREFIX_CONTROL_START,
+                    session_id=operation_id,
+                    metadata={"method": method, "request_bytes": request_bytes},
+                )
+            )
+            outcome = "success"
+            response_bytes = 0
+            try:
+                result = function(self, *args, **kwargs)
+                response_bytes = _estimated_wire_bytes(result)
+                return result
+            except Exception:
+                outcome = "failure"
+                raise
+            finally:
+                total_ns = time.monotonic_ns() - started_ns
+                lock_wait_ns = self._lock.last_wait_ns()
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.HOTPREFIX_CONTROL_END,
+                        session_id=operation_id,
+                        metadata={
+                            "method": method,
+                            "outcome": outcome,
+                            "request_bytes": request_bytes,
+                            "response_bytes": response_bytes,
+                            "duration_ns": total_ns,
+                            "lock_wait_ns": lock_wait_ns,
+                            "handler_body_ns": max(0, total_ns - lock_wait_ns),
+                        },
+                    )
+                )
+
+        return wrapper
+
+    return decorator
+
 
 class HotPrefixModule:
     """Own Global Host Prefix Trees keyed by model/cache namespace."""
+
+    _gauge_target: ClassVar["HotPrefixModule | None"] = None
+    _gauges_registered: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -68,7 +164,58 @@ class HotPrefixModule:
         )
         self._trees: dict[bytes, GlobalHostPrefixTree] = {}
         self._directories: dict[bytes, HostResidencyDirectory] = {}
-        self._lock = threading.Lock()
+        self._lock = _MeasuredLock()
+        self._event_bus = get_event_bus()
+        HotPrefixModule._gauge_target = self
+        if not HotPrefixModule._gauges_registered:
+            HotPrefixModule._gauges_registered = True
+            register_gauge(
+                "lmcache.hotprefix",
+                "lmcache_mp.hotprefix_residency_bytes",
+                "HotPrefix logical residency bytes by state.",
+                lambda: HotPrefixModule._logical_gauge("bytes"),
+            )
+            register_gauge(
+                "lmcache.hotprefix",
+                "lmcache_mp.hotprefix_generations",
+                "HotPrefix logical generations by state.",
+                lambda: HotPrefixModule._logical_gauge("generations"),
+            )
+            for metric_name, description, field_name in (
+                (
+                    "lmcache_mp.hotprefix_active_leases",
+                    "Active HotPrefix generation read leases.",
+                    "active_leases",
+                ),
+                (
+                    "lmcache_mp.hotprefix_retained_keys",
+                    "Physical L1 keys retained by HotPrefix generations.",
+                    "retained_keys",
+                ),
+                (
+                    "lmcache_mp.hotprefix_discarded_generations",
+                    "Discarded physical HotPrefix generation tombstones.",
+                    "discarded_generations",
+                ),
+                (
+                    "lmcache_mp.hotprefix_failed_publications",
+                    "Failed physical HotPrefix publications.",
+                    "failed_publications",
+                ),
+                (
+                    "lmcache_mp.hotprefix_invalidated_generations",
+                    "Invalidated physical HotPrefix generations.",
+                    "invalidated_generations",
+                ),
+            ):
+                register_gauge(
+                    "lmcache.hotprefix",
+                    metric_name,
+                    description,
+                    lambda field_name=field_name: HotPrefixModule._scalar_gauge(
+                        field_name
+                    ),
+                )
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -129,6 +276,7 @@ class HotPrefixModule:
             ),
         ]
 
+    @_observe_control("access")
     def access(
         self,
         instance_id: int,
@@ -167,12 +315,25 @@ class HotPrefixModule:
                 )
                 self._trees[namespace] = tree
             result = tree.observe(observation)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.HOTPREFIX_DECISION,
+                    metadata={
+                        "kind": "access",
+                        "action": "observe",
+                        "reason": "none",
+                        "tokens": len(token_ids),
+                        "bytes": 0,
+                    },
+                )
+            )
         return HotPrefixAccessResponse(
             result.epoch,
             result.global_matched_tokens,
             list(result.path),
         )
 
+    @_observe_control("admit")
     def admit(
         self,
         namespace: bytes,
@@ -196,6 +357,18 @@ class HotPrefixModule:
             tree = self._trees.get(namespace)
             snapshot = tree.get(prefix_id) if tree is not None else None
             if snapshot is None:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.HOTPREFIX_DECISION,
+                        metadata={
+                            "kind": "admission",
+                            "action": "reject",
+                            "reason": "prefix_absent",
+                            "tokens": 0,
+                            "bytes": size_bytes,
+                        },
+                    )
+                )
                 return HotPrefixAdmissionResponse(
                     "reject", "prefix_absent_from_global_tree", [], None
                 )
@@ -221,6 +394,18 @@ class HotPrefixModule:
                 residency.generation if residency is not None else None
             )
             self._retire_invalid_physical_generations()
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.HOTPREFIX_DECISION,
+                    metadata={
+                        "kind": "admission",
+                        "action": decision.action.value,
+                        "reason": decision.reason,
+                        "tokens": 0,
+                        "bytes": size_bytes,
+                    },
+                )
+            )
         return HotPrefixAdmissionResponse(
             decision.action.value,
             decision.reason,
@@ -228,6 +413,7 @@ class HotPrefixModule:
             reserved_generation,
         )
 
+    @_observe_control("publish")
     def publish(self, namespace: bytes, prefix_id: bytes) -> bool:
         """Publish a fully written shared Host residency.
 
@@ -255,7 +441,18 @@ class HotPrefixModule:
                 if not storage_manager.pin_generation(prefix_id, residency.generation):
                     return False
             victims = directory.replacement_victims(prefix_id)
-            directory.publish(prefix_id)
+            ready = directory.publish(prefix_id)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.HOTPREFIX_RESIDENCY_CHANGED,
+                    metadata={
+                        "old_state": "reserved",
+                        "new_state": "ready",
+                        "bytes": ready.size_bytes,
+                        "shared_keys": 0,
+                    },
+                )
+            )
             if storage_manager is not None:
                 for victim in victims:
                     storage_manager.evict_generation(
@@ -264,6 +461,7 @@ class HotPrefixModule:
             self._retire_invalid_physical_generations()
         return True
 
+    @_observe_control("abort")
     def abort(self, namespace: bytes, prefix_id: bytes) -> bool:
         """Abort an incomplete shared Host residency.
 
@@ -286,9 +484,22 @@ class HotPrefixModule:
             ):
                 storage_manager.evict_generation(prefix_id, residency.generation)
             directory.abort(prefix_id)
+            if residency is not None:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.HOTPREFIX_RESIDENCY_CHANGED,
+                        metadata={
+                            "old_state": residency.state.value,
+                            "new_state": "absent",
+                            "bytes": residency.size_bytes,
+                            "shared_keys": 0,
+                        },
+                    )
+                )
             self._retire_invalid_physical_generations()
         return True
 
+    @_observe_control("candidates")
     def candidates(
         self, namespace: bytes, prefix_ids: list[bytes]
     ) -> list[HotPrefixHostCandidate]:
@@ -337,6 +548,7 @@ class HotPrefixModule:
             )
         return candidates
 
+    @_observe_control("acquire")
     def acquire(
         self,
         namespace: bytes,
@@ -374,6 +586,7 @@ class HotPrefixModule:
             lease.size_bytes,
         )
 
+    @_observe_control("release")
     def release(self, namespace: bytes, ticket_id: bytes) -> bool:
         """Release a terminal promotion's shared Host read lease.
 
@@ -390,6 +603,7 @@ class HotPrefixModule:
             self._retire_invalid_physical_generations()
         return True
 
+    @_observe_control("renew")
     def renew(self, namespace: bytes, ticket_id: bytes) -> bool:
         """Renew an in-flight promotion lease.
 
@@ -405,6 +619,7 @@ class HotPrefixModule:
             self._directory(namespace).renew(ticket_id)
         return True
 
+    @_observe_control("invalidate")
     def invalidate(self, namespace: bytes, prefix_id: bytes, generation: int) -> bool:
         """Invalidate a READY generation after a verified physical miss.
 
@@ -419,6 +634,18 @@ class HotPrefixModule:
         with self._lock:
             self._reconcile_physical_invalidations()
             invalidated = self._directory(namespace).invalidate(prefix_id, generation)
+            if invalidated:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.HOTPREFIX_RESIDENCY_CHANGED,
+                        metadata={
+                            "old_state": "ready",
+                            "new_state": "invalid",
+                            "bytes": 0,
+                            "shared_keys": 0,
+                        },
+                    )
+                )
             self._retire_invalid_physical_generations()
             return invalidated
 
@@ -431,9 +658,34 @@ class HotPrefixModule:
         with self._lock:
             self._reconcile_physical_invalidations()
             trees = tuple(self._trees.values())
+            residencies = tuple(
+                item
+                for directory in self._directories.values()
+                for item in directory.snapshot()
+            )
+            physical = self._physical_storage_manager()
+            physical_stats = (
+                physical.hotprefix_physical_stats() if physical is not None else None
+            )
             return {
                 "hotprefix_trees": len(trees),
                 "hotprefix_nodes": sum(len(tree.snapshot()) for tree in trees),
+                "hotprefix_generations": len(residencies),
+                "hotprefix_residency_bytes": sum(
+                    item.size_bytes for item in residencies
+                ),
+                "hotprefix_active_leases": sum(
+                    directory.active_lease_count
+                    for directory in self._directories.values()
+                ),
+                "hotprefix_retained_keys": (
+                    physical_stats.retained_keys if physical_stats is not None else 0
+                ),
+                "hotprefix_discarded_generations": (
+                    physical_stats.discarded_generations
+                    if physical_stats is not None
+                    else 0
+                ),
             }
 
     def close(self) -> None:
@@ -441,6 +693,38 @@ class HotPrefixModule:
         with self._lock:
             self._trees.clear()
             self._directories.clear()
+
+    @staticmethod
+    def _logical_gauge(
+        kind: str,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        target = HotPrefixModule._gauge_target
+        totals = {state.value: 0 for state in HostResidencyState}
+        if target is not None:
+            with target._lock:
+                for directory in target._directories.values():
+                    for residency in directory.snapshot():
+                        totals[residency.state.value] += (
+                            residency.size_bytes if kind == "bytes" else 1
+                        )
+        return [(value, {"state": state}) for state, value in totals.items()]
+
+    @staticmethod
+    def _scalar_gauge(field_name: str) -> int:
+        target = HotPrefixModule._gauge_target
+        if target is None:
+            return 0
+        if field_name == "active_leases":
+            with target._lock:
+                return sum(
+                    directory.active_lease_count
+                    for directory in target._directories.values()
+                )
+        storage_manager = target._physical_storage_manager()
+        if storage_manager is None:
+            return 0
+        stats = storage_manager.hotprefix_physical_stats()
+        return int(getattr(stats, field_name))
 
     def _directory(self, namespace: bytes) -> HostResidencyDirectory:
         directory = self._directories.get(namespace)

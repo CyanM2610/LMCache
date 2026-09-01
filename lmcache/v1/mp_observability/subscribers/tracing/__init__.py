@@ -4,6 +4,9 @@
 from lmcache.v1.mp_observability.subscribers.tracing.cb_server import (
     BlendTracingSubscriber,
 )
+from lmcache.v1.mp_observability.subscribers.tracing.hotprefix import (
+    HotPrefixTracingSubscriber,
+)
 from lmcache.v1.mp_observability.subscribers.tracing.mp_server import (
     MPServerTracingSubscriber,
 )
@@ -18,6 +21,7 @@ from lmcache.v1.mp_observability.subscribers.tracing.timeout import (
 __all__ = [
     "BlendTracingSubscriber",
     "MPServerTracingSubscriber",
+    "HotPrefixTracingSubscriber",
     "SpanRegistry",
     "TimeoutTracingSubscriber",
     "get_span_registry",

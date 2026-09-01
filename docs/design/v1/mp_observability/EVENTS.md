@@ -171,8 +171,8 @@ thread processes them in strict order before any GPU-callback events.
 | EventType | Metadata keys | Types | Published by / when |
 |---|---|---|---|
 | `MP_REQUEST_START` | *(none)* | — | `MPServer.handle_request` — at request arrival, before any GPU work |
-| `MP_STORE_SUBMITTED` | `device` | `str` | `MPServer.store` — CPU-synchronous, before the GPU store is enqueued |
-| `MP_RETRIEVE_SUBMITTED` | `device` | `str` | `MPServer.retrieve` — CPU-synchronous, before the GPU retrieve is enqueued |
+| `MP_STORE_SUBMITTED` | `device`, `purpose` | `str`, `str` | `MPServer.store` — CPU-synchronous, before the GPU store is enqueued |
+| `MP_RETRIEVE_SUBMITTED` | `device`, `purpose` | `str`, `str` | `MPServer.retrieve` — CPU-synchronous, before the GPU retrieve is enqueued |
 | `MP_REQUEST_END` | *(none)* | — | `MPServer.handle_request` — after all CPU work; may precede GPU callbacks |
 
 ---
@@ -184,10 +184,10 @@ to correlate START/END pairs.
 
 | EventType | Metadata keys | Types |
 |---|---|---|
-| `MP_STORE_START` | `device`, `engine_id`, `model_name` | `str`, `int`, `str` |
-| `MP_STORE_END` | `device`, `stored_count`, `engine_id`, `model_name`, `total_bytes`, `num_tokens` | `str`, `int`, `int`, `str`, `int`, `int` |
-| `MP_RETRIEVE_START` | `device`, `engine_id`, `model_name` | `str`, `int`, `str` |
-| `MP_RETRIEVE_END` | `device`, `retrieved_count`, `engine_id`, `model_name`, `cache_salt`, `total_bytes`, `num_tokens` | `str`, `int`, `int`, `str`, `str`, `int`, `int` |
+| `MP_STORE_START` | `device`, `engine_id`, `model_name`, `purpose` | `str`, `int`, `str`, `str` |
+| `MP_STORE_END` | `device`, `stored_count`, `engine_id`, `model_name`, `total_bytes`, `num_tokens`, `purpose` | `str`, `int`, `int`, `str`, `int`, `int`, `str` |
+| `MP_RETRIEVE_START` | `device`, `engine_id`, `model_name`, `purpose` | `str`, `int`, `str`, `str` |
+| `MP_RETRIEVE_END` | `device`, `retrieved_count`, `engine_id`, `model_name`, `cache_salt`, `total_bytes`, `num_tokens`, `purpose` | `str`, `int`, `int`, `str`, `str`, `int`, `int`, `str` |
 | `MP_LOOKUP_PREFETCH_START` | *(none)* | — |
 | `MP_LOOKUP_PREFETCH_END` | `found_count`, `requested_tokens`, `hit_tokens`, `model_name`, `cache_salt` | `int`, `int`, `int`, `str`, `str` |
 | `MP_LOOKUP` | `request_id`, `chunk_hashes`, `model_name`, `chunk_size`, `seq_len`, `dtypes`, `shapes` | `str`, `list[str]`, `str`, `int`, `int`, `list[str]`, `list[list[int]]` |
@@ -224,6 +224,22 @@ know `chunk_size`:
 Together they drive the `lmcache_mp.lookup_*_tokens` counters used to
 compute the L1+L2 token-level hit rate.  See
 [L1_L2_HIT_RATE_PLAN.md](L1_L2_HIT_RATE_PLAN.md) for the design.
+
+### HotPrefix control and residency events
+
+HotPrefix handlers publish a unique operation ID as `session_id`. Prometheus
+uses only the fixed metadata enums; the operation ID is trace-only.
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `HOTPREFIX_CONTROL_START` | `method`, `request_bytes` | `str`, `int` |
+| `HOTPREFIX_CONTROL_END` | `method`, `outcome`, `request_bytes`, `response_bytes`, `duration_ns`, `lock_wait_ns`, `handler_body_ns` | `str`, `str`, `int`, `int`, `int`, `int`, `int` |
+| `HOTPREFIX_DECISION` | `kind`, `action`, `reason`, `tokens`, `bytes` | `str`, `str`, `str`, `int`, `int` |
+| `HOTPREFIX_RESIDENCY_CHANGED` | `old_state`, `new_state`, `bytes`, `shared_keys` | `str`, `str`, `int`, `int` |
+
+`purpose` on MP transfer events is one of `foreground_fetch`,
+`foreground_store`, `eviction_store`, or `promotion`. It classifies the
+existing stream-timed transfer and does not introduce a second CPU timer.
 
 ---
 
