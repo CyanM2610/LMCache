@@ -76,6 +76,7 @@ class HostResidencyDirectory:
         self._generations: dict[PrefixId, int] = {}
         self._leases: dict[bytes, HostReadLease] = {}
         self._rollback_victims: dict[PrefixId, tuple[HostResidency, ...]] = {}
+        self._retired_invalid: list[HostResidency] = []
 
     @property
     def used_bytes(self) -> int:
@@ -199,6 +200,49 @@ class HostResidencyDirectory:
                 raise RuntimeError("rollback victim prefix was reused")
             self._residencies[victim.prefix_id] = victim
 
+    def replacement_victims(self, prefix_id: PrefixId) -> tuple[HostResidency, ...]:
+        """Return victims held for one in-flight replacement rollback.
+
+        Args:
+            prefix_id: Reserved replacement candidate.
+
+        Returns:
+            Immutable READY victim generations retained until publication.
+        """
+        return self._rollback_victims.get(prefix_id, ())
+
+    def invalidate_replacement_victim(
+        self, prefix_id: PrefixId, generation: int
+    ) -> bool:
+        """Tombstone a rollback victim lost from physical storage.
+
+        Args:
+            prefix_id: Victim LogicalPrefix identifier.
+            generation: Exact physical generation reported missing.
+
+        Returns:
+            ``True`` only when the matching rollback victim was removed.
+        """
+        for candidate_id, victims in tuple(self._rollback_victims.items()):
+            retained = tuple(
+                victim
+                for victim in victims
+                if not (
+                    victim.prefix_id == prefix_id and victim.generation == generation
+                )
+            )
+            if len(retained) == len(victims):
+                continue
+            removed = next(
+                victim
+                for victim in victims
+                if victim.prefix_id == prefix_id and victim.generation == generation
+            )
+            self._rollback_victims[candidate_id] = retained
+            self._retired_invalid.append(removed)
+            return True
+        return False
+
     def evict(self, prefix_id: PrefixId) -> HostResidency:
         """Remove and return a READY shared Host residency.
 
@@ -233,6 +277,8 @@ class HostResidencyDirectory:
             return False
         if residency.generation != generation:
             return False
+        if residency.state is HostResidencyState.INVALID:
+            return True
         if residency.state is not HostResidencyState.READY:
             raise RuntimeError("cannot invalidate an in-flight Host STORE")
         if self._has_active_lease(prefix_id):
@@ -242,6 +288,7 @@ class HostResidencyDirectory:
             )
         else:
             del self._residencies[prefix_id]
+            self._retired_invalid.append(residency)
         return True
 
     def acquire(
@@ -353,6 +400,16 @@ class HostResidencyDirectory:
         """
         return self._residencies.get(prefix_id)
 
+    def take_retired_invalid(self) -> tuple[HostResidency, ...]:
+        """Drain invalid generations whose final reader has released them."""
+        retired = tuple(self._retired_invalid)
+        self._retired_invalid.clear()
+        return retired
+
+    def expire_leases(self) -> None:
+        """Expire abandoned read leases using the directory clock."""
+        self._purge_expired_leases()
+
     def _has_active_lease(self, prefix_id: PrefixId) -> bool:
         self._purge_expired_leases()
         return any(lease.prefix_id == prefix_id for lease in self._leases.values())
@@ -375,3 +432,4 @@ class HostResidencyDirectory:
         if any(lease.prefix_id == prefix_id for lease in self._leases.values()):
             return
         del self._residencies[prefix_id]
+        self._retired_invalid.append(residency)

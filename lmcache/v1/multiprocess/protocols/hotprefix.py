@@ -24,6 +24,33 @@ def is_hotprefix_store_request(request_id: str) -> bool:
     return request_id.startswith(HOTPREFIX_STORE_REQUEST_PREFIX)
 
 
+def parse_hotprefix_store_request(request_id: str) -> tuple[int, bytes]:
+    """Parse a canonical eviction STORE operation identifier.
+
+    Args:
+        request_id: Identifier formatted as
+            ``__hotprefix_store__:<generation>:<prefix-id-hex>``.
+
+    Returns:
+        Positive generation and decoded LogicalPrefix identifier.
+
+    Raises:
+        ValueError: If the identifier is not canonical HotPrefix STORE syntax.
+    """
+    if not is_hotprefix_store_request(request_id):
+        raise ValueError("request is not a HotPrefix STORE")
+    encoded = request_id[len(HOTPREFIX_STORE_REQUEST_PREFIX) :]
+    try:
+        generation_text, prefix_text = encoded.split(":", 1)
+        generation = int(generation_text)
+        prefix_id = bytes.fromhex(prefix_text)
+    except (TypeError, ValueError) as error:
+        raise ValueError("malformed HotPrefix STORE request ID") from error
+    if generation <= 0 or not prefix_id or prefix_id.hex() != prefix_text.lower():
+        raise ValueError("malformed HotPrefix STORE request ID")
+    return generation, prefix_id
+
+
 def is_hotprefix_promotion_request(request_id: str) -> bool:
     """Return whether a request carries a promotion RETRIEVE chunk.
 

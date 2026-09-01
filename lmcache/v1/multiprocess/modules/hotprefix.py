@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 import threading
 
 # First Party
@@ -33,6 +33,7 @@ from lmcache.v1.multiprocess.protocols.hotprefix import (
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.distributed.storage_manager import StorageManager
     from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 
 
@@ -49,13 +50,19 @@ class HotPrefixModule:
         host_capacity_bytes: int = 1 << 30,
         frequency_threshold: int = 10,
         lease_ttl_seconds: float = 30.0,
+        physical_publication_timeout_seconds: float = 5.0,
     ) -> None:
+        if physical_publication_timeout_seconds <= 0:
+            raise ValueError("physical_publication_timeout_seconds must be positive")
         self._ctx = ctx
         self._max_value = max_value
         self._max_age = max_age
         self._aging_interval = aging_interval
         self._host_capacity_bytes = host_capacity_bytes
         self._lease_ttl_seconds = lease_ttl_seconds
+        self._physical_publication_timeout_seconds = (
+            physical_publication_timeout_seconds
+        )
         self._admission_policy = HostAdmissionPolicy(
             frequency_threshold=frequency_threshold
         )
@@ -149,6 +156,7 @@ class HotPrefixModule:
             matched_tokens,
         )
         with self._lock:
+            self._reconcile_physical_invalidations()
             tree = self._trees.get(namespace)
             if tree is None:
                 tree = GlobalHostPrefixTree(
@@ -184,6 +192,7 @@ class HotPrefixModule:
             Explainable DEDUP, REJECT, or ACCEPT response.
         """
         with self._lock:
+            self._reconcile_physical_invalidations()
             tree = self._trees.get(namespace)
             snapshot = tree.get(prefix_id) if tree is not None else None
             if snapshot is None:
@@ -211,6 +220,7 @@ class HotPrefixModule:
             reserved_generation = (
                 residency.generation if residency is not None else None
             )
+            self._retire_invalid_physical_generations()
         return HotPrefixAdmissionResponse(
             decision.action.value,
             decision.reason,
@@ -229,7 +239,29 @@ class HotPrefixModule:
             ``True`` after publication (including an idempotent retry).
         """
         with self._lock:
-            self._directory(namespace).publish(prefix_id)
+            self._reconcile_physical_invalidations()
+            directory = self._directory(namespace)
+            residency = directory.get(prefix_id)
+            if residency is None:
+                return False
+            storage_manager = self._physical_storage_manager()
+            if storage_manager is not None:
+                if not storage_manager.wait_for_residency(
+                    prefix_id,
+                    residency.generation,
+                    self._physical_publication_timeout_seconds,
+                ):
+                    return False
+                if not storage_manager.pin_generation(prefix_id, residency.generation):
+                    return False
+            victims = directory.replacement_victims(prefix_id)
+            directory.publish(prefix_id)
+            if storage_manager is not None:
+                for victim in victims:
+                    storage_manager.evict_generation(
+                        victim.prefix_id, victim.generation
+                    )
+            self._retire_invalid_physical_generations()
         return True
 
     def abort(self, namespace: bytes, prefix_id: bytes) -> bool:
@@ -243,7 +275,18 @@ class HotPrefixModule:
             ``True`` after rollback (including an idempotent retry).
         """
         with self._lock:
-            self._directory(namespace).abort(prefix_id)
+            self._reconcile_physical_invalidations()
+            directory = self._directory(namespace)
+            residency = directory.get(prefix_id)
+            storage_manager = self._physical_storage_manager()
+            if (
+                storage_manager is not None
+                and residency is not None
+                and residency.state is HostResidencyState.RESERVED
+            ):
+                storage_manager.evict_generation(prefix_id, residency.generation)
+            directory.abort(prefix_id)
+            self._retire_invalid_physical_generations()
         return True
 
     def candidates(
@@ -260,6 +303,7 @@ class HotPrefixModule:
         """
         requested = set(prefix_ids)
         with self._lock:
+            self._reconcile_physical_invalidations()
             directory = self._directories.get(namespace)
             if directory is None:
                 return []
@@ -312,6 +356,12 @@ class HotPrefixModule:
             Renewable generation-bound transfer ticket.
         """
         with self._lock:
+            self._reconcile_physical_invalidations()
+            storage_manager = self._physical_storage_manager()
+            if storage_manager is not None and not storage_manager.pin_generation(
+                prefix_id, generation
+            ):
+                raise RuntimeError("promotion source physical generation is missing")
             lease = self._directory(namespace).acquire(
                 prefix_id,
                 generation,
@@ -335,7 +385,9 @@ class HotPrefixModule:
             ``True`` after release or an idempotent retry.
         """
         with self._lock:
+            self._reconcile_physical_invalidations()
             self._directory(namespace).release(ticket_id, missing_ok=True)
+            self._retire_invalid_physical_generations()
         return True
 
     def renew(self, namespace: bytes, ticket_id: bytes) -> bool:
@@ -349,6 +401,7 @@ class HotPrefixModule:
             ``True`` when the lease was extended.
         """
         with self._lock:
+            self._reconcile_physical_invalidations()
             self._directory(namespace).renew(ticket_id)
         return True
 
@@ -364,7 +417,10 @@ class HotPrefixModule:
             ``True`` only when that generation was removed.
         """
         with self._lock:
-            return self._directory(namespace).invalidate(prefix_id, generation)
+            self._reconcile_physical_invalidations()
+            invalidated = self._directory(namespace).invalidate(prefix_id, generation)
+            self._retire_invalid_physical_generations()
+            return invalidated
 
     def report_status(self) -> dict[str, int]:
         """Return global tree and node counts.
@@ -373,6 +429,7 @@ class HotPrefixModule:
             Counts suitable for the MP server status report.
         """
         with self._lock:
+            self._reconcile_physical_invalidations()
             trees = tuple(self._trees.values())
             return {
                 "hotprefix_trees": len(trees),
@@ -394,3 +451,41 @@ class HotPrefixModule:
             )
             self._directories[namespace] = directory
         return directory
+
+    def _physical_storage_manager(self) -> StorageManager | None:
+        storage_manager = getattr(self._ctx, "storage_manager", None)
+        return cast("StorageManager | None", storage_manager)
+
+    def _reconcile_physical_invalidations(self) -> None:
+        for directory in self._directories.values():
+            directory.expire_leases()
+        storage_manager = self._physical_storage_manager()
+        if storage_manager is None:
+            return
+        for prefix_id, generation in storage_manager.take_invalidated_generations():
+            matched = False
+            for directory in self._directories.values():
+                residency = directory.get(prefix_id)
+                if residency is not None and residency.generation == generation:
+                    matched = True
+                    if residency.state is HostResidencyState.RESERVED:
+                        directory.abort(prefix_id)
+                        storage_manager.evict_generation(prefix_id, generation)
+                    else:
+                        directory.invalidate(prefix_id, generation)
+                    continue
+                if directory.invalidate_replacement_victim(prefix_id, generation):
+                    matched = True
+            if not matched:
+                storage_manager.evict_generation(prefix_id, generation)
+        self._retire_invalid_physical_generations()
+
+    def _retire_invalid_physical_generations(self) -> None:
+        storage_manager = self._physical_storage_manager()
+        if storage_manager is None:
+            return
+        for directory in self._directories.values():
+            for residency in directory.take_retired_invalid():
+                storage_manager.evict_generation(
+                    residency.prefix_id, residency.generation
+                )

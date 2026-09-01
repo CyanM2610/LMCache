@@ -36,8 +36,9 @@ of silently bypassing admission for an unrepresentable physical victim.
 ## State and protocol
 
 - `HOT_PREFIX_ACCESS` merges per-instance ordered event streams into a Global
-  Host Prefix Tree. Duplicate `(instance_id, local_event_seq)` events are
-  idempotent.
+  Host Prefix Tree. The path is truncated to complete LMCache chunks so its
+  prefix IDs exactly match Local tree publication and physical residency
+  endpoints. Duplicate `(instance_id, local_event_seq)` events are idempotent.
 - `HOT_PREFIX_ADMIT` uses server-authoritative Global frequency and clock. A
   scheduler-proposed generation is adopted by every MP server, avoiding
   generation drift after partial failure.
@@ -62,5 +63,30 @@ publishes the detached target blocks only after every worker succeeds.
 On-demand native fetch remains available and is accounted separately from
 background promotion. Promotion has one transaction per instance, slices the
 prefix into LMCache-aligned per-step budget ranges, and guarantees at least one
-chunk as a starvation quantum. Multi-tier placement, adaptive budgets, and
-global flow arbitration are intentionally left for experiments.
+chunk as a starvation quantum. Each background RETRIEVE range first performs
+the standard LOOKUP/WAIT handshake so its physical objects hold ordinary L1
+read locks in addition to the generation lease; the lease alone only prevents
+policy replacement. Multi-tier placement, adaptive budgets, and global flow
+arbitration are intentionally left for experiments.
+
+## Physical retention ownership
+
+The HotPrefix directory and the distributed StorageManager share one physical
+generation contract. A canonical STORE completion binds the generation to every
+local `ObjectKey` produced for its chunks, object groups, and server rank. The
+binding is published only after the device-stream completion callback finishes
+all L1 writes and atomically acquires non-expiring retention pins.
+
+Retention pins are distinct from TTL read locks. Generic L1 eviction, clear,
+and in-place update skip pinned objects; HotPrefix replacement explicitly
+retires a generation. Objects shared by several prefix generations are pinned
+once and deleted only after the final generation reference is retired. If a
+reader is still active, deletion becomes pending and completes after its final
+read lock is released.
+
+Replacement victims remain physically pinned while the candidate STORE is in
+flight. Publication deletes the committed logical victims; abort deletes only
+the candidate payload and restores the victims. A failed or late stream
+completion cannot republish an aborted generation. Finally, every L1 deletion
+callback is reverse-mapped from `ObjectKey` to affected generations so a forced
+physical loss tombstones the logical residency before it can be acquired again.

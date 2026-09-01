@@ -331,6 +331,20 @@ def test_resolve_extra_config_overrides_mp_transfer_mode() -> None:
     assert cfg[ExtraConfigDefault.mp_transfer_mode.name] == "lmcache_driven"
 
 
+def test_resolve_hotprefix_enabled_independently_from_isolated_ipc() -> None:
+    """Equal boolean defaults must remain distinct extra-config entries."""
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        ExtraConfigDefault,
+        _resolve_extra_config,
+    )
+
+    cfg = _resolve_extra_config({"lmcache.mp.hotprefix_enabled": True})
+
+    assert cfg[ExtraConfigDefault.hotprefix_enabled.name] is True
+    assert cfg[ExtraConfigDefault.isolated_ipc.name] is False
+
+
 def test_extra_config_default_lets_env_var_select_mp_transfer_mode(
     monkeypatch: Any,
 ) -> None:

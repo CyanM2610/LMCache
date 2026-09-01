@@ -455,6 +455,28 @@ def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     assert event_ref() is None
 
 
+def test_hotprefix_connector_hides_non_async_and_internal_completion_ids() -> None:
+    """Canonical bookkeeping must not finish nonexistent vLLM requests."""
+    pytest.importorskip("vllm")
+
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.lazy_offload = False
+    connector.worker_adapter = MagicMock(name="worker_adapter")
+    connector.worker_adapter.hotprefix_enabled = True
+    connector.worker_adapter.get_finished.return_value = (
+        {"req-finished", "__hotprefix_store__:1:aa"},
+        {"req-loading", "__hotprefix_promotion__:ticket:0"},
+    )
+
+    finished_sending, finished_recving = connector.get_finished({"req-finished"})
+
+    assert finished_sending is None
+    assert finished_recving == {"req-loading"}
+
+
 @pytest.mark.parametrize("lazy_offload", [False, True])
 def test_failed_retrieve_marks_blocks_for_recompute(
     fake_adapter,
@@ -515,6 +537,7 @@ def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> Non
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {request.request_id: tracker}
     connector.scheduler_adapter = MagicMock(name="scheduler_adapter")
+    connector._hotprefix_promotion_transactions = {}
 
     matched_tokens, load_async = connector.get_num_new_matched_tokens(
         request,

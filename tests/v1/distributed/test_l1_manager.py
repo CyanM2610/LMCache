@@ -1968,3 +1968,45 @@ class TestIsKeyEvictable:
         assert manager.is_key_evictable(key) is True
 
         manager.close()
+
+
+class TestRetentionPins:
+    """Policy retention pins own eviction independently of read locks."""
+
+    def test_retention_pin_blocks_generic_delete_and_update(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(9001)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+
+        assert manager.pin_retention([key])[key] is L1Error.SUCCESS
+        assert manager.is_key_evictable(key) is False
+        assert manager.delete([key])[key] is L1Error.KEY_IS_LOCKED
+        assert (
+            manager.reserve_write([key], [False], basic_layout, mode="update")[key][0]
+            is L1Error.KEY_NOT_WRITABLE
+        )
+
+        assert manager.unpin_retention([key])[key] is L1Error.SUCCESS
+        assert manager.is_key_evictable(key) is True
+        manager.close()
+
+    def test_deferred_delete_preserves_reader_until_release(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(9002)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        manager.pin_retention([key])
+        manager.reserve_read([key])
+
+        assert manager.request_delete([key])[key] is L1Error.KEY_IS_LOCKED
+        assert manager.unpin_retention([key])[key] is L1Error.SUCCESS
+        assert manager.get_object_state(key) is not None
+
+        assert manager.finish_read([key])[key] is L1Error.SUCCESS
+        assert manager.get_object_state(key) is None
+        manager.close()
