@@ -227,14 +227,16 @@ compute the L1+L2 token-level hit rate.  See
 
 ### HotPrefix control and residency events
 
-HotPrefix handlers publish a unique operation ID as `session_id`. Prometheus
-uses only the fixed metadata enums; the operation ID is trace-only.
+In trace mode the vLLM client supplies one operation ID per control fanout and
+LMCache preserves it as `session_id` on control, decision, and residency events.
+Prometheus uses only fixed metadata enums; the operation ID is trace-only. Off
+mode creates none of these events.
 
 | EventType | Metadata keys | Types |
 |---|---|---|
 | `HOTPREFIX_CONTROL_START` | `method`, `request_bytes` | `str`, `int` |
 | `HOTPREFIX_CONTROL_END` | `method`, `outcome`, `request_bytes`, `response_bytes`, `duration_ns`, `lock_wait_ns`, `handler_body_ns` | `str`, `str`, `int`, `int`, `int`, `int`, `int` |
-| `HOTPREFIX_DECISION` | `kind`, `action`, `reason`, `tokens`, `bytes` | `str`, `str`, `str`, `int`, `int` |
+| `HOTPREFIX_DECISION` | `kind`, `action`, `reason`, `tokens`, `bytes`, optional `global_epoch`, `global_frequency`, `global_clock` | `str`, `str`, `str`, `int`, `int`, optional `int` |
 | `HOTPREFIX_RESIDENCY_CHANGED` | `old_state`, `new_state`, `bytes`, `shared_keys` | `str`, `str`, `int`, `int` |
 
 `purpose` on MP transfer events is one of `foreground_fetch`,

@@ -46,6 +46,8 @@ def _scheduler_adapter() -> LMCacheMPSchedulerAdapter:
     adapter.mq_clients = {url: MagicMock(name=url) for url in adapter._server_urls}
     adapter._hotprefix_control_lock = threading.Lock()
     adapter._hotprefix_control_observations = []
+    adapter._hotprefix_observability_enabled = True
+    adapter._hotprefix_trace_enabled = False
     adapter.lmcache_tokens_per_chunk = 16
     adapter.model_name = "model"
     adapter.parallel_strategy = MagicMock(
@@ -208,6 +210,47 @@ def test_candidates_are_intersected_by_generation_and_size(
     assert observations[0]["outcome"] == "success"
     assert float(observations[0]["duration_seconds"]) >= 0
     assert adapter.drain_hotprefix_control_stats() == {"control_observations": []}
+
+
+def test_control_observability_off_skips_clock_and_list_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _scheduler_adapter()
+    adapter._hotprefix_observability_enabled = False
+    candidate = HotPrefixHostCandidate(b"shared", 4096, 7, 3, 4)
+
+    def send(_client: Any, request_type: RequestType, _payloads: list[Any]):
+        assert request_type is RequestType.HOT_PREFIX_CANDIDATES
+        return _Future([candidate])
+
+    def fail_timing() -> int:
+        raise AssertionError("off mode must not read the control observation clock")
+
+    monkeypatch.setattr(adapter_module, "send_lmcache_request", send)
+    monkeypatch.setattr(adapter_module.time, "monotonic_ns", fail_timing)
+
+    assert adapter.hotprefix_candidates(b"namespace", [b"shared"]) == [candidate]
+    assert adapter.drain_hotprefix_control_stats() == {"control_observations": []}
+
+
+def test_trace_mode_sends_client_operation_id_with_control_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _scheduler_adapter()
+    adapter._hotprefix_trace_enabled = True
+    candidate = HotPrefixHostCandidate(b"shared", 4096, 7, 3, 4)
+    operation_ids: list[str] = []
+
+    def send(_client: Any, request_type: RequestType, payloads: list[Any]):
+        assert request_type is RequestType.HOT_PREFIX_CANDIDATES
+        operation_ids.append(payloads[-1])
+        return _Future([candidate])
+
+    monkeypatch.setattr(adapter_module, "send_lmcache_request", send)
+
+    assert adapter.hotprefix_candidates(b"namespace", [b"shared"]) == [candidate]
+    assert len(set(operation_ids)) == 1
+    assert operation_ids[0].startswith("hotprefix-candidates-")
 
 
 def test_partial_acquire_releases_ticket_on_every_contacted_server(

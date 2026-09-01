@@ -97,6 +97,8 @@ class ExtraConfigDefault(enum.Enum):
     isolated_ipc = _ExtraConfigDefaultValue(False)
     # Enable one fleet-wide HotPrefix access observation per initial lookup.
     hotprefix_enabled = _ExtraConfigDefaultValue(False)
+    # HotPrefix-only control observation mode, independent of general stats.
+    hotprefix_observability_mode = _ExtraConfigDefaultValue("off")
     # Stable scheduler identity. Negative values request a generated identity.
     hotprefix_instance_id = _ExtraConfigDefaultValue(-1)
     # Maximum Host-to-HBM promotion bytes submitted by one scheduler step.
@@ -682,6 +684,20 @@ class LMCacheMPSchedulerAdapter:
         self._per_server_hits: dict[str, dict[str, int]] = {}
         self._lookup_params: dict[str, tuple[list[int], str]] = {}
         self._hotprefix_enabled = bool(cfg[ExtraConfigDefault.hotprefix_enabled.name])
+        hotprefix_observability_mode = str(
+            cfg[ExtraConfigDefault.hotprefix_observability_mode.name]
+        )
+        if hotprefix_observability_mode not in {"off", "aggregate", "trace"}:
+            raise ValueError("invalid HotPrefix observability mode")
+        self._hotprefix_observability_enabled = hotprefix_observability_mode != "off"
+        self._hotprefix_trace_enabled = hotprefix_observability_mode == "trace"
+        if self._hotprefix_trace_enabled:
+            # Third Party
+            from opentelemetry import trace
+
+            self._hotprefix_tracer = trace.get_tracer("vllm.lmcache.hotprefix")
+        else:
+            self._hotprefix_tracer = None
         self._hotprefix_promotion_budget_bytes = int(
             cfg[ExtraConfigDefault.hotprefix_promotion_budget_bytes.name]
         )
@@ -915,9 +931,14 @@ class LMCacheMPSchedulerAdapter:
         self._hotprefix_event_seq += 1
         event_seq = self._hotprefix_event_seq
         namespace = self._hotprefix_namespace_prefix + cache_salt.encode()
-        started_ns = time.monotonic_ns()
-        request_bytes = len(self._server_urls) * (
-            24 + len(namespace) + 8 * len(cacheable_token_ids)
+        observe_control = self._hotprefix_observability_enabled
+        operation_id = self._new_hotprefix_operation_id("access")
+        started_ns = time.monotonic_ns() if observe_control else 0
+        request_bytes = (
+            len(self._server_urls)
+            * (24 + len(namespace) + 8 * len(cacheable_token_ids))
+            if observe_control
+            else 0
         )
         futures: dict[str, MessagingFuture[Any]] = {
             url: send_lmcache_request(
@@ -929,6 +950,7 @@ class LMCacheMPSchedulerAdapter:
                     namespace,
                     cacheable_token_ids,
                     cacheable_matched_tokens,
+                    operation_id,
                 ],
             )
             for url in self._server_urls
@@ -960,9 +982,13 @@ class LMCacheMPSchedulerAdapter:
             responses[url] = response
         self._hotprefix_request_sequences[request_id] = event_seq
         self._hotprefix_results[request_id] = responses
-        response_bytes = sum(
-            16 + sum(len(prefix_id) for prefix_id in response.path)
-            for response in responses.values()
+        response_bytes = (
+            sum(
+                16 + sum(len(prefix_id) for prefix_id in response.path)
+                for response in responses.values()
+            )
+            if observe_control
+            else 0
         )
         self._record_hotprefix_control(
             "access", "success", started_ns, request_bytes, response_bytes
@@ -1271,8 +1297,14 @@ class LMCacheMPSchedulerAdapter:
         """
         if not self._hotprefix_enabled or not self.is_healthy:
             return None
-        started_ns = time.monotonic_ns()
-        request_bytes = len(self._server_urls) * (len(namespace) + len(prefix_id) + 16)
+        observe_control = self._hotprefix_observability_enabled
+        operation_id = self._new_hotprefix_operation_id("admit")
+        started_ns = time.monotonic_ns() if observe_control else 0
+        request_bytes = (
+            len(self._server_urls) * (len(namespace) + len(prefix_id) + 16)
+            if observe_control
+            else 0
+        )
         proposed_generation = uuid.uuid4().int & ((1 << 63) - 1)
         responses: list[HotPrefixAdmissionResponse] = []
         accepted_urls: list[str] = []
@@ -1280,7 +1312,13 @@ class LMCacheMPSchedulerAdapter:
             future = send_lmcache_request(
                 self.mq_clients[url],
                 RequestType.HOT_PREFIX_ADMIT,
-                [namespace, prefix_id, size_bytes, proposed_generation],
+                [
+                    namespace,
+                    prefix_id,
+                    size_bytes,
+                    proposed_generation,
+                    operation_id,
+                ],
             )
             try:
                 response = future.result(timeout=self._mq_timeout)
@@ -1317,12 +1355,16 @@ class LMCacheMPSchedulerAdapter:
                 "admit", "failure", started_ns, request_bytes
             )
             raise RuntimeError("HotPrefix admission disagreed across LMCache servers")
-        response_bytes = sum(
-            16
-            + len(response.action)
-            + len(response.reason)
-            + sum(len(item) for item in response.evict_prefixes)
-            for response in responses
+        response_bytes = (
+            sum(
+                16
+                + len(response.action)
+                + len(response.reason)
+                + sum(len(item) for item in response.evict_prefixes)
+                for response in responses
+            )
+            if observe_control
+            else 0
         )
         self._record_hotprefix_control(
             "admit", "success", started_ns, request_bytes, response_bytes
@@ -1335,11 +1377,12 @@ class LMCacheMPSchedulerAdapter:
         prefix_id: bytes,
         accepted_urls: list[str],
     ) -> None:
+        operation_id = self._new_hotprefix_operation_id("abort")
         for url in accepted_urls:
             future = send_lmcache_request(
                 self.mq_clients[url],
                 RequestType.HOT_PREFIX_ABORT,
-                [namespace, prefix_id],
+                [namespace, prefix_id, operation_id],
             )
             try:
                 future.result(timeout=self._mq_timeout)
@@ -1367,9 +1410,14 @@ class LMCacheMPSchedulerAdapter:
         """
         if not self._hotprefix_enabled or not self.is_healthy or not prefix_ids:
             return []
-        started_ns = time.monotonic_ns()
-        request_bytes = len(self._server_urls) * (
-            len(namespace) + sum(len(prefix_id) for prefix_id in prefix_ids)
+        observe_control = self._hotprefix_observability_enabled
+        operation_id = self._new_hotprefix_operation_id("candidates")
+        started_ns = time.monotonic_ns() if observe_control else 0
+        request_bytes = (
+            len(self._server_urls)
+            * (len(namespace) + sum(len(prefix_id) for prefix_id in prefix_ids))
+            if observe_control
+            else 0
         )
 
         responses: list[list[HotPrefixHostCandidate]] = []
@@ -1377,7 +1425,7 @@ class LMCacheMPSchedulerAdapter:
             future = send_lmcache_request(
                 self.mq_clients[url],
                 RequestType.HOT_PREFIX_CANDIDATES,
-                [namespace, prefix_ids],
+                [namespace, prefix_ids, operation_id],
             )
             try:
                 response = future.result(timeout=self._mq_timeout)
@@ -1419,8 +1467,10 @@ class LMCacheMPSchedulerAdapter:
             common.values(),
             key=lambda item: requested_order.get(item.prefix_id, len(prefix_ids)),
         )
-        response_bytes = sum(
-            len(item.prefix_id) + 32 for response in responses for item in response
+        response_bytes = (
+            sum(len(item.prefix_id) + 32 for response in responses for item in response)
+            if observe_control
+            else 0
         )
         self._record_hotprefix_control(
             "candidates", "success", started_ns, request_bytes, response_bytes
@@ -1443,9 +1493,13 @@ class LMCacheMPSchedulerAdapter:
         """
         if not self._hotprefix_enabled or not self.is_healthy:
             return None
-        started_ns = time.monotonic_ns()
-        request_bytes = len(self._server_urls) * (
-            len(namespace) + len(candidate.prefix_id) + 24
+        observe_control = self._hotprefix_observability_enabled
+        operation_id = self._new_hotprefix_operation_id("acquire")
+        started_ns = time.monotonic_ns() if observe_control else 0
+        request_bytes = (
+            len(self._server_urls) * (len(namespace) + len(candidate.prefix_id) + 24)
+            if observe_control
+            else 0
         )
         ticket_id = uuid.uuid4().bytes
         acquired_urls: list[str] = []
@@ -1459,6 +1513,7 @@ class LMCacheMPSchedulerAdapter:
                     candidate.prefix_id,
                     candidate.generation,
                     ticket_id,
+                    operation_id,
                 ],
             )
             try:
@@ -1491,8 +1546,10 @@ class LMCacheMPSchedulerAdapter:
                 "acquire", "failure", started_ns, request_bytes
             )
             return None
-        response_bytes = len(tickets) * (
-            len(first.ticket_id) + len(first.prefix_id) + 16
+        response_bytes = (
+            len(tickets) * (len(first.ticket_id) + len(first.prefix_id) + 16)
+            if observe_control
+            else 0
         )
         self._record_hotprefix_control(
             "acquire", "success", started_ns, request_bytes, response_bytes
@@ -1545,11 +1602,12 @@ class LMCacheMPSchedulerAdapter:
         ticket_id: bytes,
         acquired_urls: list[str],
     ) -> None:
+        operation_id = self._new_hotprefix_operation_id("release")
         for url in acquired_urls:
             future = send_lmcache_request(
                 self.mq_clients[url],
                 RequestType.HOT_PREFIX_RELEASE,
-                [namespace, ticket_id],
+                [namespace, ticket_id, operation_id],
             )
             try:
                 future.result(timeout=self._mq_timeout)
@@ -1620,14 +1678,20 @@ class LMCacheMPSchedulerAdapter:
     ) -> bool:
         if not self._hotprefix_enabled or not self.is_healthy:
             return False
-        started_ns = time.monotonic_ns()
+        observe_control = self._hotprefix_observability_enabled
+        started_ns = time.monotonic_ns() if observe_control else 0
         method = request_type.name.removeprefix("HOT_PREFIX_").lower()
-        payload_bytes = sum(
-            len(item) if isinstance(item, bytes) else 8 for item in payloads
+        operation_id = self._new_hotprefix_operation_id(method)
+        payload_bytes = (
+            sum(len(item) if isinstance(item, bytes) else 8 for item in payloads)
+            if observe_control
+            else 0
         )
         request_bytes = len(self._server_urls) * payload_bytes
         for url in self._server_urls:
-            future = send_lmcache_request(self.mq_clients[url], request_type, payloads)
+            future = send_lmcache_request(
+                self.mq_clients[url], request_type, [*payloads, operation_id]
+            )
             try:
                 response = future.result(timeout=self._mq_timeout)
             except TimeoutError:
@@ -1745,6 +1809,26 @@ class LMCacheMPSchedulerAdapter:
             )
 
     # Helper functions
+    def _new_hotprefix_operation_id(self, method: str) -> str:
+        if not self._hotprefix_trace_enabled:
+            return ""
+        operation_id = f"hotprefix-{method}-{uuid.uuid4().hex}"
+        tracer = getattr(self, "_hotprefix_tracer", None)
+        if tracer is not None:
+            attributes = {
+                "hotprefix.method": method,
+                "hotprefix.operation_id": operation_id,
+                "hotprefix.marker": "client_send",
+            }
+            run_id = os.environ.get("HOTPREFIX_RUN_ID")
+            if run_id:
+                attributes["hotprefix.run_id"] = run_id
+            span = tracer.start_span(
+                f"hotprefix.control.{method}", attributes=attributes
+            )
+            span.end()
+        return operation_id
+
     def _record_hotprefix_control(
         self,
         method: str,
@@ -1753,6 +1837,8 @@ class LMCacheMPSchedulerAdapter:
         request_bytes: int,
         response_bytes: int = 0,
     ) -> None:
+        if not self._hotprefix_observability_enabled:
+            return
         observation: dict[str, int | float | str] = {
             "method": method,
             "outcome": outcome,

@@ -63,6 +63,11 @@ class TestExtraLoggingArgs:
         assert config.traces_otlp_endpoint == "http://127.0.0.1:4317"
         assert config.prometheus_port == 19090
 
+    def test_hotprefix_observability_mode_is_independent(self):
+        config = _parse(["--hotprefix-observability-mode", "aggregate"])
+
+        assert config.hotprefix_observability_mode == "aggregate"
+
 
 class _CaptureHandler(logging.Handler):
     def __init__(self) -> None:

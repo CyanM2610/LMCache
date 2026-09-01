@@ -409,6 +409,10 @@ HotPrefix control handlers use EventBus events for interval counters and
 histograms. Current-state values use pull gauges so an EventBus drop cannot
 permanently skew residency state.
 
+`--hotprefix-observability-mode` is independent of general metrics: `off`
+registers no HotPrefix subscribers, `aggregate` enables this section, and
+`trace` adds HotPrefix spans while retaining the same aggregate metrics.
+
 | OTel metric name | Prometheus name | Type | Attributes |
 |---|---|---|---|
 | `lmcache_mp.hotprefix_handler_duration` | `lmcache_mp_hotprefix_handler_duration_milliseconds` | Histogram | `method`, `outcome`, `phase` (`total`, `lock_wait`, `handler_body`) |
