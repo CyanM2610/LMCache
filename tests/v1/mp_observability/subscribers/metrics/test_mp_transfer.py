@@ -161,6 +161,24 @@ class TestStoreCounters:
         assert counter_value(delta, _SUBMITTED_RETRIEVES, device=_DEVICE) == 0
         assert counter_value(delta, _FINISHED_RETRIEVES, device=_DEVICE) == 0
 
+    def test_hotprefix_store_bytes_are_classified_by_purpose(self, subscriber):
+        before = read_tagged_counters()
+        event = _store_end()
+        event.metadata["purpose"] = "eviction_store"
+        subscriber._on_store_finished(event)
+        delta = counter_delta(before, read_tagged_counters())
+
+        assert (
+            counter_value(
+                delta,
+                "lmcache_mp.hotprefix_transfer_bytes",
+                purpose="eviction_store",
+                direction="store",
+                outcome="success",
+            )
+            == 1024
+        )
+
 
 class TestRetrieveCounters:
     def test_submitted_and_finished_count_one_each(self, subscriber):

@@ -74,6 +74,9 @@ def test_shared_objects_remain_pinned_until_last_generation_is_evicted() -> None
     assert manager.publish_residency(b"first", 1, [shared, first_only])
     assert manager.publish_residency(b"second", 2, [shared, second_only])
     assert store.pin_counts == {shared: 1, first_only: 1, second_only: 1}
+    stats = manager.stats_snapshot()
+    assert stats.generations == 2
+    assert stats.retained_keys == 3
 
     assert manager.evict_generation(b"first", 1)
     assert store.pin_counts[shared] == 1
@@ -84,6 +87,10 @@ def test_shared_objects_remain_pinned_until_last_generation_is_evicted() -> None
     assert store.pin_counts[shared] == 0
     assert shared in store.deleted
     assert second_only in store.deleted
+    stats = manager.stats_snapshot()
+    assert stats.generations == 0
+    assert stats.retained_keys == 0
+    assert stats.discarded_generations == 2
 
 
 def test_physical_deletion_tombstones_every_affected_generation() -> None:

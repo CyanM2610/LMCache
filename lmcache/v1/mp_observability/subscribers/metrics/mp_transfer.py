@@ -80,6 +80,11 @@ class MPTransferCountersSubscriber(EventSubscriber):
                 "stream (regardless of how many chunks were retrieved)."
             ),
         )
+        self._hotprefix_transfer_bytes = meter.create_counter(
+            "lmcache_mp.hotprefix_transfer_bytes",
+            description="HotPrefix-classified GPU transfer bytes.",
+            unit="By",
+        )
 
     # -- EventSubscriber interface -----------------------------------------
 
@@ -98,12 +103,14 @@ class MPTransferCountersSubscriber(EventSubscriber):
 
     def _on_store_finished(self, event: Event) -> None:
         self._finished_stores.add(1, attributes=self._device_attrs(event))
+        self._record_hotprefix_bytes(event, "store", "stored_count")
 
     def _on_retrieve_submitted(self, event: Event) -> None:
         self._submitted_retrieves.add(1, attributes=self._device_attrs(event))
 
     def _on_retrieve_finished(self, event: Event) -> None:
         self._finished_retrieves.add(1, attributes=self._device_attrs(event))
+        self._record_hotprefix_bytes(event, "retrieve", "retrieved_count")
 
     # -- Attributes --------------------------------------------------------
 
@@ -125,3 +132,19 @@ class MPTransferCountersSubscriber(EventSubscriber):
         if device is None:
             return {}
         return {"device": str(device)}
+
+    def _record_hotprefix_bytes(
+        self, event: Event, direction: str, count_key: str
+    ) -> None:
+        purpose = str(event.metadata.get("purpose", "unknown"))
+        if purpose not in {"eviction_store", "promotion", "foreground_fetch"}:
+            return
+        outcome = "success" if int(event.metadata.get(count_key, 0)) > 0 else "failure"
+        self._hotprefix_transfer_bytes.add(
+            int(event.metadata.get("total_bytes", 0)),
+            attributes={
+                "purpose": purpose,
+                "direction": direction,
+                "outcome": outcome,
+            },
+        )

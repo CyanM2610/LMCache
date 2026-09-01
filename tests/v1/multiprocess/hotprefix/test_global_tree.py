@@ -54,7 +54,15 @@ def test_hotprefix_module_exposes_multi_instance_access_handler() -> None:
     assert first.epoch == 1
     assert second.epoch == 2
     assert module.get_handlers()[0].request_type is RequestType.HOT_PREFIX_ACCESS
-    assert module.report_status() == {"hotprefix_trees": 1, "hotprefix_nodes": 3}
+    assert module.report_status() == {
+        "hotprefix_trees": 1,
+        "hotprefix_nodes": 3,
+        "hotprefix_generations": 0,
+        "hotprefix_residency_bytes": 0,
+        "hotprefix_active_leases": 0,
+        "hotprefix_retained_keys": 0,
+        "hotprefix_discarded_generations": 0,
+    }
 
     prefix_id = first.path[-1]
     absent = module.admit(b"model-a", b"not-observed", 100, 17)

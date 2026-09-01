@@ -34,6 +34,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.hotprefix import make_hotprefix_namespace
+from vllm.v1.core.hotprefix_presets import resolve_hotprefix_capabilities
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -44,6 +45,10 @@ import zmq
 # First Party
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.hotprefix_metrics import (
+    HotPrefixKVConnectorStats,
+    HotPrefixPromMetrics,
+)
 from lmcache.integration.vllm.kv_cache_group_edits import (
     apply_kv_cache_group_edits,
     validate_kv_cache_groups,
@@ -346,6 +351,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config: "KVCacheConfig | None" = None,
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
+        experiment_preset = getattr(
+            vllm_config.cache_config, "hotprefix_experiment_preset", None
+        )
+        if not isinstance(experiment_preset, str):
+            experiment_preset = None
+        self._hotprefix_capabilities = resolve_hotprefix_capabilities(
+            vllm_config.cache_config.prefix_cache_eviction_policy,
+            experiment_preset,
+        )
 
         # Fail fast, before the server handshake below.
         validate_mamba_step_alignment(vllm_config)
@@ -923,7 +937,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         Get the KV connector stats collected during the last interval.
         """
-        return None
+        if self.role != KVConnectorRole.SCHEDULER:
+            return None
+        stats = HotPrefixKVConnectorStats(
+            data=self.scheduler_adapter.drain_hotprefix_control_stats()
+        )
+        return None if stats.is_empty() else stats
 
     # ==============================
     # Scheduler-side methods
@@ -961,6 +980,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.role != KVConnectorRole.SCHEDULER
             or not self.scheduler_adapter.hotprefix_enabled
+            or not (
+                self._hotprefix_capabilities.selective_store
+                or self._hotprefix_capabilities.promotion
+            )
         ):
             return
 
@@ -973,32 +996,42 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             ):
                 transaction.failed = True
         if not has_decode_work:
-            if not self._hotprefix_store_transactions:
+            if (
+                self._hotprefix_capabilities.selective_store
+                and not self._hotprefix_store_transactions
+            ):
                 self._plan_hotprefix_eviction_store(kv_cache_manager)
             return
 
         candidates: dict[bytes, list[HotPrefixHostCandidate]] = {}
         promotion_sources: list[tuple[bytes, Any, HotPrefixHostCandidate]] = []
-        for namespace, nodes in kv_cache_manager.get_hotprefix_promotion_nodes():
-            ready = self.scheduler_adapter.hotprefix_candidates(
-                namespace,
-                [node.prefix_id for node in nodes],
-            )
-            if ready:
-                candidates[namespace] = ready
-                nodes_by_id = {node.prefix_id: node for node in nodes}
-                promotion_sources.extend(
-                    (namespace, nodes_by_id[item.prefix_id], item)
-                    for item in ready
-                    if item.prefix_id in nodes_by_id
+        if self._hotprefix_capabilities.promotion:
+            for namespace, nodes in kv_cache_manager.get_hotprefix_promotion_nodes():
+                ready = self.scheduler_adapter.hotprefix_candidates(
+                    namespace,
+                    [node.prefix_id for node in nodes],
                 )
+                if ready:
+                    candidates[namespace] = ready
+                    nodes_by_id = {node.prefix_id: node for node in nodes}
+                    promotion_sources.extend(
+                        (namespace, nodes_by_id[item.prefix_id], item)
+                        for item in ready
+                        if item.prefix_id in nodes_by_id
+                    )
         self._hotprefix_host_candidates = candidates
-        if not self._hotprefix_promotion_transactions:
+        if (
+            self._hotprefix_capabilities.promotion
+            and not self._hotprefix_promotion_transactions
+        ):
             self._plan_hotprefix_promotion(
                 kv_cache_manager,
                 promotion_sources,
             )
-        if not self._hotprefix_store_transactions:
+        if (
+            self._hotprefix_capabilities.selective_store
+            and not self._hotprefix_store_transactions
+        ):
             self._plan_hotprefix_eviction_store(kv_cache_manager)
 
     def _plan_hotprefix_promotion(
@@ -1239,6 +1272,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
 
+        if not self._hotprefix_capabilities.on_demand_fetch:
+            if self._hotprefix_capabilities.global_access:
+                self.scheduler_adapter.submit_hotprefix_access(
+                    request.request_id,
+                    token_ids=tracker.get_token_ids(),
+                    cache_salt=tracker.cache_salt,
+                    local_matched_tokens=num_computed_tokens,
+                )
+            return 0, False
+
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=tracker.get_token_ids(),
@@ -1290,6 +1333,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request (Request): The request object.
         """
         if self.role != KVConnectorRole.SCHEDULER:
+            return
+        if not self._hotprefix_capabilities.on_demand_fetch:
             return
         if not self._eager_prefetch or request.resumable:
             return
@@ -1609,6 +1654,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
+        # Access-only ablations do not pass through the normal lookup-result
+        # cleanup after allocation. This call is idempotent for P5/P6 and
+        # releases their scheduler-side HotPrefix sequence/result state too.
+        self.scheduler_adapter.cleanup_lookup_result(request.request_id)
 
         # have not been offloaded, the touch operation in end_session is incorrect
         # Notify LMCache to end the session for this request
@@ -1671,7 +1720,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         registered connectors to return their own KVConnectorStats object,
         which can implement custom aggregation logic on the data dict.
         """
-        return None
+        return HotPrefixKVConnectorStats(data=data or {})
 
     @classmethod
     def build_prom_metrics(
@@ -1686,7 +1735,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         per-connector Prometheus metrics and implement observe() to
         expose connector transfer stats via Prometheus.
         """
-        return None
+        return HotPrefixPromMetrics(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        )
 
     ##############################
     # Helper functions

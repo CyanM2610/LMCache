@@ -43,6 +43,17 @@ class PhysicalHostResidency:
     valid: bool = True
 
 
+@dataclass(frozen=True)
+class HotPrefixPhysicalStats:
+    """Current physical residency and tombstone counts."""
+
+    generations: int
+    retained_keys: int
+    discarded_generations: int
+    failed_publications: int
+    invalidated_generations: int
+
+
 class HotPrefixPhysicalResidencyManager(L1ManagerListener):
     """Bind HotPrefix generations to L1 objects and own their retention.
 
@@ -335,6 +346,17 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
         """Return physical bindings in deterministic generation order."""
         with self._condition:
             return tuple(self._residencies[key] for key in sorted(self._residencies))
+
+    def stats_snapshot(self) -> HotPrefixPhysicalStats:
+        """Return pull-based physical state without draining tombstones."""
+        with self._condition:
+            return HotPrefixPhysicalStats(
+                generations=len(self._residencies),
+                retained_keys=len(self._generations_by_key),
+                discarded_generations=len(self._discarded),
+                failed_publications=len(self._failed_publications),
+                invalidated_generations=len(self._invalidated),
+            )
 
     def on_l1_keys_reserved_read(self, keys: list[ObjectKey]) -> None:
         """Ignore temporary data-plane read locks."""

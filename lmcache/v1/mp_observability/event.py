@@ -94,6 +94,12 @@ class EventType(Enum):
     # vLLM end session events
     MP_VLLM_END_SESSION = "mp.vllm.end_session"
 
+    # Multi-instance HotPrefix control and residency events.
+    HOTPREFIX_CONTROL_START = "hotprefix.control.start"
+    HOTPREFIX_CONTROL_END = "hotprefix.control.end"
+    HOTPREFIX_DECISION = "hotprefix.decision"
+    HOTPREFIX_RESIDENCY_CHANGED = "hotprefix.residency.changed"
+
     # Published by LMCacheTimeoutError on construction (see errors.py).
     # Metadata: message (str), exception_type (str), stacktrace (str, mapped
     # to the OTel exception.stacktrace span attribute).

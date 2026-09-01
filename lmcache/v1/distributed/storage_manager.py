@@ -33,6 +33,7 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.hotprefix_residency import (
     HotPrefixPhysicalResidencyManager,
+    HotPrefixPhysicalStats,
     PhysicalGeneration,
 )
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
@@ -330,6 +331,10 @@ class StorageManager:
             generation,
             physical_object_keys,
         )
+
+    def hotprefix_physical_stats(self) -> HotPrefixPhysicalStats:
+        """Return current HotPrefix physical ownership and tombstone counts."""
+        return self._hotprefix_residencies.stats_snapshot()
 
     def pin_generation(self, prefix_id: bytes, generation: int) -> bool:
         """Ensure an exact HotPrefix generation remains retention-pinned.

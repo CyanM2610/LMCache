@@ -83,6 +83,12 @@ class HostResidencyDirectory:
         """Return bytes held by reserved and READY residencies."""
         return sum(item.size_bytes for item in self._residencies.values())
 
+    @property
+    def active_lease_count(self) -> int:
+        """Return the number of unexpired generation read leases."""
+        self._purge_expired_leases()
+        return len(self._leases)
+
     def reserve(
         self,
         candidate: HostAdmissionCandidate,

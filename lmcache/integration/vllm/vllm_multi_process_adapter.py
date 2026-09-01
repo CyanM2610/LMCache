@@ -8,6 +8,7 @@ import enum
 import math
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -754,6 +755,8 @@ class LMCacheMPSchedulerAdapter:
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = parallel_strategy.vllm_world_size
         self._store_request_pending_counts: dict[str, int] = {}
+        self._hotprefix_control_lock = threading.Lock()
+        self._hotprefix_control_observations: list[dict[str, int | float | str]] = []
 
     @property
     def world_size(self) -> int:
@@ -769,6 +772,13 @@ class LMCacheMPSchedulerAdapter:
     def hotprefix_promotion_budget_bytes(self) -> int:
         """Return the configured per-step promotion transfer budget."""
         return self._hotprefix_promotion_budget_bytes
+
+    def drain_hotprefix_control_stats(self) -> dict[str, Any]:
+        """Return and reset client-observed HotPrefix control RPC deltas."""
+        with self._hotprefix_control_lock:
+            observations = self._hotprefix_control_observations
+            self._hotprefix_control_observations = []
+        return {"control_observations": observations}
 
     @property
     def tp_size(self) -> int:
@@ -905,6 +915,10 @@ class LMCacheMPSchedulerAdapter:
         self._hotprefix_event_seq += 1
         event_seq = self._hotprefix_event_seq
         namespace = self._hotprefix_namespace_prefix + cache_salt.encode()
+        started_ns = time.monotonic_ns()
+        request_bytes = len(self._server_urls) * (
+            24 + len(namespace) + 8 * len(cacheable_token_ids)
+        )
         futures: dict[str, MessagingFuture[Any]] = {
             url: send_lmcache_request(
                 self.mq_clients[url],
@@ -930,17 +944,58 @@ class LMCacheMPSchedulerAdapter:
                     self._mq_timeout,
                 )
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "access", "timeout", started_ns, request_bytes
+                )
                 return False
             if not isinstance(response, HotPrefixAccessResponse):
                 logger.warning(
                     "HOT_PREFIX_ACCESS from %s returned %s", url, type(response)
                 )
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "access", "failure", started_ns, request_bytes
+                )
                 return False
             responses[url] = response
         self._hotprefix_request_sequences[request_id] = event_seq
         self._hotprefix_results[request_id] = responses
+        response_bytes = sum(
+            16 + sum(len(prefix_id) for prefix_id in response.path)
+            for response in responses.values()
+        )
+        self._record_hotprefix_control(
+            "access", "success", started_ns, request_bytes, response_bytes
+        )
         return True
+
+    def submit_hotprefix_access(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        cache_salt: str = "",
+        local_matched_tokens: int = 0,
+    ) -> bool:
+        """Submit only the Global ACCESS observation for cost ablations.
+
+        Args:
+            request_id: Stable request identifier.
+            token_ids: Complete request tokens.
+            cache_salt: Per-tenant cache namespace.
+            local_matched_tokens: Tokens matched by native APC.
+
+        Returns:
+            Whether every configured server accepted the observation.
+        """
+        self._ensure_heartbeat_started()
+        if not self.is_healthy:
+            return False
+        return self._submit_hotprefix_access(
+            request_id,
+            token_ids,
+            cache_salt,
+            local_matched_tokens,
+        )
 
     def prepare_hotprefix_retrieve(
         self,
@@ -1216,6 +1271,8 @@ class LMCacheMPSchedulerAdapter:
         """
         if not self._hotprefix_enabled or not self.is_healthy:
             return None
+        started_ns = time.monotonic_ns()
+        request_bytes = len(self._server_urls) * (len(namespace) + len(prefix_id) + 16)
         proposed_generation = uuid.uuid4().int & ((1 << 63) - 1)
         responses: list[HotPrefixAdmissionResponse] = []
         accepted_urls: list[str] = []
@@ -1232,22 +1289,44 @@ class LMCacheMPSchedulerAdapter:
                     namespace, prefix_id, [*accepted_urls, url]
                 )
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "admit", "timeout", started_ns, request_bytes
+                )
                 return None
             if not isinstance(response, HotPrefixAdmissionResponse):
                 self._rollback_hotprefix_admission(
                     namespace, prefix_id, [*accepted_urls, url]
                 )
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "admit", "failure", started_ns, request_bytes
+                )
                 return None
             responses.append(response)
             if response.action == "accept":
                 accepted_urls.append(url)
         if not responses:
+            self._record_hotprefix_control(
+                "admit", "failure", started_ns, request_bytes
+            )
             return None
         first = responses[0]
         if any(response != first for response in responses[1:]):
             self._rollback_hotprefix_admission(namespace, prefix_id, accepted_urls)
+            self._record_hotprefix_control(
+                "admit", "failure", started_ns, request_bytes
+            )
             raise RuntimeError("HotPrefix admission disagreed across LMCache servers")
+        response_bytes = sum(
+            16
+            + len(response.action)
+            + len(response.reason)
+            + sum(len(item) for item in response.evict_prefixes)
+            for response in responses
+        )
+        self._record_hotprefix_control(
+            "admit", "success", started_ns, request_bytes, response_bytes
+        )
         return first
 
     def _rollback_hotprefix_admission(
@@ -1288,6 +1367,10 @@ class LMCacheMPSchedulerAdapter:
         """
         if not self._hotprefix_enabled or not self.is_healthy or not prefix_ids:
             return []
+        started_ns = time.monotonic_ns()
+        request_bytes = len(self._server_urls) * (
+            len(namespace) + sum(len(prefix_id) for prefix_id in prefix_ids)
+        )
 
         responses: list[list[HotPrefixHostCandidate]] = []
         for url in self._server_urls:
@@ -1300,15 +1383,24 @@ class LMCacheMPSchedulerAdapter:
                 response = future.result(timeout=self._mq_timeout)
             except TimeoutError:
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "candidates", "timeout", started_ns, request_bytes
+                )
                 return []
             if not isinstance(response, list) or any(
                 not isinstance(item, HotPrefixHostCandidate) for item in response
             ):
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "candidates", "failure", started_ns, request_bytes
+                )
                 return []
             responses.append(response)
 
         if not responses:
+            self._record_hotprefix_control(
+                "candidates", "failure", started_ns, request_bytes
+            )
             return []
         common = {
             (item.prefix_id, item.generation, item.size_bytes): item
@@ -1323,10 +1415,17 @@ class LMCacheMPSchedulerAdapter:
         requested_order = {
             prefix_id: index for index, prefix_id in enumerate(prefix_ids)
         }
-        return sorted(
+        result = sorted(
             common.values(),
             key=lambda item: requested_order.get(item.prefix_id, len(prefix_ids)),
         )
+        response_bytes = sum(
+            len(item.prefix_id) + 32 for response in responses for item in response
+        )
+        self._record_hotprefix_control(
+            "candidates", "success", started_ns, request_bytes, response_bytes
+        )
+        return result
 
     def hotprefix_acquire(
         self,
@@ -1344,6 +1443,10 @@ class LMCacheMPSchedulerAdapter:
         """
         if not self._hotprefix_enabled or not self.is_healthy:
             return None
+        started_ns = time.monotonic_ns()
+        request_bytes = len(self._server_urls) * (
+            len(namespace) + len(candidate.prefix_id) + 24
+        )
         ticket_id = uuid.uuid4().bytes
         acquired_urls: list[str] = []
         tickets: list[HotPrefixTransferTicket] = []
@@ -1365,12 +1468,18 @@ class LMCacheMPSchedulerAdapter:
                     namespace, ticket_id, [*acquired_urls, url]
                 )
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "acquire", "failure", started_ns, request_bytes
+                )
                 return None
             if not isinstance(response, HotPrefixTransferTicket):
                 self._rollback_hotprefix_acquire(
                     namespace, ticket_id, [*acquired_urls, url]
                 )
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    "acquire", "failure", started_ns, request_bytes
+                )
                 return None
             acquired_urls.append(url)
             tickets.append(response)
@@ -1378,7 +1487,16 @@ class LMCacheMPSchedulerAdapter:
         first = tickets[0] if tickets else None
         if first is None or any(ticket != first for ticket in tickets[1:]):
             self._rollback_hotprefix_acquire(namespace, ticket_id, acquired_urls)
+            self._record_hotprefix_control(
+                "acquire", "failure", started_ns, request_bytes
+            )
             return None
+        response_bytes = len(tickets) * (
+            len(first.ticket_id) + len(first.prefix_id) + 16
+        )
+        self._record_hotprefix_control(
+            "acquire", "success", started_ns, request_bytes, response_bytes
+        )
         return first
 
     def hotprefix_release(
@@ -1502,16 +1620,35 @@ class LMCacheMPSchedulerAdapter:
     ) -> bool:
         if not self._hotprefix_enabled or not self.is_healthy:
             return False
+        started_ns = time.monotonic_ns()
+        method = request_type.name.removeprefix("HOT_PREFIX_").lower()
+        payload_bytes = sum(
+            len(item) if isinstance(item, bytes) else 8 for item in payloads
+        )
+        request_bytes = len(self._server_urls) * payload_bytes
         for url in self._server_urls:
             future = send_lmcache_request(self.mq_clients[url], request_type, payloads)
             try:
                 response = future.result(timeout=self._mq_timeout)
             except TimeoutError:
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    method, "timeout", started_ns, request_bytes
+                )
                 return False
             if response is not True:
                 self._health_events[url].clear()
+                self._record_hotprefix_control(
+                    method, "failure", started_ns, request_bytes
+                )
                 return False
+        self._record_hotprefix_control(
+            method,
+            "success",
+            started_ns,
+            request_bytes,
+            len(self._server_urls),
+        )
         return True
 
     def shutdown(self) -> None:
@@ -1608,6 +1745,24 @@ class LMCacheMPSchedulerAdapter:
             )
 
     # Helper functions
+    def _record_hotprefix_control(
+        self,
+        method: str,
+        outcome: str,
+        started_ns: int,
+        request_bytes: int,
+        response_bytes: int = 0,
+    ) -> None:
+        observation: dict[str, int | float | str] = {
+            "method": method,
+            "outcome": outcome,
+            "duration_seconds": (time.monotonic_ns() - started_ns) / 1e9,
+            "request_bytes": request_bytes,
+            "response_bytes": response_bytes,
+        }
+        with self._hotprefix_control_lock:
+            self._hotprefix_control_observations.append(observation)
+
     def _create_key(
         self,
         token_ids: list[int],

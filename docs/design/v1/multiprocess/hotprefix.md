@@ -90,3 +90,18 @@ the candidate payload and restores the victims. A failed or late stream
 completion cannot republish an aborted generation. Finally, every L1 deletion
 callback is reverse-mapped from `ObjectKey` to affected generations so a forced
 physical loss tombstones the logical residency before it can be acquired again.
+
+## Observability
+
+Every Global control handler emits a paired `HOTPREFIX_CONTROL_START/END`
+EventBus operation with total, lock-wait, and handler-body duration. Admission
+and residency transitions emit bounded decision/state events. Existing
+stream-timed MP STORE/RETRIEVE events carry a fixed `purpose` classification
+(`eviction_store`, `promotion`, or `foreground_fetch`) so GPU copy time is not
+measured twice with a CPU clock.
+
+Prometheus aggregation excludes request, prefix, generation, and ticket IDs.
+Those fields are available only in sampled traces, correlated by
+`HOTPREFIX_RUN_ID` and a per-operation ID. Logical residency bytes/generations,
+active leases, physical retained keys, and physical tombstone/publication counts
+are pull gauges; they cannot drift permanently if the EventBus drops an event.
