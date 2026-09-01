@@ -30,6 +30,8 @@ class HotPrefixTracingSubscriber(EventSubscriber):
         return {
             EventType.HOTPREFIX_CONTROL_START: self._on_start,
             EventType.HOTPREFIX_CONTROL_END: self._on_end,
+            EventType.HOTPREFIX_DECISION: self._on_decision,
+            EventType.HOTPREFIX_RESIDENCY_CHANGED: self._on_residency_changed,
         }
 
     def shutdown(self) -> None:
@@ -65,4 +67,25 @@ class HotPrefixTracingSubscriber(EventSubscriber):
             "handler_body_ns",
         ):
             span.set_attribute(f"hotprefix.{key}", event.metadata.get(key, 0))
+        span.end(end_time=int(event.timestamp * 1e9))
+
+    def _on_decision(self, event: Event) -> None:
+        self._record_instant_span(event, "decision")
+
+    def _on_residency_changed(self, event: Event) -> None:
+        self._record_instant_span(event, "residency_changed")
+
+    def _record_instant_span(self, event: Event, kind: str) -> None:
+        if not _HAS_OTEL:
+            return
+        span = _tracer.start_span(
+            f"hotprefix.{kind}",
+            start_time=int(event.timestamp * 1e9),
+        )
+        span.set_attribute("hotprefix.operation_id", event.session_id)
+        if self._run_id:
+            span.set_attribute("hotprefix.run_id", self._run_id)
+        for key, value in event.metadata.items():
+            if isinstance(value, (str, bool, int, float)):
+                span.set_attribute(f"hotprefix.{key}", value)
         span.end(end_time=int(event.timestamp * 1e9))

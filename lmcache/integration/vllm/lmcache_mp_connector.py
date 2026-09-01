@@ -360,6 +360,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config.cache_config.prefix_cache_eviction_policy,
             experiment_preset,
         )
+        connector_extra_config = dict(
+            vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        )
+        connector_extra_config.setdefault(
+            "lmcache.mp.hotprefix_observability_mode",
+            getattr(
+                vllm_config.cache_config,
+                "hotprefix_observability_mode",
+                "off",
+            ),
+        )
+        self._connector_extra_config = connector_extra_config
 
         # Fail fast, before the server handshake below.
         validate_mamba_step_alignment(vllm_config)
@@ -474,7 +486,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 model_name=vllm_config.model_config.model,
                 vllm_block_size=vllm_config.cache_config.block_size * dcp_size,
                 parallel_strategy=parallel_strategy,
-                extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                extra_config=self._connector_extra_config,
                 hotprefix_namespace_prefix=hotprefix_namespace,
             )
             if (
@@ -520,7 +532,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # Initialize pending store for lazy offload mode
             if self.lazy_offload:
                 self._pending_store = LazyOffloadPendingStore(
-                    vllm_config.kv_transfer_config.kv_connector_extra_config
+                    self._connector_extra_config
                 )
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
@@ -537,7 +549,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 model_name=vllm_config.model_config.model,
                 vllm_block_size=vllm_config.cache_config.block_size * dcp_size,
                 parallel_strategy=parallel_strategy,
-                extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                extra_config=self._connector_extra_config,
             )
             if self.transfer_intermediate_tensors:
                 # First Party
@@ -1045,6 +1057,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 token_ids=node.full_prefix,
                 total_bytes=source.size_bytes,
                 min_free_blocks=max(1, kv_cache_manager.watermark_blocks),
+                residency_epoch=source.generation,
+                local_frequency=node.record.frequency,
+                local_clock=node.record.clock,
             )
             if transaction is None:
                 continue

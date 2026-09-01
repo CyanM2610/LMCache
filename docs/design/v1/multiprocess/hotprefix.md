@@ -13,7 +13,8 @@ lmcache_server \
   --hotprefix-host-capacity-bytes 1073741824 \
   --hotprefix-frequency-threshold 10 \
   --hotprefix-aging-interval 50 \
-  --hotprefix-lease-ttl-seconds 30
+  --hotprefix-lease-ttl-seconds 30 \
+  --hotprefix-observability-mode aggregate
 ```
 
 Enable canonical mode in the vLLM connector extra config:
@@ -22,12 +23,20 @@ Enable canonical mode in the vLLM connector extra config:
 {
   "lmcache.mp.hotprefix_enabled": true,
   "lmcache.mp.hotprefix_instance_id": 0,
-  "lmcache.mp.hotprefix_promotion_budget_bytes": 67108864
+  "lmcache.mp.hotprefix_promotion_budget_bytes": 67108864,
+  "lmcache.mp.hotprefix_observability_mode": "aggregate"
 }
 ```
 
 Every serving instance needs a stable, non-negative instance ID. When omitted,
 the connector generates one for the scheduler process.
+
+HotPrefix observability is independent of general LMCache metrics. `off`
+short-circuits before control timing and event allocation; `aggregate` enables
+bounded metrics and pull gauges; `trace` adds sampled spans and requires the
+normal tracing endpoint options. Trace-mode vLLM clients attach one operation ID
+to every control fanout, and LMCache preserves it as the control span
+`session_id` for offline joins.
 
 The first faithful baseline requires LMCache `chunk_size` to equal the vLLM
 scheduler block size. The connector fails at startup on a coarser chunk instead

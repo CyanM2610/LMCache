@@ -47,6 +47,9 @@ class ObservabilityConfig:
     tracing_enabled: bool = False
     """Register span subscribers (OTel traces)."""
 
+    hotprefix_observability_mode: str = "off"
+    """HotPrefix-only mode: off, aggregate metrics, or aggregate plus trace."""
+
     otlp_endpoint: str | None = None
     """OTLP gRPC endpoint (e.g. ``http://localhost:4317``).  When set,
     metrics and traces are pushed to an OTel collector.  When ``None``,
@@ -162,6 +165,12 @@ def add_observability_args(
             "Trace-only OTLP gRPC endpoint. Metrics continue using "
             "--otlp-endpoint or the Prometheus fallback."
         ),
+    )
+    group.add_argument(
+        "--hotprefix-observability-mode",
+        choices=("off", "aggregate", "trace"),
+        default="off",
+        help="HotPrefix-only observation mode. Default is off.",
     )
     group.add_argument(
         "--event-bus-queue-size",
@@ -317,6 +326,7 @@ def parse_args_to_observability_config(
         metrics_enabled=not args.disable_metrics,
         logging_enabled=not args.disable_logging,
         tracing_enabled=args.enable_tracing,
+        hotprefix_observability_mode=args.hotprefix_observability_mode,
         otlp_endpoint=args.otlp_endpoint,
         traces_otlp_endpoint=args.traces_otlp_endpoint,
         prometheus_port=args.prometheus_port,
@@ -348,6 +358,13 @@ def parse_args_to_observability_config(
             "--traces-otlp-endpoint to be set. "
             "Tracing needs an OTLP gRPC endpoint to export spans."
         )
+
+    if config.hotprefix_observability_mode != "off" and not config.enabled:
+        raise ValueError("HotPrefix observability requires the observability EventBus")
+    if config.hotprefix_observability_mode != "off" and not config.metrics_enabled:
+        raise ValueError("HotPrefix observability requires metrics")
+    if config.hotprefix_observability_mode == "trace" and not config.tracing_enabled:
+        raise ValueError("HotPrefix trace mode requires --enable-tracing")
 
     if config.extra_logging_enabled and not config.enabled:
         raise ValueError(
@@ -457,7 +474,8 @@ def init_observability(
         bus.register_subscriber(BlendMetricsSubscriber())
         bus.register_subscriber(EngineMetricsSubscriber())
         bus.register_subscriber(EventBusSelfMetricsSubscriber(bus))
-        bus.register_subscriber(HotPrefixMetricsSubscriber())
+        if obs_config.hotprefix_observability_mode != "off":
+            bus.register_subscriber(HotPrefixMetricsSubscriber())
         bus.register_subscriber(TimeoutMetricsSubscriber())
 
     if obs_config.logging_enabled:
@@ -492,7 +510,8 @@ def init_observability(
         bus.register_subscriber(MPServerTracingSubscriber(registry))
         bus.register_subscriber(BlendTracingSubscriber(registry))
         bus.register_subscriber(TimeoutTracingSubscriber(registry))
-        bus.register_subscriber(HotPrefixTracingSubscriber())
+        if obs_config.hotprefix_observability_mode == "trace":
+            bus.register_subscriber(HotPrefixTracingSubscriber())
 
     # Lookup hash file logging (independent of the logging_enabled flag —
     # it has its own enable gate via output_dir).
