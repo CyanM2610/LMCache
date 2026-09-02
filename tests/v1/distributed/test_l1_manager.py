@@ -2010,3 +2010,21 @@ class TestRetentionPins:
         assert manager.finish_read([key])[key] is L1Error.SUCCESS
         assert manager.get_object_state(key) is None
         manager.close()
+
+    def test_retention_pin_cancels_pending_delete_for_readable_object(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(9003)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        manager.reserve_read([key])
+        assert manager.request_delete([key])[key] is L1Error.KEY_IS_LOCKED
+
+        assert manager.pin_retention([key])[key] is L1Error.SUCCESS
+        assert manager.finish_read([key])[key] is L1Error.SUCCESS
+        assert manager.get_object_state(key) is not None
+
+        assert manager.unpin_retention([key])[key] is L1Error.SUCCESS
+        assert manager.is_key_evictable(key)
+        manager.close()

@@ -747,8 +747,10 @@ class L1Manager:
             keys: Complete object-key set for one physical residency.
 
         Returns:
-            Per-key results. No pin is acquired when any key is absent,
-            write-locked, temporary, or already pending deletion.
+        Per-key results. No pin is acquired when any key is absent,
+        write-locked, or temporary. A readable object pending deletion is
+        rescued atomically because the new retention owner supersedes the
+        earlier policy eviction request.
         """
         keys = list(dict.fromkeys(keys))
         results: dict[ObjectKey, L1Error] = {}
@@ -758,11 +760,7 @@ class L1Manager:
             if entry is None:
                 results[key] = L1Error.KEY_NOT_EXIST
                 can_pin = False
-            elif (
-                entry.write_lock.is_locked()
-                or entry.is_temporary
-                or entry.delete_pending
-            ):
+            elif entry.write_lock.is_locked() or entry.is_temporary:
                 results[key] = L1Error.KEY_NOT_READABLE
                 can_pin = False
             else:
@@ -770,6 +768,7 @@ class L1Manager:
         if not can_pin:
             return results
         for key in keys:
+            self._objects[key].delete_pending = False
             self._objects[key].retention_pins += 1
         return results
 
