@@ -307,7 +307,7 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                 residency = self._residencies.pop(residency_id, None)
                 if residency is None:
                     self._condition.notify_all()
-                    return False
+                    return pending is not None
                 keys_to_unpin = (
                     self._keys_without_other_pins(residency.object_keys, residency_id)
                     if residency.pinned
@@ -321,7 +321,9 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                     generations.discard(residency_id)
                     if not generations:
                         del self._generations_by_key[key]
-                        keys_to_delete.append(key)
+                        pending_generations = self._publishing_by_key.get(key, ())
+                        if not pending_generations:
+                            keys_to_delete.append(key)
                 self._condition.notify_all()
             if keys_to_unpin:
                 self._object_store.unpin_retention(keys_to_unpin)

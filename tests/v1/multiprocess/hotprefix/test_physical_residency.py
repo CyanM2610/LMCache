@@ -15,12 +15,21 @@ class _ObjectStore:
     def __init__(self, keys: list[ObjectKey]) -> None:
         self.keys = set(keys)
         self.pin_counts = {key: 0 for key in keys}
+        self.unreadable: set[ObjectKey] = set()
         self.deleted: list[ObjectKey] = []
         self.on_pin: Callable[[list[ObjectKey]], None] | None = None
 
     def pin_retention(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
         results = {
-            key: L1Error.SUCCESS if key in self.keys else L1Error.KEY_NOT_EXIST
+            key: (
+                L1Error.KEY_NOT_EXIST
+                if key not in self.keys
+                else (
+                    L1Error.KEY_NOT_READABLE
+                    if key in self.unreadable
+                    else L1Error.SUCCESS
+                )
+            )
             for key in keys
         }
         if any(error is not L1Error.SUCCESS for error in results.values()):
@@ -138,6 +147,24 @@ def test_staged_binding_retries_after_overlapping_writer_finishes() -> None:
 
     assert manager.wait_for_residency(b"prefix", 12, 0.1)
     assert manager.snapshot()[0].object_keys == (ready, still_writing)
+
+
+def test_old_generation_eviction_preserves_keys_for_staged_generation() -> None:
+    shared = _key(1)
+    old_only = _key(2)
+    new_only = _key(3)
+    store = _ObjectStore([shared, old_only, new_only])
+    manager = HotPrefixPhysicalResidencyManager(store)
+    assert manager.publish_residency(b"old", 1, [shared, old_only])
+    store.unreadable.add(new_only)
+    assert manager.stage_residency_publication(b"new", 2, [shared, new_only])
+
+    assert manager.evict_generation(b"old", 1)
+
+    assert shared not in store.deleted
+    assert old_only in store.deleted
+    store.unreadable.clear()
+    assert manager.wait_for_residency(b"new", 2, 0.1)
 
 
 def test_eviction_rejects_a_late_stream_completion() -> None:
