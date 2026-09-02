@@ -12,9 +12,12 @@ import threading
 import time
 
 # First Party
+from lmcache.utils import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener
+
+logger = init_logger(__name__)
 
 PhysicalGeneration = tuple[bytes, int]
 
@@ -71,6 +74,7 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
         self._generations_by_key: dict[ObjectKey, set[PhysicalGeneration]] = {}
         self._publishing_by_key: dict[ObjectKey, set[PhysicalGeneration]] = {}
         self._pending_publications: dict[PhysicalGeneration, tuple[ObjectKey, ...]] = {}
+        self._pending_pin_errors: dict[PhysicalGeneration, dict[str, int]] = {}
         self._invalidated: set[PhysicalGeneration] = set()
         self._failed_publications: set[PhysicalGeneration] = set()
         self._discarded: set[PhysicalGeneration] = set()
@@ -296,6 +300,7 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                 self._discarded.add(residency_id)
                 self._failed_publications.discard(residency_id)
                 self._invalidated.discard(residency_id)
+                self._pending_pin_errors.pop(residency_id, None)
                 pending = self._pending_publications.pop(residency_id, None)
                 if pending is not None:
                     self._remove_publishing(pending, residency_id)
@@ -383,10 +388,18 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                     or residency_id in self._invalidated
                 ):
                     return False
+                pending = residency_id in self._pending_publications
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    if pending:
+                        logger.warning(
+                            "Timed out publishing HotPrefix physical generation "
+                            "prefix=%s generation=%d pin_errors=%s",
+                            prefix_id.hex(),
+                            generation,
+                            self._pending_pin_errors.get(residency_id, {}),
+                        )
                     return False
-                pending = residency_id in self._pending_publications
             if pending:
                 with self._operation_lock:
                     self._try_publish_pending_locked(residency_id)
@@ -480,8 +493,17 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
             if residency_id in self._discarded or residency_id in self._invalidated:
                 return False
             keys_to_pin = self._keys_needing_pin(object_keys, residency_id)
-        if keys_to_pin and not self._pin_keys(keys_to_pin):
-            return False
+        if keys_to_pin:
+            pin_results = self._object_store.pin_retention(keys_to_pin)
+            pin_errors: dict[str, int] = {}
+            for key in keys_to_pin:
+                error = pin_results.get(key, L1Error.KEY_NOT_EXIST)
+                if error is not L1Error.SUCCESS:
+                    pin_errors[error.name] = pin_errors.get(error.name, 0) + 1
+            if pin_errors:
+                with self._condition:
+                    self._pending_pin_errors[residency_id] = pin_errors
+                return False
 
         rejected = False
         with self._condition:
@@ -497,6 +519,7 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                 for key in object_keys:
                     self._generations_by_key.setdefault(key, set()).add(residency_id)
                 self._pending_publications.pop(residency_id, None)
+                self._pending_pin_errors.pop(residency_id, None)
                 self._remove_publishing(object_keys, residency_id)
                 self._failed_publications.discard(residency_id)
                 self._condition.notify_all()
