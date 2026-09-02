@@ -76,6 +76,11 @@ def test_access_with_hotprefix_observability_off_publishes_no_events(
     monkeypatch.setattr(hotprefix_module, "get_event_bus", lambda: event_bus)
     module = HotPrefixModule(object(), frequency_threshold=1)  # type: ignore[arg-type]
 
+    def fail_timing() -> int:
+        raise AssertionError("off mode must use an untimed handler lock")
+
+    monkeypatch.setattr(hotprefix_module.time, "monotonic_ns", fail_timing)
+
     module.access(1, 1, b"namespace", [1, 2, 3, 4], 0)
 
     event_bus.publish.assert_not_called()
