@@ -9,9 +9,27 @@ from lmcache.v1.multiprocess.hotprefix.global_tree import (
     PrefixAccessObservation,
 )
 from lmcache.v1.multiprocess.modules.hotprefix import HotPrefixModule
+from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.v1.multiprocess.server import add_handler_helper
 
 pytestmark = pytest.mark.no_shared_allocator
+
+
+def test_every_hotprefix_handler_matches_registered_wire_protocol() -> None:
+    module = HotPrefixModule(
+        object(),  # type: ignore[arg-type]
+        aging_interval=100,
+        host_capacity_bytes=100,
+        frequency_threshold=1,
+    )
+    server = MessageQueueServer.__new__(MessageQueueServer)
+    server.handlers = {}
+
+    for spec in module.get_handlers():
+        add_handler_helper(server, spec.request_type, spec.handler)
+
+    assert set(server.handlers) == {spec.request_type for spec in module.get_handlers()}
 
 
 def test_global_tree_merges_instance_streams_and_deduplicates_events() -> None:

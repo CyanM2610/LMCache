@@ -120,47 +120,47 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
     """
     return {
         "HOT_PREFIX_ACCESS": ProtocolDefinition(
-            payload_classes=[int, int, bytes, list[int], int],
+            payload_classes=[int, int, bytes, list[int], int, str],
             response_class=HotPrefixAccessResponse,
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_ADMIT": ProtocolDefinition(
-            payload_classes=[bytes, bytes, int, int],
+            payload_classes=[bytes, bytes, int, int, str],
             response_class=HotPrefixAdmissionResponse,
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_PUBLISH": ProtocolDefinition(
-            payload_classes=[bytes, bytes],
+            payload_classes=[bytes, bytes, str],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_ABORT": ProtocolDefinition(
-            payload_classes=[bytes, bytes],
+            payload_classes=[bytes, bytes, str],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_CANDIDATES": ProtocolDefinition(
-            payload_classes=[bytes, list[bytes]],
+            payload_classes=[bytes, list[bytes], str],
             response_class=list[HotPrefixHostCandidate],
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_ACQUIRE": ProtocolDefinition(
-            payload_classes=[bytes, bytes, int, bytes],
+            payload_classes=[bytes, bytes, int, bytes, str],
             response_class=HotPrefixTransferTicket,
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_RELEASE": ProtocolDefinition(
-            payload_classes=[bytes, bytes],
+            payload_classes=[bytes, bytes, str],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_RENEW": ProtocolDefinition(
-            payload_classes=[bytes, bytes],
+            payload_classes=[bytes, bytes, str],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
         "HOT_PREFIX_INVALIDATE": ProtocolDefinition(
-            payload_classes=[bytes, bytes, int],
+            payload_classes=[bytes, bytes, int, str],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
