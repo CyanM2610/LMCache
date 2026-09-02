@@ -27,6 +27,7 @@ class HotPrefixTracingSubscriber(EventSubscriber):
         self._run_id = os.environ.get("HOTPREFIX_RUN_ID", "")
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
+        """Return control, decision, and residency tracing callbacks."""
         return {
             EventType.HOTPREFIX_CONTROL_START: self._on_start,
             EventType.HOTPREFIX_CONTROL_END: self._on_end,

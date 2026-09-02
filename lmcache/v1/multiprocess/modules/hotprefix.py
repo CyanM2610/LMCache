@@ -76,6 +76,20 @@ class _MeasuredLock:
         return int(getattr(self._local, "wait_ns", 0))
 
 
+class _UntimedLock:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *_args: object) -> None:
+        self._lock.release()
+
+    def last_wait_ns(self) -> int:
+        return 0
+
+
 def _observe_control(
     method: str,
 ) -> Callable[[Callable[..., _ResultT]], Callable[..., _ResultT]]:
@@ -178,9 +192,14 @@ class HotPrefixModule:
         )
         self._trees: dict[bytes, GlobalHostPrefixTree] = {}
         self._directories: dict[bytes, HostResidencyDirectory] = {}
-        self._lock = _MeasuredLock()
         self._control_operation_local = threading.local()
         self._event_bus = get_event_bus()
+        measure_control = self._event_bus.has_subscribers(
+            EventType.HOTPREFIX_CONTROL_START
+        ) or self._event_bus.has_subscribers(EventType.HOTPREFIX_CONTROL_END)
+        self._lock: _MeasuredLock | _UntimedLock = (
+            _MeasuredLock() if measure_control else _UntimedLock()
+        )
         HotPrefixModule._gauge_target = self
         if (
             self._event_bus.has_subscribers(EventType.HOTPREFIX_DECISION)

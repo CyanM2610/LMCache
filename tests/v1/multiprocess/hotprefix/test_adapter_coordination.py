@@ -35,7 +35,9 @@ class _Future:
         return self._value
 
 
-def _scheduler_adapter() -> LMCacheMPSchedulerAdapter:
+def _scheduler_adapter(
+    observability_mode: str = "aggregate",
+) -> LMCacheMPSchedulerAdapter:
     adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
     adapter._hotprefix_enabled = True
     adapter._server_urls = ["server-a", "server-b"]
@@ -46,8 +48,7 @@ def _scheduler_adapter() -> LMCacheMPSchedulerAdapter:
     adapter.mq_clients = {url: MagicMock(name=url) for url in adapter._server_urls}
     adapter._hotprefix_control_lock = threading.Lock()
     adapter._hotprefix_control_observations = []
-    adapter._hotprefix_observability_enabled = True
-    adapter._hotprefix_trace_enabled = False
+    adapter.configure_hotprefix_observability(observability_mode)
     adapter.lmcache_tokens_per_chunk = 16
     adapter.model_name = "model"
     adapter.parallel_strategy = MagicMock(
@@ -91,7 +92,7 @@ def test_hotprefix_retrieve_prepares_exact_range_read_locks(
     client_to_url = {client: url for url, client in adapter.mq_clients.items()}
     calls: list[tuple[str, RequestType]] = []
 
-    def send(client: Any, request_type: RequestType, payloads: list[Any]):
+    def send(client: Any, request_type: RequestType, payloads: list[Any]) -> _Future:
         url = client_to_url[client]
         calls.append((url, request_type))
         if request_type is RequestType.WAIT_PREFETCH_STATUS:
@@ -124,7 +125,7 @@ def test_hotprefix_retrieve_short_hit_releases_partial_locks(
     client_to_url = {client: url for url, client in adapter.mq_clients.items()}
     calls: list[tuple[str, RequestType]] = []
 
-    def send(client: Any, request_type: RequestType, payloads: list[Any]):
+    def send(client: Any, request_type: RequestType, payloads: list[Any]) -> _Future:
         del payloads
         url = client_to_url[client]
         calls.append((url, request_type))
@@ -156,7 +157,7 @@ def test_partial_admission_rolls_back_every_contacted_server(
     client_to_url = {client: url for url, client in adapter.mq_clients.items()}
     calls: list[tuple[str, RequestType]] = []
 
-    def send(client: Any, request_type: RequestType, payloads: list[Any]):
+    def send(client: Any, request_type: RequestType, payloads: list[Any]) -> _Future:
         url = client_to_url[client]
         calls.append((url, request_type))
         if request_type is RequestType.HOT_PREFIX_ADMIT:
@@ -189,7 +190,7 @@ def test_candidates_are_intersected_by_generation_and_size(
     mismatched_a = HotPrefixHostCandidate(b"mismatch", 4096, 8, 2, 3)
     mismatched_b = HotPrefixHostCandidate(b"mismatch", 8192, 8, 2, 3)
 
-    def send(client: Any, request_type: RequestType, payloads: list[Any]):
+    def send(client: Any, request_type: RequestType, payloads: list[Any]) -> _Future:
         del payloads
         assert request_type is RequestType.HOT_PREFIX_CANDIDATES
         values = (
@@ -215,11 +216,10 @@ def test_candidates_are_intersected_by_generation_and_size(
 def test_control_observability_off_skips_clock_and_list_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter = _scheduler_adapter()
-    adapter._hotprefix_observability_enabled = False
+    adapter = _scheduler_adapter("off")
     candidate = HotPrefixHostCandidate(b"shared", 4096, 7, 3, 4)
 
-    def send(_client: Any, request_type: RequestType, _payloads: list[Any]):
+    def send(_client: Any, request_type: RequestType, _payloads: list[Any]) -> _Future:
         assert request_type is RequestType.HOT_PREFIX_CANDIDATES
         return _Future([candidate])
 
@@ -236,12 +236,11 @@ def test_control_observability_off_skips_clock_and_list_allocation(
 def test_trace_mode_sends_client_operation_id_with_control_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter = _scheduler_adapter()
-    adapter._hotprefix_trace_enabled = True
+    adapter = _scheduler_adapter("trace")
     candidate = HotPrefixHostCandidate(b"shared", 4096, 7, 3, 4)
     operation_ids: list[str] = []
 
-    def send(_client: Any, request_type: RequestType, payloads: list[Any]):
+    def send(_client: Any, request_type: RequestType, payloads: list[Any]) -> _Future:
         assert request_type is RequestType.HOT_PREFIX_CANDIDATES
         operation_ids.append(payloads[-1])
         return _Future([candidate])
@@ -261,7 +260,7 @@ def test_partial_acquire_releases_ticket_on_every_contacted_server(
     candidate = HotPrefixHostCandidate(b"prefix", 4096, 7, 3, 4)
     calls: list[tuple[str, RequestType]] = []
 
-    def send(client: Any, request_type: RequestType, payloads: list[Any]):
+    def send(client: Any, request_type: RequestType, payloads: list[Any]) -> _Future:
         url = client_to_url[client]
         calls.append((url, request_type))
         if request_type is RequestType.HOT_PREFIX_ACQUIRE:

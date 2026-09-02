@@ -1032,6 +1032,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                         if item.prefix_id in nodes_by_id
                     )
         self._hotprefix_host_candidates = candidates
+        if self._hotprefix_capabilities.promotion:
+            kv_cache_manager.record_hotprefix_promotion_candidates(
+                len(promotion_sources)
+            )
         if (
             self._hotprefix_capabilities.promotion
             and not self._hotprefix_promotion_transactions

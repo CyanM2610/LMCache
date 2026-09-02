@@ -3,7 +3,7 @@
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, NoReturn, Protocol, cast
 import enum
 import math
 import os
@@ -57,6 +57,8 @@ if TYPE_CHECKING:
     from lmcache.integration.vllm.experimental import Dispatcher
 
 logger = init_logger(__name__)
+
+HotPrefixObservabilityMode = Literal["off", "aggregate", "trace"]
 
 
 @dataclass(frozen=True, eq=False)
@@ -687,17 +689,7 @@ class LMCacheMPSchedulerAdapter:
         hotprefix_observability_mode = str(
             cfg[ExtraConfigDefault.hotprefix_observability_mode.name]
         )
-        if hotprefix_observability_mode not in {"off", "aggregate", "trace"}:
-            raise ValueError("invalid HotPrefix observability mode")
-        self._hotprefix_observability_enabled = hotprefix_observability_mode != "off"
-        self._hotprefix_trace_enabled = hotprefix_observability_mode == "trace"
-        if self._hotprefix_trace_enabled:
-            # Third Party
-            from opentelemetry import trace
-
-            self._hotprefix_tracer = trace.get_tracer("vllm.lmcache.hotprefix")
-        else:
-            self._hotprefix_tracer = None
+        self.configure_hotprefix_observability(hotprefix_observability_mode)
         self._hotprefix_promotion_budget_bytes = int(
             cfg[ExtraConfigDefault.hotprefix_promotion_budget_bytes.name]
         )
@@ -788,6 +780,25 @@ class LMCacheMPSchedulerAdapter:
     def hotprefix_promotion_budget_bytes(self) -> int:
         """Return the configured per-step promotion transfer budget."""
         return self._hotprefix_promotion_budget_bytes
+
+    def configure_hotprefix_observability(self, mode: str) -> None:
+        """Configure HotPrefix control observations before serving requests.
+
+        This public seam also lets fixtures exercise true-off and trace modes
+        without mutating adapter internals.
+        """
+        if mode not in {"off", "aggregate", "trace"}:
+            raise ValueError("invalid HotPrefix observability mode")
+        typed_mode = cast(HotPrefixObservabilityMode, mode)
+        self._hotprefix_observability_enabled = typed_mode != "off"
+        self._hotprefix_trace_enabled = typed_mode == "trace"
+        if self._hotprefix_trace_enabled:
+            # Third Party
+            from opentelemetry import trace
+
+            self._hotprefix_tracer = trace.get_tracer("vllm.lmcache.hotprefix")
+        else:
+            self._hotprefix_tracer = None
 
     def drain_hotprefix_control_stats(self) -> dict[str, Any]:
         """Return and reset client-observed HotPrefix control RPC deltas."""
