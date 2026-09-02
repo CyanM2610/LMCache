@@ -70,6 +70,7 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
         self._residencies: dict[PhysicalGeneration, PhysicalHostResidency] = {}
         self._generations_by_key: dict[ObjectKey, set[PhysicalGeneration]] = {}
         self._publishing_by_key: dict[ObjectKey, set[PhysicalGeneration]] = {}
+        self._pending_publications: dict[PhysicalGeneration, tuple[ObjectKey, ...]] = {}
         self._invalidated: set[PhysicalGeneration] = set()
         self._failed_publications: set[PhysicalGeneration] = set()
         self._discarded: set[PhysicalGeneration] = set()
@@ -159,6 +160,59 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                 return False
             return True
 
+    def stage_residency_publication(
+        self,
+        prefix_id: bytes,
+        generation: int,
+        physical_object_keys: list[ObjectKey],
+    ) -> bool:
+        """Stage a generation that may share keys with an active writer.
+
+        Canonical STOREs for different logical prefixes can overlap on
+        content-addressed chunks.  A stream may therefore complete while one
+        of its deduplicated keys is still write-locked by another stream.  The
+        logical publication waiter retries the atomic retention pin after that
+        writer finishes instead of treating this transient state as data loss.
+
+        Returns:
+            ``True`` when the publication was accepted for immediate or
+            deferred pinning; ``False`` for a tombstoned generation.
+        """
+        if not prefix_id:
+            raise ValueError("prefix_id must not be empty")
+        if generation <= 0:
+            raise ValueError("generation must be positive")
+        object_keys = tuple(dict.fromkeys(physical_object_keys))
+        if not object_keys:
+            raise ValueError("physical_object_keys must not be empty")
+        residency_id = (prefix_id, generation)
+        with self._operation_lock:
+            with self._condition:
+                if residency_id in self._discarded or residency_id in self._invalidated:
+                    return False
+                existing = self._residencies.get(residency_id)
+                if existing is not None:
+                    if existing.object_keys != object_keys:
+                        raise RuntimeError(
+                            "physical generation is already bound to other keys"
+                        )
+                    return existing.valid
+                pending = self._pending_publications.get(residency_id)
+                if pending is not None and pending != object_keys:
+                    raise RuntimeError(
+                        "physical generation publication changed object keys"
+                    )
+                self._pending_publications[residency_id] = object_keys
+                for key in object_keys:
+                    self._publishing_by_key.setdefault(key, set()).add(residency_id)
+                self._condition.notify_all()
+            self._try_publish_pending_locked(residency_id)
+            with self._condition:
+                return (
+                    residency_id not in self._discarded
+                    and residency_id not in self._invalidated
+                )
+
     def pin_generation(self, prefix_id: bytes, generation: int) -> bool:
         """Ensure an intact generation owns retention pins.
 
@@ -242,6 +296,9 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                 self._discarded.add(residency_id)
                 self._failed_publications.discard(residency_id)
                 self._invalidated.discard(residency_id)
+                pending = self._pending_publications.pop(residency_id, None)
+                if pending is not None:
+                    self._remove_publishing(pending, residency_id)
                 residency = self._residencies.pop(residency_id, None)
                 if residency is None:
                     self._condition.notify_all()
@@ -315,8 +372,8 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
             raise ValueError("timeout_seconds must be non-negative")
         residency_id = (prefix_id, generation)
         deadline = time.monotonic() + timeout_seconds
-        with self._condition:
-            while True:
+        while True:
+            with self._condition:
                 residency = self._residencies.get(residency_id)
                 if residency is not None and residency.valid and residency.pinned:
                     return True
@@ -329,7 +386,12 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self._condition.wait(remaining)
+                pending = residency_id in self._pending_publications
+            if pending:
+                with self._operation_lock:
+                    self._try_publish_pending_locked(residency_id)
+            with self._condition:
+                self._condition.wait(min(remaining, 0.01))
 
     def take_invalidated_generations(self) -> tuple[PhysicalGeneration, ...]:
         """Drain generations tombstoned by physical object deletion callbacks.
@@ -368,7 +430,10 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
         """Ignore objects until their immutable payload is complete."""
 
     def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
-        """Ignore generic writes not bound by ``publish_residency``."""
+        """Wake staged generations that may depend on completed shared keys."""
+        if keys:
+            with self._condition:
+                self._condition.notify_all()
 
     def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
         """Ignore temporary prefetch objects."""
@@ -404,6 +469,40 @@ class HotPrefixPhysicalResidencyManager(L1ManagerListener):
     def _pin_keys(self, keys: list[ObjectKey]) -> bool:
         results = self._object_store.pin_retention(keys)
         return all(results.get(key) is L1Error.SUCCESS for key in keys)
+
+    def _try_publish_pending_locked(self, residency_id: PhysicalGeneration) -> bool:
+        """Try one staged publication while ``_operation_lock`` is held."""
+        with self._condition:
+            object_keys = self._pending_publications.get(residency_id)
+            if object_keys is None:
+                residency = self._residencies.get(residency_id)
+                return bool(residency is not None and residency.valid)
+            if residency_id in self._discarded or residency_id in self._invalidated:
+                return False
+            keys_to_pin = self._keys_needing_pin(object_keys, residency_id)
+        if keys_to_pin and not self._pin_keys(keys_to_pin):
+            return False
+
+        rejected = False
+        with self._condition:
+            if residency_id in self._discarded or residency_id in self._invalidated:
+                rejected = True
+            else:
+                prefix_id, generation = residency_id
+                self._residencies[residency_id] = PhysicalHostResidency(
+                    prefix_id,
+                    generation,
+                    object_keys,
+                )
+                for key in object_keys:
+                    self._generations_by_key.setdefault(key, set()).add(residency_id)
+                self._pending_publications.pop(residency_id, None)
+                self._remove_publishing(object_keys, residency_id)
+                self._failed_publications.discard(residency_id)
+                self._condition.notify_all()
+        if rejected and keys_to_pin:
+            self._object_store.unpin_retention(keys_to_pin)
+        return not rejected
 
     def _remove_publishing(
         self,

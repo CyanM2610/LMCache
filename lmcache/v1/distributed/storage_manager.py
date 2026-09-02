@@ -274,15 +274,17 @@ class StorageManager:
                 deduplicated keys that were already present.
 
         Returns:
-            ``True`` only when all writes finish and the complete physical
-            generation is retention-pinned.
+            ``True`` when all owned writes finish and the complete physical
+            generation is accepted for immediate or deferred retention pinning.
+            Deferred pinning covers content-addressed keys still being written
+            by an overlapping canonical STORE.
         """
         finish_result = self._finish_write(written_keys)
         if any(error is not L1Error.SUCCESS for error in finish_result.values()):
             self.mark_residency_publication_failed(prefix_id, generation)
             self._hotprefix_residencies.delete_unbound_objects(written_keys)
             return False
-        published = self.publish_residency(
+        published = self._hotprefix_residencies.stage_residency_publication(
             prefix_id,
             generation,
             physical_object_keys,

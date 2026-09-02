@@ -2,7 +2,7 @@
 
 # Standard
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 import threading
 
@@ -11,7 +11,10 @@ import pytest
 
 # First Party
 from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_module
-from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+from lmcache.integration.vllm.lmcache_mp_connector import (
+    LMCacheMPConnector,
+    _HotPrefixStoreTransaction,
+)
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPSchedulerAdapter,
 )
@@ -295,3 +298,23 @@ def test_request_finished_cleans_access_only_hotprefix_state() -> None:
         "access-only"
     )
     connector.scheduler_adapter.end_session.assert_called_once_with("access-only")
+
+
+def test_store_publication_failure_aborts_without_killing_scheduler() -> None:
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    candidate = cast(Any, SimpleNamespace(namespace=b"namespace", prefix_id=b"prefix"))
+    connector._hotprefix_store_transactions = {
+        "store-1": _HotPrefixStoreTransaction("store-1", candidate, 1, MagicMock())
+    }
+    connector._hotprefix_kv_cache_manager = MagicMock()
+    connector.scheduler_adapter = MagicMock()
+    connector.scheduler_adapter.hotprefix_publish.return_value = False
+
+    connector._finish_hotprefix_store("store-1")
+
+    connector.scheduler_adapter.hotprefix_abort.assert_called_once_with(
+        b"namespace", b"prefix"
+    )
+    connector._hotprefix_kv_cache_manager.release_hotprefix_eviction_store.assert_called_once_with(
+        candidate
+    )
