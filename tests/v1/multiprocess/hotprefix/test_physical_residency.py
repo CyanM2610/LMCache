@@ -123,6 +123,23 @@ def test_incomplete_binding_fails_closed_and_wakes_publication() -> None:
     assert manager.snapshot() == ()
 
 
+def test_staged_binding_retries_after_overlapping_writer_finishes() -> None:
+    ready = _key(1)
+    still_writing = _key(2)
+    store = _ObjectStore([ready])
+    manager = HotPrefixPhysicalResidencyManager(store)
+
+    assert manager.stage_residency_publication(b"prefix", 12, [ready, still_writing])
+    assert manager.snapshot() == ()
+
+    store.keys.add(still_writing)
+    store.pin_counts[still_writing] = 0
+    manager.on_l1_keys_write_finished([still_writing])
+
+    assert manager.wait_for_residency(b"prefix", 12, 0.1)
+    assert manager.snapshot()[0].object_keys == (ready, still_writing)
+
+
 def test_eviction_rejects_a_late_stream_completion() -> None:
     key = _key(1)
     store = _ObjectStore([key])

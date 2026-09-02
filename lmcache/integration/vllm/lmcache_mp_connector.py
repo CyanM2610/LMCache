@@ -1571,7 +1571,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     transaction.candidate.namespace,
                     transaction.candidate.prefix_id,
                 )
-                raise RuntimeError("HotPrefix STORE publication failed")
+                logger.warning(
+                    "HotPrefix STORE publication failed for request %s; "
+                    "aborted background admission and released its HBM pin",
+                    request_id,
+                )
+                return
         finally:
             manager.release_hotprefix_eviction_store(transaction.candidate)
 
