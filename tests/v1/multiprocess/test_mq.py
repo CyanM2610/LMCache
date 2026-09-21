@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from concurrent.futures import Future
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Callable
 from unittest.mock import MagicMock
@@ -7,6 +8,7 @@ import multiprocessing as mp
 import sys
 import threading
 import time
+import uuid
 
 # Third Party
 import msgspec
@@ -40,6 +42,53 @@ from lmcache.v1.multiprocess.transport.zmq_impl.server import (
 
 # Test helpers
 from tests.v1.multiprocess import test_mq_handler_helpers
+
+
+def test_deferred_reply_does_not_hold_the_affinity_submission_thread() -> None:
+    """A second STORE must submit before the first operation's reply is ready."""
+    endpoint = "inproc://deferred-" + uuid.uuid4().hex
+    context = zmq.Context.instance()
+    server = MessageQueueServer(endpoint, context)
+    replies: list[Future] = []
+    submitted = threading.Event()
+
+    def handler(
+        key: IPCCacheServerKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool] | Future[tuple[bytes, bool]]:
+        future: Future[tuple[bytes, bool]] = Future()
+        replies.append(future)
+        if len(replies) == 2:
+            submitted.set()
+        return future
+
+    add_handler_helper(server, RequestType.STORE, handler)
+    server.add_affinity_thread_pool([RequestType.STORE], max_workers=1)
+    server.start()
+    client = MessageQueueClient(endpoint, context)
+    try:
+        first: MessagingFuture[tuple[bytes, bool]] = client.submit_request(
+            RequestType.STORE, [create_cache_key(1), 1, [[1]], b"a"]
+        )
+        second: MessagingFuture[tuple[bytes, bool]] = client.submit_request(
+            RequestType.STORE, [create_cache_key(2), 1, [[2]], b"b"]
+        )
+        assert submitted.wait(5), "unresolved reply blocked the next submission"
+        assert not first.query() and not second.query()
+        replies[1].set_result((b"second", True))
+        assert second.result(timeout=5) == (b"second", True)
+        assert not first.query()
+        replies[0].set_result((b"first", False))
+        assert first.result(timeout=5) == (b"first", False)
+    finally:
+        for future in replies:
+            if not future.done():
+                future.set_result((b"", False))
+        client.close()
+        server.close()
+
 
 # ==============================================================================
 # MessageQueueServer and MessageQueueClient Tests Infrastructure

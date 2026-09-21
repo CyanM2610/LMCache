@@ -625,6 +625,96 @@ def test_failed_retrieve_marks_blocks_for_recompute(
     assert "req-1" not in adapter.retrieve_futures
 
 
+def test_failed_receive_under_fail_policy_does_not_send_a_second_release(
+    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
+) -> None:
+    """A failed receive is the final release under vLLM's fail policy."""
+    adapter, _send, _future = fake_adapter
+    adapter.kv_load_failure_policy = "fail"
+    completed = MagicMock()
+    completed.query.return_value = True
+    completed.result.return_value = False
+    adapter.retrieve_futures["req-1"] = (completed, [7, 8])
+    sending, receiving = adapter.get_finished(set())
+    assert receiving == {"req-1"} and sending == set()
+    sending, receiving = adapter.get_finished({"req-1"})
+    assert sending == set() and receiving == set()
+
+
+def test_cancelled_receive_retains_blocks_until_the_submitted_copy_finishes(
+    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
+) -> None:
+    """Engine cancellation cannot turn a still-running receive into a completed send."""
+    adapter, _send, _future = fake_adapter
+    copy = MagicMock()
+    copy.query.return_value = False
+    adapter.retrieve_futures["req-1"] = (copy, [7, 8])
+    sending, receiving = adapter.get_finished({"req-1"})
+    assert sending == set() and receiving == set()
+    copy.query.return_value = True
+    copy.result.return_value = True
+    sending, receiving = adapter.get_finished(set())
+    assert sending == set() and receiving == {"req-1"}
+    sending, receiving = adapter.get_finished({"req-1"})
+    assert sending == set() and receiving == set()
+
+
+def test_cancelled_receive_also_waits_for_a_pending_store(
+    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
+) -> None:
+    """Receive cancellation cannot free blocks still read by a STORE."""
+    adapter, _send, _future = fake_adapter
+    receive = MagicMock()
+    receive.query.return_value = True
+    receive.result.return_value = True
+    store = MagicMock()
+    store.query.return_value = False
+    adapter.retrieve_futures["req-1"] = (receive, [7, 8])
+    adapter.store_futures["req-1"] = store
+    assert adapter.get_finished({"req-1"}) == (set(), set())
+    store.query.return_value = True
+    store.result.return_value = True
+    assert adapter.get_finished(set()) == (set(), {"req-1"})
+    assert adapter.get_finished({"req-1"}) == (set(), set())
+
+
+def test_heartbeat_loss_is_not_a_terminal_gpu_copy(
+    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
+) -> None:
+    """A liveness timeout cannot authorize reuse of a submitted LOAD target."""
+    adapter, _send, _future = fake_adapter
+    adapter.require_terminal_completion = True
+    copy = MagicMock()
+    copy.query.return_value = False
+    adapter.transfer_ctx = MagicMock()
+    adapter.transfer_ctx.submit_retrieve.return_value = copy
+    adapter.submit_retrieve_request("req-1", _op([[7, 8]]), FakeCudaEvent())
+    FakeHeartbeatThread.instances[0].health_event.clear()
+    assert adapter.get_finished({"req-1"}) == (set(), set())
+    assert "req-1" in adapter.retrieve_events
+    copy.query.return_value = True
+    copy.result.return_value = True
+    assert adapter.get_finished(set()) == (set(), {"req-1"})
+    assert "req-1" not in adapter.retrieve_events
+
+
+@pytest.mark.parametrize("retrieve_result", [False, True])
+def test_recomputed_or_successful_receive_allows_later_store_release(
+    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
+    retrieve_result: bool,
+) -> None:
+    """A live request still needs a send completion after computation ends."""
+    adapter, _send, _future = fake_adapter
+    adapter.kv_load_failure_policy = "recompute"
+    receive = MagicMock()
+    receive.query.return_value = True
+    receive.result.return_value = retrieve_result
+    adapter.retrieve_futures["req-1"] = (receive, [7, 8])
+    assert adapter.get_finished(set()) == (set(), {"req-1"})
+    assert adapter.get_finished({"req-1"}) == ({"req-1"}, set())
+    assert adapter.get_finished({"req-1"}) == (set(), set())
+
+
 def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> None:
     """A failed full async load must not re-enter remote wait forever."""
     pytest.importorskip("vllm")

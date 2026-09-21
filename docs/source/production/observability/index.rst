@@ -13,6 +13,7 @@ Observability
 
    vllm_endpoint
    internal_api_server
+   /internal_api_server/dynamic_backend_management
    metrics
    chunk_statistics
    health_monitor

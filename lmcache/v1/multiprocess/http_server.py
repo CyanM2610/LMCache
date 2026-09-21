@@ -180,10 +180,10 @@ async def lifespan(app: FastAPI):
     launcher = getattr(app.state, "plugin_launcher", None)
     if launcher is not None:
         launcher.stop_plugins()
-    get_event_bus().stop()
     if hasattr(app.state, "zmq_server") and app.state.zmq_server is not None:
         app.state.zmq_server.close()
     engine.close()
+    get_event_bus().stop()
     logger.info("LMCache HTTP server stopped")
 
 

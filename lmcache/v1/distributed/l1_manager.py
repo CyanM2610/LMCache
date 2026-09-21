@@ -7,13 +7,15 @@ Managing objects and memory for L1 cache
 from dataclasses import dataclass
 from typing import Literal
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.distributed.hybrid_policy import EvictionCandidate
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L1ObjectMeta
 from lmcache.v1.distributed.memory_manager import (
     GDSL1MemoryManager,
@@ -23,6 +25,10 @@ from lmcache.v1.distributed.memory_manager import (
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
 )
+from lmcache.v1.distributed.memory_manager.hybrid_l1_memory_manager import (
+    HybridL1MemoryManager,
+)
+from lmcache.v1.distributed.reference_lock import ReferenceLock
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -41,14 +47,17 @@ class L1ObjectState:
     memory_obj: MemoryObj
     """ The memory object stored in L1 cache. """
 
-    write_lock: TTLLock
+    write_lock: TTLLock | ReferenceLock
     """ Whether the object is write-locked. """
 
-    read_lock: TTLLock
+    read_lock: TTLLock | ReferenceLock
     """ The read lock with TTL for the object. """
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
+
+    last_access_ns: int = 0
+    transfer_refs: int = 0
 
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
@@ -69,6 +78,7 @@ class L1ObjectState:
         return (
             not self.write_lock.is_locked()
             and not self.read_lock.is_locked()
+            and self.transfer_refs == 0
             and not self.is_temporary
         )
 
@@ -185,14 +195,18 @@ class L1Manager:
     _gauge_target: "L1Manager | None" = None
 
     def __init__(self, config: L1ManagerConfig):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         self._objects: dict[ObjectKey, L1ObjectState] = {}
 
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
         self._memory_manager: L1ManagerProtocol
-        if config.gds_l1_config is not None:
+        self.hybrid_memory: HybridL1MemoryManager | None = None
+        if config.hybrid_config is not None:
+            self.hybrid_memory = HybridL1MemoryManager(config.hybrid_config)
+            self._memory_manager = self.hybrid_memory
+        elif config.gds_l1_config is not None:
             self._memory_manager = GDSL1MemoryManager(config.gds_l1_config)
             logger.info("L1Manager: GDS L1 tier enabled; CPU pinned-DRAM L1 disabled")
         elif config.memory_config.devdax_path:
@@ -285,6 +299,7 @@ class L1Manager:
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.lock()
+            entry.last_access_ns = time.monotonic_ns()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
 
@@ -302,6 +317,8 @@ class L1Manager:
     def unsafe_read(
         self,
         keys: list[ObjectKey],
+        *,
+        pin_transfer: bool = False,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Unsafe read the read-locked objects without adding new read locks.
 
@@ -311,10 +328,16 @@ class L1Manager:
 
         Args:
             keys: The list of object keys to read.
+            pin_transfer: Atomically acquire one physical source reservation per
+                successful key while its read lock still exists. The caller must
+                call release_transfer exactly once per acquired reservation,
+                after submitted device work drains, including failure paths.
 
         Returns:
             A dictionary mapping each object key to a tuple of
             (L1Error, Optional[MemoryObj]).
+            With pin_transfer=True, these physical reservations protect the
+            buffers independently after the logical read locks are released.
 
         Errors:
             KEY_NOT_EXIST: The key does not exist.
@@ -332,9 +355,33 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_READABLE, None)
                 continue
 
+            if pin_transfer:
+                entry.transfer_refs += 1
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
 
         return ret
+
+    @l1_mgr_synchronized
+    def release_transfer(self, keys: list[ObjectKey]) -> None:
+        """Release physical source protection after its submitted copy drains.
+
+        Args:
+            keys: Exactly one owned transfer reservation per key.
+        Raises:
+            RuntimeError: If a key is absent or has no transfer reservation.
+        """
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None or entry.transfer_refs <= 0:
+                raise RuntimeError("unmatched hybrid transfer release")
+            entry.transfer_refs -= 1
+            if (
+                entry.is_temporary
+                and entry.transfer_refs == 0
+                and not entry.read_lock.is_locked()
+                and not entry.write_lock.is_locked()
+            ):
+                self.delete([key])
 
     @l1_mgr_synchronized
     def finish_read(
@@ -406,7 +453,11 @@ class L1Manager:
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                entry.is_temporary
+                and not entry.read_lock.is_locked()
+                and entry.transfer_refs == 0
+            ):
                 # NOTE: temporary objects shouldn't have write-locks
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
@@ -469,13 +520,18 @@ class L1Manager:
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
 
+        seen: set[ObjectKey] = set()
         for key, is_temp in zip(keys, is_temporary, strict=False):
+            if key in seen:
+                continue
+            seen.add(key)
             entry = self._objects.get(key, None)
             if entry is None:
                 need_to_allocate.append((key, is_temp))
                 continue
 
-            if mode == "new":
+            entry.last_access_ns = time.monotonic_ns()
+            if mode == "new" or self.hybrid_memory is not None:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
                 continue
 
@@ -497,9 +553,14 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
             return ret
 
-        err, allocated_objs = self._memory_manager.allocate(
-            layout_desc, len(need_to_allocate)
-        )
+        if self.hybrid_memory is not None:
+            err, allocated_objs = self._allocate_hybrid(
+                layout_desc, len(need_to_allocate), set(keys)
+            )
+        else:
+            err, allocated_objs = self._memory_manager.allocate(
+                layout_desc, len(need_to_allocate)
+            )
 
         if err != L1Error.SUCCESS:
             for key, _ in need_to_allocate:
@@ -515,9 +576,18 @@ class L1Manager:
             ):
                 self._objects[key] = L1ObjectState(
                     memory_obj=mem_obj,
-                    write_lock=TTLLock(self._write_ttl_seconds),
-                    read_lock=TTLLock(self._read_ttl_seconds),
+                    write_lock=(
+                        ReferenceLock()
+                        if self.hybrid_memory is not None
+                        else TTLLock(self._write_ttl_seconds)
+                    ),
+                    read_lock=(
+                        ReferenceLock()
+                        if self.hybrid_memory is not None
+                        else TTLLock(self._read_ttl_seconds)
+                    ),
                     is_temporary=is_temp,
+                    last_access_ns=time.monotonic_ns(),
                 )
                 self._objects[key].write_lock.lock()
                 ret[key] = (L1Error.SUCCESS, mem_obj)
@@ -532,6 +602,43 @@ class L1Manager:
             )
         )
         return ret
+
+    @l1_mgr_synchronized
+    def abort_write(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """Discard failed, unpublished writes after their device work has drained.
+
+        Args:
+            keys: Writer reservations owned by the failed STORE operation.
+        Returns:
+            Per-key success or state error. READY/read-locked objects are kept.
+        Notes:
+            Caller must order this after every submitted copy accessing the slots.
+        """
+        result: dict[ObjectKey, L1Error] = {}
+        objects: list[MemoryObj] = []
+        removed: list[ObjectKey] = []
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                result[key] = L1Error.KEY_NOT_EXIST
+            elif not entry.write_lock.is_locked() or entry.read_lock.is_locked():
+                result[key] = L1Error.KEY_IN_WRONG_STATE
+            else:
+                objects.append(entry.memory_obj)
+                removed.append(key)
+                del self._objects[key]
+                result[key] = L1Error.SUCCESS
+        metadata = [self._object_meta(obj) for obj in objects]
+        self._memory_manager.free(objects)
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(removed)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": removed, "meta": metadata, "reason": "aborted_write"},
+            )
+        )
+        return result
 
     @l1_mgr_synchronized
     def finish_write(
@@ -706,8 +813,12 @@ class L1Manager:
                 ret[key] = L1Error.KEY_NOT_EXIST
                 continue
 
-            locked = entry.read_lock.is_locked() or entry.write_lock.is_locked()
-            if locked and not force:
+            locked = (
+                entry.read_lock.is_locked()
+                or entry.write_lock.is_locked()
+                or entry.transfer_refs > 0
+            )
+            if locked and (not force or self.hybrid_memory is not None):
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
             if locked:
@@ -731,12 +842,17 @@ class L1Manager:
         )
         return ret
 
+    @l1_mgr_synchronized
     def touch_keys(self, keys: list[ObjectKey]):
         """Touch the given keys, marking the keys as accessed(retrieved or stored).
 
         Args:
             keys: The list of object keys to touch.
         """
+        now = time.monotonic_ns()
+        for key in keys:
+            if key in self._objects:
+                self._objects[key].last_access_ns = now
         for listener in self._registered_listeners:
             listener.on_l1_keys_accessed(keys)
         if self._event_bus.has_subscribers(EventType.L1_KEYS_ACCESSED):
@@ -757,6 +873,8 @@ class L1Manager:
                 If False (default), only clear unlocked objects, keeping
                 write-locked and read-locked objects intact.
         """
+        if self.hybrid_memory is not None:
+            force = False
         if force:
             logger.warning(
                 "L1Manager: force-clearing all %d objects "
@@ -788,7 +906,11 @@ class L1Manager:
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.write_lock.is_locked() or entry.read_lock.is_locked():
+            if (
+                entry.write_lock.is_locked()
+                or entry.read_lock.is_locked()
+                or entry.transfer_refs > 0
+            ):
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -833,7 +955,11 @@ class L1Manager:
         entry = self._objects.get(key, None)
         if entry is None:
             return False
-        return not entry.read_lock.is_locked() and not entry.write_lock.is_locked()
+        return (
+            not entry.read_lock.is_locked()
+            and not entry.write_lock.is_locked()
+            and entry.transfer_refs == 0
+        )
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Get the current memory usage of L1 cache.
@@ -854,6 +980,11 @@ class L1Manager:
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:
+            if self.hybrid_memory is not None and any(
+                e.write_lock.is_locked() or e.read_lock.is_locked() or e.transfer_refs
+                for e in self._objects.values()
+            ):
+                raise RuntimeError("hybrid directory still owns active references")
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
@@ -884,12 +1015,17 @@ class L1Manager:
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
             "temporary_count": temporary,
+            "transfer_reservation_count": sum(
+                e.transfer_refs for e in self._objects.values()
+            ),
             "memory_used_bytes": used,
             "memory_total_bytes": total,
             "memory_configured_bytes": self._configured_capacity_bytes,
             "memory_usage_ratio": used / total if total > 0 else 0.0,
             "write_ttl_seconds": self._write_ttl_seconds,
             "read_ttl_seconds": self._read_ttl_seconds,
+            "protection": "explicit_release" if self.hybrid_memory else "ttl",
+            "pools": self.hybrid_memory.pool_usage() if self.hybrid_memory else None,
         }
 
     # Debugging APIs
@@ -927,6 +1063,45 @@ class L1Manager:
             num_read_locked,
         )
         return mem_check_result
+
+    def _allocate_hybrid(
+        self, layout: MemoryLayoutDesc, count: int, protected_keys: set[ObjectKey]
+    ) -> tuple[L1Error, list[MemoryObj]]:
+        manager = self.hybrid_memory
+        assert manager is not None
+        if count > manager.max_object_count(layout):
+            return L1Error.OUT_OF_MEMORY, []
+        error, objects = manager.allocate(layout, count)
+        if error == L1Error.SUCCESS:
+            return error, objects
+        identities = {repr(key): key for key in self._objects}
+        candidates = [
+            EvictionCandidate(
+                object_id=identity,
+                medium=(
+                    "cxl_sim"
+                    if manager.get_backend_type(self._objects[key].memory_obj)
+                    == L1BackendType.CXL_SIM
+                    else "dram"
+                ),
+                physical_bytes=self._objects[key].memory_obj.meta.phy_size,
+                last_access_ns=self._objects[key].last_access_ns,
+                evictable=(
+                    key not in protected_keys
+                    and self._objects[key].available_for_write()
+                ),
+            )
+            for identity, key in identities.items()
+        ]
+        for identity in manager.policy.victims(candidates):
+            key = identities[identity]
+            # The shared directory lock is held across selection and deletion.
+            if self.delete([key])[key] != L1Error.SUCCESS:
+                continue
+            error, objects = manager.allocate(layout, count)
+            if error == L1Error.SUCCESS:
+                return error, objects
+        return L1Error.OUT_OF_MEMORY, []
 
     def _object_meta(self, memory_obj: MemoryObj) -> L1ObjectMeta:
         """Build the listener-facing metadata for one resident object."""

@@ -2,7 +2,8 @@
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, Optional, TypeVar, get_type_hints
+from types import GenericAlias
+from typing import Any, Callable, Generic, Optional, TypeVar, get_args, get_type_hints
 import enum
 import inspect
 import itertools
@@ -28,6 +29,7 @@ from lmcache.v1.multiprocess.futures import (
 from lmcache.v1.multiprocess.protocol import (
     HandlerType,
     RequestType,
+    get_handler_type,
     get_payload_classes,
     get_response_class,
 )
@@ -576,6 +578,11 @@ class MessageQueueServer:
         def _notify_response(fut: Future):
             try:
                 response = fut.result()
+                if isinstance(response, Future):
+                    # The handler has submitted device work and relinquished
+                    # its affinity thread. Send only the eventual wire value.
+                    response.add_done_callback(_notify_response)
+                    return
                 response_cls = handler_entry.get_response_class()
                 b_response = msgspec_encode(response, cls=response_cls)
                 frames_to_send = (
@@ -711,7 +718,13 @@ class MessageQueueServer:
 
         return_ann = hints.get("return", sig.return_annotation)
         expected_return_cls = get_response_class(request_type)
-        if not same_type(return_ann, expected_return_cls):
+        expected = type(None) if expected_return_cls is None else expected_return_cls
+        # Construct the annotation dynamically; expected is a runtime wire type.
+        deferred = GenericAlias(Future, expected)
+        deferred_return = get_handler_type(request_type) == HandlerType.BLOCKING and (
+            return_ann == deferred or set(get_args(return_ann)) == {expected, deferred}
+        )
+        if not same_type(return_ann, expected_return_cls) and not deferred_return:
             logger.error(
                 "Handler for %s expects return type %s, but got %s",
                 request_type,

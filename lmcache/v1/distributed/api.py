@@ -47,6 +47,7 @@ class L1BackendType(str, enum.Enum):
 
     DRAM = "dram"
     DEVDAX = "devdax"
+    CXL_SIM = "cxl_sim"
     GDS = "gds"
 
 

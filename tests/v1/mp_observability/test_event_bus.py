@@ -3,7 +3,9 @@
 """Tests for EventBus, EventSubscriber, and singleton management."""
 
 # Standard
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+import json
 import time
 
 # Third Party
@@ -19,6 +21,38 @@ from lmcache.v1.mp_observability.event_bus import (
     init_event_bus,
 )
 import lmcache.v1.mp_observability.event_bus as _bus_module
+
+
+def test_jsonl_preserves_occurrence_time_and_records_drops(tmp_path: Path) -> None:
+    """Delayed drain must preserve timestamps and reveal lost events to audits."""
+    # First Party
+    from lmcache.v1.mp_observability.subscribers.jsonl import JsonlSubscriber
+
+    bus = EventBus(EventBusConfig(enabled=True, max_queue_size=1))
+    path = tmp_path / "events.jsonl"
+    bus.register_subscriber(JsonlSubscriber(str(path), bus))
+    with patch("lmcache.v1.mp_observability.event_bus.time.time", return_value=123.5):
+        bus.publish(
+            Event(
+                EventType.MP_TOKENS,
+                session_id="req-1",
+                metadata={"hash": b"\x00\xff", "tokens": [1, 2]},
+            )
+        )
+        bus.publish(Event(EventType.MP_REQUEST_END))
+    bus.stop()
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert records[1]["timestamp_s"] == 123.5
+    assert records[1]["session_id"] == "req-1"
+    assert records[1]["metadata"]["hash"] == {"encoding": "hex", "value": "00ff"}
+    assert records[1]["metadata"]["tokens"] == [1, 2]
+    assert records[-1]["events_written"] == 1
+    assert records[-1]["bus_dropped_events"] == 1
+    assert records[-1]["subscriber_errors"] == {}
+    assert records[-1]["bus_queue_depth"] == 0
+    with pytest.raises(FileExistsError):
+        JsonlSubscriber(str(path), bus)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

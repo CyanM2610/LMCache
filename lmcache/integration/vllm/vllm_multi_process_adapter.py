@@ -96,6 +96,9 @@ class ExtraConfigDefault(enum.Enum):
     # VMM IPC instead of legacy CUDA IPC handles; see
     # lmcache/v1/platform/cuda/vmm_ipc.py.
     use_vmm_api = False
+    # Hybrid server replies prove both CUDA and model completion. Heartbeat
+    # loss cannot replace that proof or authorize GPU block reuse.
+    require_terminal_completion = False
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -1206,6 +1209,7 @@ class LMCacheMPWorkerAdapter:
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
+        kv_load_failure_policy: str = "recompute",
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
 
@@ -1226,6 +1230,9 @@ class LMCacheMPWorkerAdapter:
             extra_config: Optional dict with keys starting with
                 ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
+            kv_load_failure_policy: vLLM's configured action on failed loads.
+                ``fail`` releases the request on receive completion; ``recompute``
+                keeps it alive until inference and any stores finish.
 
         Raises:
             TypeError: If the connector argument shape is unsupported.
@@ -1255,6 +1262,11 @@ class LMCacheMPWorkerAdapter:
             set_use_vmm_api(cfg[ExtraConfigDefault.use_vmm_api.name])
         else:
             self._mp_transfer_mode = None
+        self.require_terminal_completion = (
+            cfg[ExtraConfigDefault.require_terminal_completion.name]
+            if extra_config is not None
+            else ExtraConfigDefault.require_terminal_completion.default
+        )
         self.req_client = RequestClientFactory.create(server_url, context=context)
         self._mq_timeout = mq_timeout
 
@@ -1292,13 +1304,17 @@ class LMCacheMPWorkerAdapter:
         # submit_retrieve_request. get_finished must still report each id
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
         self._dropped_retrieves: set[str] = set()
+        self.kv_load_failure_policy = kv_load_failure_policy
+        # Engine cancellation does not cancel an already submitted GPU copy.
+        # Keep its blocks until receive completion, then release exactly once.
+        self._finished_during_receive: set[str] = set()
 
         # The store requests that have finished execution in LMCache
         self.finished_stores: set[str] = set()
         # The finished request ids that are passed via vLLM and also
         # have corresponding store requests submitted to LMCache before
         self.previously_finished: set[str] = set()
-        # Request IDs already returned as finished_sending to the scheduler.
+        # Request IDs whose final release was already reported to the scheduler.
         # Prevents re-reporting the same ID after drain clears tracking sets.
         self._returned_finished: set[str] = set()
 
@@ -1533,6 +1549,12 @@ class LMCacheMPWorkerAdapter:
             succeeds; ``False`` on failure or a requested heartbeat stop
             (event stays cleared; retried on the next successful PING).
         """
+        if self.require_terminal_completion and (
+            self.store_futures or self.retrieve_futures
+        ):
+            # Retain the exporting context while a previous server may still
+            # own its IPC mappings. A lost terminal response requires restart.
+            return False
         if not self.kv_caches:
             # Nothing was registered yet (server flapped before the
             # very first register_kv_caches). Treat as success so the
@@ -1811,10 +1833,15 @@ class LMCacheMPWorkerAdapter:
         finished_req_ids_from_engine: set[str],
     ) -> set[str]:
         """Merge LMCache-side and engine-side finished store info."""
-        self.finished_stores.update(finished_req_ids_from_lmcache)
+        self.finished_stores.update(
+            finished_req_ids_from_lmcache - self._returned_finished
+        )
         ret_stores = set()
         for req_id in finished_req_ids_from_engine:
-            if req_id in self._returned_finished:
+            if (
+                req_id in self._returned_finished
+                or req_id in self._finished_during_receive
+            ):
                 continue
             if req_id in self.finished_stores or req_id in self.store_futures:
                 self.previously_finished.add(req_id)
@@ -1853,8 +1880,14 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
-        if not self.is_healthy:
+        self._finished_during_receive.update(
+            finished_req_ids_from_engine
+            & (self.retrieve_futures.keys() | self._dropped_retrieves)
+        )
+
+        # Legacy best-effort recovery does not prove DMA completion. Hybrid
+        # mode keeps polling the actual futures even after heartbeat loss.
+        if not self.is_healthy and not self.require_terminal_completion:
             finished_stores = set(self.store_futures.keys())
             finished_retrieves = set()
             for request_id, (
@@ -1877,6 +1910,8 @@ class LMCacheMPWorkerAdapter:
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
 
+            self._record_receive_releases(finished_retrieves, finished_retrieves)
+
             ret_stores = self._process_finished_stores(
                 finished_stores, finished_req_ids_from_engine
             )
@@ -1890,6 +1925,7 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = set()
         finished_retrieves = set()
+        failed_retrieves = set()
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
@@ -1909,9 +1945,21 @@ class LMCacheMPWorkerAdapter:
                 continue
 
             r_result = r_future.result(timeout=60)
+            terminal = request_id in self._finished_during_receive or (
+                not r_result and self.kv_load_failure_policy == "fail"
+            )
+            if (
+                terminal
+                and request_id in self.store_futures
+                and request_id not in finished_stores
+            ):
+                # A final receive notification frees all request blocks, so it
+                # must also wait for any outstanding store reading those blocks.
+                continue
             finished_retrieves.add(request_id)
 
             if not r_result:
+                failed_retrieves.add(request_id)
                 self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
@@ -1928,15 +1976,14 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
 
-        # Retrieves dropped while unhealthy still must be reported,
-        # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
-        # finished_sending dedup is needed (unlike the unhealthy branch): a
-        # dropped retrieve's request is parked in WAITING_FOR_REMOTE_KVS until
-        # this report, so it cannot also be engine-finished in the same call.
+        # Retrieves dropped while unhealthy still must be reported exactly
+        # once. Deduplicate final receive releases for fail/cancel paths too.
         # Swap-drain so a concurrent submit_retrieve_request add is never lost.
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
+        failed_retrieves.update(dropped)
+        self._record_receive_releases(finished_retrieves, failed_retrieves)
 
         # Update the internal states
         ret_stores = self._process_finished_stores(
@@ -1981,8 +2028,8 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
-        if not self.is_healthy:
+        # Hybrid callers must retain submitted work until its actual fence.
+        if not self.is_healthy and not self.require_terminal_completion:
             finished_stores = set(self.store_futures.keys())
             finished_retrieves = set()
             for request_id, (
@@ -2139,6 +2186,12 @@ class LMCacheMPWorkerAdapter:
                 future = self.req_client.unregister_kv_cache(self.instance_id)
             future.result(timeout=self._mq_timeout)
         except TimeoutError:
+            if self.require_terminal_completion and (
+                self.store_futures or self.retrieve_futures
+            ):
+                raise RuntimeError(
+                    "cannot close hybrid GPU context without a terminal drain reply"
+                ) from None
             logger.warning(
                 "LMCache server did not respond to unregister within %ss. "
                 "Proceeding with shutdown.",
@@ -2156,6 +2209,18 @@ class LMCacheMPWorkerAdapter:
         self.request_telemetry.close()
 
     # Helper functions
+    def _record_receive_releases(
+        self, finished_retrieves: set[str], failed_retrieves: set[str]
+    ) -> None:
+        """Deduplicate final releases performed by vLLM's receive handler."""
+        terminal = finished_retrieves & self._finished_during_receive
+        if self.kv_load_failure_policy == "fail":
+            terminal.update(failed_retrieves)
+        self._returned_finished.update(terminal)
+        self._finished_during_receive.difference_update(terminal)
+        self.finished_stores.difference_update(terminal)
+        self.previously_finished.difference_update(terminal)
+
     def _update_and_get_finished_store(
         self,
     ) -> set[str]:

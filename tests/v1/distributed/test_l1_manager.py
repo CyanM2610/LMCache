@@ -79,6 +79,29 @@ if not torch_dev.is_available():
 # =============================================================================
 
 
+def test_abort_write_releases_unpublished_slots_only(basic_l1_config, basic_layout):
+    """A drained failed store must not leave a writer or publish partial data."""
+    manager = L1Manager(basic_l1_config)
+    failed = ObjectKey(b"failed", "m", 0)
+    ready = ObjectKey(b"ready", "m", 0)
+    try:
+        manager.reserve_write([failed, ready], [False, False], basic_layout, "new")
+        manager.finish_write([ready])
+        used_before = manager.get_memory_usage()[0]
+        results = manager.abort_write([failed, ready])
+        assert results[failed] == L1Error.SUCCESS
+        assert results[ready] == L1Error.KEY_IN_WRONG_STATE
+        assert manager.get_memory_usage()[0] < used_before
+        assert manager.reserve_read([failed])[failed][0] == L1Error.KEY_NOT_EXIST
+        assert manager.reserve_read([ready])[ready][0] == L1Error.SUCCESS
+        assert manager.abort_write([ready])[ready] == L1Error.KEY_IN_WRONG_STATE
+        manager.finish_read([ready])
+        assert manager.report_status()["write_locked_count"] == 0
+        assert manager.memcheck()
+    finally:
+        manager.close()
+
+
 @pytest.fixture
 def basic_memory_config():
     """Create a basic L1MemoryManagerConfig for testing."""

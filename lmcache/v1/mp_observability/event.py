@@ -38,6 +38,7 @@ class EventType(Enum):
     SM_READ_PREFETCHED_FINISHED = "sm.read.prefetched_finished"
     SM_WRITE_RESERVED = "sm.write.reserved"
     SM_WRITE_FINISHED = "sm.write.finished"
+    SM_WRITE_ABORTED = "sm.write.aborted"
 
     # L2 Store Controller events
     L2_STORE_SUBMITTED = "l2.store.submitted"
@@ -81,6 +82,10 @@ class EventType(Enum):
     # transfer_key (in the native layer's session_id slot) identifies the
     # store/retrieve operation, minted by ``next_transfer_key``.
     MP_TRANSFER_PHASE_SAMPLES = "mp.transfer.phase_samples"
+    MP_KV_CONTENT_CHECK = "mp.kv.content_check"
+    HYBRID_ACCESS = "hybrid.access"
+    HYBRID_COMPLETION = "hybrid.completion"
+    HYBRID_LOOKUP_LEASE = "hybrid.lookup_lease"
     MP_RETRIEVE_START = "mp.retrieve.start"
     MP_RETRIEVE_END = "mp.retrieve.end"
     MP_LOOKUP_PREFETCH_START = "mp.lookup_prefetch.start"

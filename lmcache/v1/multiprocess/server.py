@@ -315,6 +315,11 @@ def run_cache_server(
         If return_engine is True: tuple of (MessageQueueServer, MPCacheServer).
         If return_engine is False: None (blocks until interrupted).
     """
+    if storage_manager_config.l1_manager_config.hybrid_config is not None:
+        if mp_config.supported_transfer_mode != "lmcache_driven":
+            raise ValueError("hybrid requires --supported-transfer-mode lmcache_driven")
+        if mp_config.transport != "zmq":
+            raise ValueError("hybrid deferred completions require the ZMQ transport")
     # Before any event IPC backend is resolved (KV-cache registration), so
     # the setting is observed by every resolver in this process.
     set_isolated_ipc(mp_config.isolated_ipc)
@@ -408,9 +413,9 @@ def run_cache_server(
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutting down server...")
-        event_bus.stop()
         server.close()
         engine.close()
+        event_bus.stop()
     finally:
         shutdown_gc_monitor()
     return None

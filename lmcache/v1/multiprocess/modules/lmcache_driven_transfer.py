@@ -2,9 +2,11 @@
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
+from concurrent.futures import Future
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Generator, Sequence
+import os
 import threading
 import time
 
@@ -21,6 +23,9 @@ from lmcache.utils import (
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
+)
+from lmcache.v1.distributed.memory_manager.hybrid_l1_memory_manager import (
+    HybridL1MemoryManager,
 )
 from lmcache.v1.gpu_connector.gpu_ops import (
     build_staging_copies,
@@ -43,11 +48,13 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.hybrid_completion import HybridAccess, HybridCompletionLoop
 from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
     submit_callback_to_stream,
 )
+from lmcache.v1.multiprocess.session import Session
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -513,6 +520,20 @@ def transfer_kv_per_object_group(
     if _HAS_NATIVE_OBJECT_GROUP_TRANSFER and not any(
         isinstance(mo, GDSMemoryObject) for mo in memory_objs
     ):
+        content_check = None
+        if os.environ.get("LMCACHE_VERIFY_KV_CONTENT") == "1":
+            # First Party
+            from lmcache.v1.multiprocess.kv_content_check import KvContentCheck
+
+            content_check = KvContentCheck(
+                cache_context,
+                block_ids_gpu,
+                memory_objs,
+                object_group_id,
+                skip_first_n_tokens,
+                direction,
+                transfer_key,
+            )
         _run_object_group_transfer_plan(
             cache_context,
             block_ids_gpu,
@@ -523,6 +544,8 @@ def transfer_kv_per_object_group(
             direction,
             transfer_key=transfer_key,
         )
+        if content_check is not None:
+            content_check.verify()
         return
 
     lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
@@ -685,6 +708,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ctx: The shared engine context.
     """
 
+    _hybrid_completion: HybridCompletionLoop | None = None
+
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
         self._cache_contexts: dict[int, ContextEntry] = {}
@@ -694,6 +719,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # ops -- never across context creation, layout-registry calls, or
         # empty_cache (leaf-lock invariant: no thread holds two locks).
         self._lock = threading.Lock()
+        memory = ctx.storage_manager.hybrid_memory
+        self._hybrid_completion = (
+            HybridCompletionLoop(memory)
+            if isinstance(memory, HybridL1MemoryManager)
+            else None
+        )
 
         # Route finish_write / finish_read_prefetched through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
@@ -701,6 +732,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._device_host_func_dispatcher.register(
             "finish_write",
             self._ctx.storage_manager.finish_write,
+            payload_type=list[ObjectKey],
+        )
+        self._device_host_func_dispatcher.register(
+            "abort_write",
+            self._ctx.storage_manager.abort_write,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
@@ -784,7 +820,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # particular, do not release the scheduler's whole MLA
             # reservation here: the remaining TP workers and concurrent
             # requests still own their independent read locks.
-            self._ctx.storage_manager.finish_read_prefetched(obj_keys, read_locks=1)
+            if self._hybrid_completion is not None:
+                if session.hybrid_read_lease is not None:
+                    session.hybrid_read_lease.release(obj_keys, 1)
+            else:
+                self._ctx.storage_manager.finish_read_prefetched(obj_keys, read_locks=1)
 
     def context_entries_snapshot(self) -> dict[int, ContextEntry]:
         """Return a shallow copy of the registry for iteration or status.
@@ -873,6 +913,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if not entries:
             return
         for entry in entries:
+            if self._hybrid_completion is not None:
+                self._hybrid_completion.drain_context(entry.cache_context)
             entry.cache_context.close()
             self._ctx.layout_desc_registry.unregister(
                 entry.model_name, entry.world_size
@@ -909,12 +951,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return {
             "registered_gpu_ids": registered_gpu_ids,
             "cache_context_meta": cache_context_meta,
+            "hybrid_completion": (
+                self._hybrid_completion.report_status()
+                if self._hybrid_completion is not None
+                else None
+            ),
         }
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
+        if self._hybrid_completion is not None:
+            self._hybrid_completion.close()
         self._device_host_func_dispatcher.stop()
 
         with self._lock:
@@ -974,6 +1023,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         kv_groups_manager = cache_context.kv_layer_groups_manager
         num_object_groups = kv_groups_manager.num_object_groups
+        if self._hybrid_completion is not None and num_object_groups != 1:
+            cache_context.close()
+            raise ValueError("initial hybrid supports one dense/GQA object group")
         event_backend = get_event_ipc_backend(cache_context.device)
         event_backend.check_event_support(cache_context.device)
         layout_desc = get_layout_desc(
@@ -1042,7 +1094,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         instance_id: int,
         gpu_block_ids: list[list[int]],
         event_ipc_handle: bytes,
-    ) -> tuple[bytes, bool]:
+    ) -> tuple[bytes, bool] | Future[tuple[bytes, bool]]:
         """Store the GPU KV cache blocks to CPU.
 
         Args:
@@ -1073,6 +1125,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         st = time.perf_counter()
 
+        hybrid = getattr(self, "_hybrid_completion", None)
+        hybrid_accesses: list[HybridAccess] = []
+        deferred_response = None
+
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
             # The worker can reconnect to a replacement server before its next
@@ -1093,8 +1149,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             raise RuntimeError("Registered cache context has no event backend")
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
+        store_session = None
+        if hybrid is not None:
+            store_session = self._ctx.session_manager.get(key.request_id)
+            if store_session is None:
+                # A queued STORE may outlive demand; hashing must not recreate
+                # a session that END_SESSION already retired.
+                store_session = Session(key.request_id, self._ctx.token_hasher)
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
-            key, list(range(num_object_groups))
+            key,
+            list(range(num_object_groups)),
+            **({"session": store_session} if hybrid is not None else {}),
         )
         num_chunks = len(obj_keys_per_obj_group[0])
 
@@ -1226,16 +1291,56 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     ]
 
                     # NOTE: batch_size must stay 1 for store.
+                    inject_failure = (
+                        hybrid is not None
+                        and bool(reserved_dict)
+                        and hybrid.claim_failure("store")
+                    )
+                    copy_objects = memory_objs
+                    if inject_failure:
+                        first = next(
+                            i for i, obj in enumerate(memory_objs) if obj is not None
+                        )
+                        copy_objects = [
+                            obj if i == first else None
+                            for i, obj in enumerate(memory_objs)
+                        ]
+                    if hybrid is not None:
+                        hybrid.begin_objects(
+                            hybrid_accesses,
+                            copy_objects,
+                            obj_keys,
+                            "store",
+                            transfer_key,
+                            gpu_block_ids,
+                            self._ctx.chunk_size,
+                        )
                     transfer_kv_per_object_group(
                         cache_context,
                         block_ids_per_group_gpu,
-                        memory_objs,
+                        copy_objects,
                         object_group_id=obj_group_id,
                         batch_size=1,
                         skip_first_n_tokens=0,
                         direction=lmcache_native.TransferDirection.D2H,
                         transfer_key=transfer_key,
                     )
+                    if inject_failure:
+                        self._ctx.event_bus.publish(
+                            Event(
+                                event_type=EventType.HYBRID_COMPLETION,
+                                session_id=key.request_id,
+                                metadata={
+                                    "phase": "injected_partial_store",
+                                    "transfer_key": transfer_key,
+                                    "submitted_chunks": 1,
+                                    "reserved_chunks": len(all_dict),
+                                },
+                            )
+                        )
+                        raise RuntimeError(
+                            "diagnostic failure after one real STORE chunk submission"
+                        )
 
                 store_succeeded = True
             except Exception:
@@ -1245,31 +1350,61 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
-                if stored_count:
+                if stored_count and hybrid is None:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
                         "finish_write",
                         list(all_dict.keys()),
                     )
-                else:
+                elif not stored_count:
                     total_bytes = 0
+                    if all_dict and hybrid is None:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_write",
+                            list(all_dict.keys()),
+                        )
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
-                self._ctx.event_bus.publish_on_stream(
-                    cache_context.cupy_stream,
-                    Event(
-                        event_type=EventType.MP_STORE_END,
-                        session_id=key.request_id,
-                        metadata={
-                            "stored_count": stored_count,
-                            "device": str(cache_context.device),
-                            "engine_id": instance_id,
-                            "model_name": model_name,
-                            "total_bytes": total_bytes,
-                            "num_tokens": num_tokens,
-                            "transfer_key": transfer_key,
-                        },
-                    ),
+                end_event = Event(
+                    event_type=EventType.MP_STORE_END,
+                    session_id=key.request_id,
+                    metadata={
+                        "stored_count": stored_count,
+                        "device": str(cache_context.device),
+                        "engine_id": instance_id,
+                        "model_name": model_name,
+                        "total_bytes": total_bytes,
+                        "num_tokens": num_tokens,
+                        "transfer_key": transfer_key,
+                    },
                 )
+                if hybrid is None:
+                    self._ctx.event_bus.publish_on_stream(
+                        cache_context.cupy_stream, end_event
+                    )
+                else:
+                    handle = event_backend.export_event(event, cache_context.device)
+                    written_keys = list(all_dict)
+
+                    def finish_hybrid_store(success: bool) -> tuple[bytes, bool]:
+                        if success:
+                            self._ctx.storage_manager.finish_write(written_keys)
+                        else:
+                            self._ctx.storage_manager.abort_write(written_keys)
+                            end_event.metadata.update(
+                                stored_count=0, total_bytes=0, num_tokens=0
+                            )
+                        self._ctx.event_bus.publish(end_event)
+                        return handle, success
+
+                    deferred_response = hybrid.defer(
+                        event,
+                        cache_context,
+                        hybrid_accesses,
+                        store_succeeded,
+                        finish_hybrid_store,
+                        transfer_key,
+                    )
 
         ed = time.perf_counter()
         if stored_count:
@@ -1278,6 +1413,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 num_chunks * self._ctx.chunk_size,
                 ed - st,
             )
+        if deferred_response is not None:
+            return deferred_response
         return (
             event_backend.export_event(event, cache_context.device),
             store_succeeded,
@@ -1291,7 +1428,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         gpu_block_ids: list[list[int]],
         event_ipc_handle: bytes,
         skip_first_n_tokens: int = 0,
-    ) -> tuple[bytes, bool]:
+    ) -> tuple[bytes, bool] | Future[tuple[bytes, bool]]:
         """Retrieve the CPU KV cache and put into GPU blocks.
 
         Args:
@@ -1316,6 +1453,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             RuntimeError: If the backend does not support IPC event handles.
         """
         st = time.perf_counter()
+        hybrid = getattr(self, "_hybrid_completion", None)
+        hybrid_accesses: list[HybridAccess] = []
+        deferred_response = None
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -1345,8 +1485,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             raise RuntimeError("Registered cache context has no event backend")
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
+        read_session = self._ctx.session_manager.get(key.request_id) if hybrid else None
+        read_lease = (
+            read_session.hybrid_read_lease if read_session is not None else None
+        )
+        if hybrid is not None and read_lease is None:
+            # Cancelled before submission: no ownership, therefore no device work.
+            return b"", False
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
-            key, list(range(num_object_groups))
+            key,
+            list(range(num_object_groups)),
+            **({"session": read_session} if hybrid is not None else {}),
         )
         num_chunks = len(obj_keys_per_obj_group[0])
 
@@ -1409,6 +1558,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     blocks_per_chunk,
                 )
                 event_backend.record_event(event, cache_context.stream)
+                if hybrid is not None:
+                    self._release_failed_retrieve_locks(key, instance_id)
                 return event_backend.export_event(event, cache_context.device), False
 
             # Cut and stage all block_ids to GPU once before the transfer
@@ -1450,9 +1601,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         continue
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
-                    with self._ctx.storage_manager.read_prefetched_results(
-                        in_window_keys
-                    ) as window_objs:
+                    if hybrid is not None:
+                        read_context = (
+                            self._ctx.storage_manager.read_prefetched_results(
+                                in_window_keys,
+                                release_on_error=False,
+                                read_lease=read_lease,
+                            )
+                        )
+                    else:
+                        read_context = (
+                            self._ctx.storage_manager.read_prefetched_results(
+                                in_window_keys
+                            )
+                        )
+                    with read_context as window_objs:
                         if not window_objs or len(window_objs) != len(in_window_keys):
                             logger.error("Some keys not found during retrieve!")
                             retrieve_succeeded = False
@@ -1467,26 +1630,63 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             window_objs
                         )
 
+                        if hybrid is not None:
+                            # Own cleanup even if a later native call only
+                            # partially enqueues work and then raises.
+                            prefetched_keys.extend(in_window_keys)
+                            inject_failure = hybrid.claim_failure("load")
+                            copy_objects = (
+                                memory_objs[:1] if inject_failure else memory_objs
+                            )
+                            hybrid.begin_objects(
+                                hybrid_accesses,
+                                copy_objects,
+                                obj_keys_per_obj_group[obj_group_id][
+                                    : len(copy_objects)
+                                ],
+                                "load",
+                                transfer_key,
+                                gpu_block_ids,
+                                self._ctx.chunk_size,
+                                skip_first_n_tokens,
+                            )
                         transfer_kv_per_object_group(
                             cache_context,
                             block_ids_per_group_gpu,
-                            memory_objs,
+                            copy_objects if hybrid is not None else memory_objs,
                             object_group_id=obj_group_id,
                             batch_size=cache_context.max_batch_size,
                             skip_first_n_tokens=skip_first_n_tokens,
                             direction=lmcache_native.TransferDirection.H2D,
                             transfer_key=transfer_key,
                         )
+                        if hybrid is not None and inject_failure:
+                            self._ctx.event_bus.publish(
+                                Event(
+                                    event_type=EventType.HYBRID_COMPLETION,
+                                    session_id=key.request_id,
+                                    metadata={
+                                        "phase": "injected_partial_load",
+                                        "transfer_key": transfer_key,
+                                        "submitted_chunks": 1,
+                                        "reserved_chunks": len(prefetched_keys),
+                                    },
+                                )
+                            )
+                            raise RuntimeError(
+                                "diagnostic failure after partial LOAD submission"
+                            )
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks
                         # itself, and a key must not be released twice.
-                        prefetched_keys.extend(in_window_keys)
+                        if hybrid is None:
+                            prefetched_keys.extend(in_window_keys)
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
             finally:
                 event_backend.record_event(event, cache_context.stream)
-                if prefetched_keys:
+                if prefetched_keys and hybrid is None:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
                         "finish_read_prefetched",
@@ -1497,23 +1697,44 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     if len(prefetched_keys) == expected_retained
                     else 0
                 )
-                self._ctx.event_bus.publish_on_stream(
-                    cache_context.cupy_stream,
-                    Event(
-                        event_type=EventType.MP_RETRIEVE_END,
-                        session_id=key.request_id,
-                        metadata={
-                            "retrieved_count": len(prefetched_keys),
-                            "device": str(cache_context.device),
-                            "engine_id": instance_id,
-                            "model_name": model_name,
-                            "cache_salt": key.cache_salt,
-                            "total_bytes": total_bytes,
-                            "num_tokens": num_tokens,
-                            "transfer_key": transfer_key,
-                        },
-                    ),
+                end_event = Event(
+                    event_type=EventType.MP_RETRIEVE_END,
+                    session_id=key.request_id,
+                    metadata={
+                        "retrieved_count": len(prefetched_keys),
+                        "device": str(cache_context.device),
+                        "engine_id": instance_id,
+                        "model_name": model_name,
+                        "cache_salt": key.cache_salt,
+                        "total_bytes": total_bytes,
+                        "num_tokens": num_tokens,
+                        "transfer_key": transfer_key,
+                    },
                 )
+                if hybrid is None:
+                    self._ctx.event_bus.publish_on_stream(
+                        cache_context.cupy_stream, end_event
+                    )
+                else:
+                    handle = event_backend.export_event(event, cache_context.device)
+                    read_keys = list(prefetched_keys)
+
+                    def finish_hybrid_read(success: bool) -> tuple[bytes, bool]:
+                        if read_keys:
+                            self._ctx.storage_manager.release_transfer(read_keys)
+                        if not success:
+                            end_event.metadata.update(num_tokens=0, retrieved_count=0)
+                        self._ctx.event_bus.publish(end_event)
+                        return handle, success
+
+                    deferred_response = hybrid.defer(
+                        event,
+                        cache_context,
+                        hybrid_accesses,
+                        retrieve_succeeded,
+                        finish_hybrid_read,
+                        transfer_key,
+                    )
         if retrieve_succeeded:
             tokens_retrieved = num_chunks * self._ctx.chunk_size
             ed = time.perf_counter()
@@ -1523,6 +1744,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 ed - st,
             )
 
+        if deferred_response is not None:
+            return deferred_response
         return (
             event_backend.export_event(event, cache_context.device),
             retrieve_succeeded,

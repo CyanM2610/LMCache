@@ -619,6 +619,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_block_size=scheduler_block_size,
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                kv_load_failure_policy=getattr(
+                    vllm_config.kv_transfer_config,
+                    "kv_load_failure_policy",
+                    "recompute",
+                ),
             )
             if self.transfer_intermediate_tensors:
                 # First Party

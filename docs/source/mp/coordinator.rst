@@ -343,6 +343,7 @@ startup.
      - int
      - Optional (default ``0``). ZMQ message-queue port P2P peers send
        lookup/unlock RPCs to; ``0`` when P2P is disabled.
+
 **Response** (``200 OK``):
 
 .. code-block:: json

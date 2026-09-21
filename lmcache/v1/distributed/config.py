@@ -6,13 +6,16 @@ Configuration for distributed storage manager
 
 # Standard
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, cast
 import argparse
+import json
 import os
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import L1BackendType
+from lmcache.v1.distributed.hybrid_config import HybridMemoryConfig
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     L2AdaptersConfig,
@@ -215,6 +218,9 @@ class L1ManagerConfig:
     read_ttl_seconds: int = field(default=300)
     """ Time to live for each object's read lock. Default is 300s (5 minutes). """
 
+    hybrid_config: HybridMemoryConfig | None = None
+    """Optional peer pools with one directory and explicit lifetime protection."""
+
 
 def get_configured_capacity_bytes(
     config: L1ManagerConfig,
@@ -239,6 +245,11 @@ def get_configured_capacity_bytes(
     Returns:
         Configured bytes per medium, omitting any sized zero.
     """
+    if config.hybrid_config is not None:
+        return {
+            L1BackendType.DRAM: config.hybrid_config.dram_bytes,
+            L1BackendType.CXL_SIM: config.hybrid_config.cxl_bytes,
+        }
     if config.gds_l1_config is not None:
         size = config.gds_l1_config.size_in_bytes
         return {L1BackendType.GDS: size} if size > 0 else {}
@@ -353,6 +364,21 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    hybrid = config.l1_manager_config.hybrid_config
+    if hybrid is not None:
+        memory = config.l1_manager_config.memory_config
+        if config.l1_manager_config.gds_l1_config or memory.devdax_path:
+            raise ValueError("hybrid cannot be combined with GDS or Device-DAX")
+        if config.l2_adapter_config.adapters:
+            raise ValueError("hybrid peer pools do not support additional L2 adapters")
+        if memory.use_lazy or memory.shm_name:
+            raise ValueError('hybrid requires --no-l1-use-lazy and --shm-name ""')
+        if memory.size_in_bytes != hybrid.dram_bytes:
+            raise ValueError("l1-size-gb must equal hybrid dram_bytes")
+        if config.eviction_config.eviction_policy != "noop":
+            raise ValueError(
+                "hybrid owns capacity-driven eviction; select noop periodic policy"
+            )
     if (
         config.l1_manager_config.gds_l1_config is not None
         and config.l1_manager_config.memory_config.devdax_path
@@ -388,6 +414,8 @@ def l1_exposes_single_memory_region(config: StorageManagerConfig) -> bool:
         GDS L1 or Device-DAX L1.
     """
     l1_config = config.l1_manager_config
+    if l1_config.hybrid_config is not None:
+        return False
     if l1_config.gds_l1_config is not None:
         return False
     if l1_config.memory_config.devdax_path:
@@ -423,6 +451,11 @@ def add_storage_manager_args(
     # L1 Memory Manager Config
     memory_group = parser.add_argument_group(
         "L1 Memory Manager", "Configuration for L1 memory manager"
+    )
+    memory_group.add_argument(
+        "--l1-hybrid-config",
+        default=None,
+        help="Path to explicit DRAM/CXLMemSim peer-pool JSON configuration.",
     )
     memory_group.add_argument(
         "--l1-size-gb",
@@ -653,6 +686,11 @@ def parse_args_to_config(
 
     l1_manager_config = L1ManagerConfig(
         memory_config=memory_config,
+        hybrid_config=(
+            HybridMemoryConfig(**json.loads(Path(args.l1_hybrid_config).read_text()))
+            if getattr(args, "l1_hybrid_config", None)
+            else None
+        ),
         gds_l1_config=gds_l1_config,
         write_ttl_seconds=args.l1_write_ttl_seconds,
         read_ttl_seconds=args.l1_read_ttl_seconds,

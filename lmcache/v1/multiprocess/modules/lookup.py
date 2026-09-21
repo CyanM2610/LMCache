@@ -2,6 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 import threading
@@ -18,6 +19,9 @@ from lmcache.v1.distributed.api import (
     ipc_key_to_object_keys,
 )
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_ranked
+from lmcache.v1.distributed.memory_manager.hybrid_l1_memory_manager import (
+    HybridL1MemoryManager,
+)
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
@@ -118,6 +122,15 @@ class LookupModule:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        self._hybrid = isinstance(
+            getattr(ctx.storage_manager, "hybrid_memory", None), HybridL1MemoryManager
+        )
+        self._lifecycle_lock = threading.RLock()
+        self._hybrid_requests: set[str] = set()
+        # END_SESSION can overtake a queued LOOKUP in the blocking handler pool.
+        # Retain only request-ID tombstones, not payload references, until close.
+        self._ended_requests: set[str] = set()
+        self._closing = False
         self._setup_metrics()
 
     @property
@@ -136,14 +149,215 @@ class LookupModule:
         }
 
     def close(self) -> None:
-        """Release resources owned by this module (no-op)."""
-        pass
+        """Release unused hybrid lookup reservations after admission stops.
+
+        Raises:
+            RuntimeError: If an owned reservation is missing during cleanup.
+                Protected resources must be retained after failed cleanup.
+        """
+        if self._hybrid:
+            with self._lifecycle_lock:
+                self._closing = True
+                for request_id in list(self._hybrid_requests):
+                    self.end_session(request_id)
+                self._ended_requests.clear()
+
+    def lookup(self, key: IPCCacheServerKey, tp_size: int) -> None:
+        """Reserve a prefix lookup unless its request has already ended.
+
+        Args:
+            key: Scheduler key, including the unique request ID and token prefix.
+            tp_size: Legacy protocol field retained for wire compatibility.
+        Raises:
+            RuntimeError: If replacing a lookup detects missing owned references.
+        Notes:
+            Hybrid lookup and END_SESSION are serialized through ownership
+            adoption. Late lookup RPCs after cancellation acquire no references.
+        """
+        with self._lifecycle_lock if self._hybrid else nullcontext():
+            if self._hybrid:
+                if self._closing or key.request_id in self._ended_requests:
+                    return
+                self._hybrid_requests.add(key.request_id)
+            self._lookup(key, tp_size)
+
+    def query_prefetch_status(self, request_id: str) -> int | None:
+        """Consume lookup status without recreating a cancelled hybrid session.
+
+        Args:
+            request_id: Unique ID used by the original LOOKUP.
+        Returns:
+            Completed prefix chunk count, None while pending, or zero after end.
+        """
+        with self._lifecycle_lock if self._hybrid else nullcontext():
+            if self._hybrid and request_id in self._ended_requests:
+                return 0
+            return self._query_prefetch_status(request_id)
+
+    def free_lookup_locks(self, key: IPCCacheServerKey, tp_size: int) -> None:
+        """Release only this request's unused prefix lookup ownership.
+
+        Args:
+            key: Chunk-aligned prefix range, including its request ID.
+            tp_size: Legacy protocol field retained for wire compatibility.
+        Raises:
+            ValueError: If the resolved reader count is invalid.
+            RuntimeError: If an owned reservation is missing during cleanup.
+        """
+        with self._lifecycle_lock if self._hybrid else nullcontext():
+            self._free_lookup_locks(key, tp_size)
+
+    def end_session(self, request_id: str) -> None:
+        """End demand and release unused lookup references, preserving DMA pins.
+
+        Args:
+            request_id: Unique request ID to retire, including an unpolled lookup.
+        Raises:
+            RuntimeError: If an owned reservation is missing during cleanup.
+                Protected resources must be retained after failed cleanup.
+        Notes:
+            Idempotent hybrid cleanup never releases another reader's share.
+            Submitted transfers own separate physical pins until their fences.
+        """
+        with self._lifecycle_lock if self._hybrid else nullcontext():
+            if self._hybrid:
+                self._ended_requests.add(request_id)
+                self._hybrid_requests.discard(request_id)
+                with self._prefetch_job_lock:
+                    self._prefetch_jobs.pop(request_id, None)
+            self._end_session(request_id)
 
     # -----------------------------------------------------------------
     # Handlers
     # -----------------------------------------------------------------
 
-    def lookup(
+    def query_prefetch_lookup_hits(
+        self,
+        request_id: str,
+    ) -> int | None:
+        """Query the number of hits for a prefetch request before it's finished.
+
+        Args:
+            request_id: The external request ID passed in the lookup key.
+
+        Returns:
+            The number of hits for the prefetched keys if the lookup phase is
+            done. None if the lookup phase is still in progress. 0 if the
+            request_id is unknown (already completed and consumed, or invalid).
+        """
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(request_id)
+
+        if job is None:
+            logger.warning(
+                "Prefetch job for request %s not found (already completed or invalid)",
+                request_id,
+            )
+            return 0
+
+        # Result is already in chunk-level units (l1_hit_chunks + l2_hit_chunks).
+        return self._ctx.storage_manager.query_prefetch_lookup_hits(job.handle)
+
+    def wait_prefetch_status(
+        self,
+        request_id: str,
+        timeout: float,
+    ) -> int | None:
+        """Block until a prefetch job completes, then return its chunk count.
+
+        Like query_prefetch_status, but waits for the daemon to publish the
+        result instead of returning None while the prefetch is still in
+        progress, so the caller does not have to busy-poll. The job entry is
+        removed once a non-None result is returned (exactly-once semantics).
+
+        Args:
+            request_id: The external request ID passed in the lookup key.
+            timeout: Maximum number of seconds to wait for the prefetch.
+
+        Returns:
+            Chunk count (int) when done, None if the wait timed out, 0 if the
+            request_id is unknown (already completed and consumed, or invalid).
+        """
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(request_id)
+        if job is None:
+            logger.warning(
+                "Prefetch job for request %s not found (already completed or invalid)",
+                request_id,
+            )
+            return 0
+
+        if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
+            return None
+        return self.query_prefetch_status(request_id)
+
+    # -----------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------
+
+    def _chunk_major_object_keys(
+        self,
+        key: IPCCacheServerKey,
+        chunk_hashes: list[bytes],
+    ) -> list[ObjectKey]:
+        """Resolve the flat object-key list across all object groups,
+        chunk-major.
+
+        The object-group count is read from the layout registry for
+        ``key``'s ``(model_name, world_size)``. The keys are ordered
+        ``chunk -> object group -> kv_rank`` so that all keys belonging to one
+        chunk are contiguous; a leading-ones prefix over the flat list then maps
+        directly to a whole-chunk hit count. Callers that need the full key set
+        regardless of order (lock release, touch) use this too.
+
+        Example (2 chunks ``c0,c1``; 2 groups ``g0,g1``; 2 kv_ranks ``r0,r1``)::
+
+            [c0g0r0, c0g0r1, c0g1r0, c0g1r1,   # chunk 0: all groups, all ranks
+             c1g0r0, c1g0r1, c1g1r0, c1g1r1]   # chunk 1: ...
+
+        Args:
+            key: The IPC key (model/world/worker, salt).
+            chunk_hashes: Chunk hashes to resolve keys for.
+
+        Returns:
+            The chunk-major flattened list of object keys across all groups.
+        """
+        num_groups = self._ctx.layout_desc_registry.find_attn_desc(
+            key.model_name, key.world_size
+        ).num_object_groups
+        per_group = ipc_key_to_object_keys(key, chunk_hashes, list(range(num_groups)))
+        if num_groups == 1:
+            return per_group[0]
+        # Each per-group list is chunk-major / rank-minor of length
+        # len(chunk_hashes) * num_ranks; recover num_ranks to slice per chunk.
+        num_ranks = len(per_group[0]) // len(chunk_hashes) if chunk_hashes else 0
+        obj_keys: list[ObjectKey] = []
+        for chunk_idx in range(len(chunk_hashes)):
+            lo = chunk_idx * num_ranks
+            hi = lo + num_ranks
+            for group_keys in per_group:
+                obj_keys.extend(group_keys[lo:hi])
+        return obj_keys
+
+    def _register_prefetch_job(self, job: _PrefetchJob) -> None:
+        with self._prefetch_job_lock:
+            self._prefetch_jobs[job.request_id] = job
+
+    def _active_prefetch_count(self) -> int:
+        """Return the number of active prefetch jobs (thread-safe)."""
+        with self._prefetch_job_lock:
+            return len(self._prefetch_jobs)
+
+    def _setup_metrics(self) -> None:
+        """Register OTel observable gauges for lookup module metrics."""
+        _gauge = partial(register_gauge, "lmcache.mp_server")
+        _gauge(
+            "lmcache_mp.active_prefetch_jobs",
+            "Number of active prefetch jobs",
+            self._active_prefetch_count,
+        )
+
+    def _lookup(
         self,
         key: IPCCacheServerKey,
         tp_size: int,
@@ -256,6 +470,8 @@ class LookupModule:
             model_name, world_size
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
+        if self._hybrid and session.hybrid_read_lease is not None:
+            session.hybrid_read_lease.close()
         session.set_tokens(list(key.token_ids))
         session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
@@ -299,6 +515,29 @@ class LookupModule:
             ),
             external_request_id=key.request_id,
         )
+        if self._hybrid:
+            session.hybrid_read_lease = self._ctx.storage_manager.create_read_lease(
+                [obj_keys[index] for index in handle.l1_found_indices], num_kv_readers
+            )
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.HYBRID_LOOKUP_LEASE,
+                    session_id=key.request_id,
+                    metadata={
+                        "phase": "reserved",
+                        "observed_ns": time.monotonic_ns(),
+                        "logical_references": (
+                            session.hybrid_read_lease.reservation_count()
+                        ),
+                        "keys": [obj_keys[index] for index in handle.l1_found_indices],
+                    },
+                )
+            )
+            memory = self._ctx.storage_manager.hybrid_memory
+            assert memory is not None
+            if handle.l1_found_indices and memory.config.diagnostic_lookup_delay_s:
+                # Explicit diagnostic hook; disabled in every service comparison.
+                time.sleep(memory.config.diagnostic_lookup_delay_s)
         self._register_prefetch_job(
             _PrefetchJob(
                 handle=handle,
@@ -312,34 +551,7 @@ class LookupModule:
             )
         )
 
-    def query_prefetch_lookup_hits(
-        self,
-        request_id: str,
-    ) -> int | None:
-        """Query the number of hits for a prefetch request before it's finished.
-
-        Args:
-            request_id: The external request ID passed in the lookup key.
-
-        Returns:
-            The number of hits for the prefetched keys if the lookup phase is
-            done. None if the lookup phase is still in progress. 0 if the
-            request_id is unknown (already completed and consumed, or invalid).
-        """
-        with self._prefetch_job_lock:
-            job = self._prefetch_jobs.get(request_id)
-
-        if job is None:
-            logger.warning(
-                "Prefetch job for request %s not found (already completed or invalid)",
-                request_id,
-            )
-            return 0
-
-        # Result is already in chunk-level units (l1_hit_chunks + l2_hit_chunks).
-        return self._ctx.storage_manager.query_prefetch_lookup_hits(job.handle)
-
-    def query_prefetch_status(
+    def _query_prefetch_status(
         self,
         request_id: str,
     ) -> int | None:
@@ -426,40 +638,7 @@ class LookupModule:
 
         return found_count
 
-    def wait_prefetch_status(
-        self,
-        request_id: str,
-        timeout: float,
-    ) -> int | None:
-        """Block until a prefetch job completes, then return its chunk count.
-
-        Like query_prefetch_status, but waits for the daemon to publish the
-        result instead of returning None while the prefetch is still in
-        progress, so the caller does not have to busy-poll. The job entry is
-        removed once a non-None result is returned (exactly-once semantics).
-
-        Args:
-            request_id: The external request ID passed in the lookup key.
-            timeout: Maximum number of seconds to wait for the prefetch.
-
-        Returns:
-            Chunk count (int) when done, None if the wait timed out, 0 if the
-            request_id is unknown (already completed and consumed, or invalid).
-        """
-        with self._prefetch_job_lock:
-            job = self._prefetch_jobs.get(request_id)
-        if job is None:
-            logger.warning(
-                "Prefetch job for request %s not found (already completed or invalid)",
-                request_id,
-            )
-            return 0
-
-        if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
-            return None
-        return self.query_prefetch_status(request_id)
-
-    def free_lookup_locks(
+    def _free_lookup_locks(
         self,
         key: IPCCacheServerKey,
         tp_size: int,
@@ -481,6 +660,19 @@ class LookupModule:
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
         if key.start >= key.end:
+            return
+
+        if self._hybrid:
+            session = self._ctx.session_manager.get(key.request_id)
+            if session is None or session.hybrid_read_lease is None:
+                return
+            obj_keys = resolve_prefetched_obj_keys(
+                self._ctx,
+                key,
+                session.prefetch_hit_chunks,
+                session.prefetch_locked_gids,
+            )
+            session.hybrid_read_lease.release(obj_keys, key.require_num_kv_readers())
             return
 
         hit_chunks = self._ctx.session_manager.get_or_create(
@@ -508,7 +700,7 @@ class LookupModule:
             obj_keys, read_locks=key.require_num_kv_readers()
         )
 
-    def end_session(self, request_id: str) -> None:
+    def _end_session(self, request_id: str) -> None:
         """Remove the session for a finished request.
 
         Args:
@@ -530,6 +722,20 @@ class LookupModule:
         if session is None:
             logger.warning("Session %s not found, skipping touch", request_id)
             return
+        if self._hybrid and session.hybrid_read_lease is not None:
+            references = session.hybrid_read_lease.reservation_count()
+            session.hybrid_read_lease.close()
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.HYBRID_LOOKUP_LEASE,
+                    session_id=request_id,
+                    metadata={
+                        "phase": "released",
+                        "observed_ns": time.monotonic_ns(),
+                        "logical_references_released": references,
+                    },
+                )
+            )
         if session.lookup_ipc_key is None:
             logger.warning(
                 "Session %s has no lookup ipc key, skipping touch",
@@ -544,69 +750,3 @@ class LookupModule:
         #  and will be deleted after finish_read_prefetched, when we touch all keys,
         #  these keys has been deleted and will not be touched.
         self._ctx.storage_manager.touch_l1_keys(obj_keys)
-
-    # -----------------------------------------------------------------
-    # Internal helpers
-    # -----------------------------------------------------------------
-
-    def _chunk_major_object_keys(
-        self,
-        key: IPCCacheServerKey,
-        chunk_hashes: list[bytes],
-    ) -> list[ObjectKey]:
-        """Resolve the flat object-key list across all object groups,
-        chunk-major.
-
-        The object-group count is read from the layout registry for
-        ``key``'s ``(model_name, world_size)``. The keys are ordered
-        ``chunk -> object group -> kv_rank`` so that all keys belonging to one
-        chunk are contiguous; a leading-ones prefix over the flat list then maps
-        directly to a whole-chunk hit count. Callers that need the full key set
-        regardless of order (lock release, touch) use this too.
-
-        Example (2 chunks ``c0,c1``; 2 groups ``g0,g1``; 2 kv_ranks ``r0,r1``)::
-
-            [c0g0r0, c0g0r1, c0g1r0, c0g1r1,   # chunk 0: all groups, all ranks
-             c1g0r0, c1g0r1, c1g1r0, c1g1r1]   # chunk 1: ...
-
-        Args:
-            key: The IPC key (model/world/worker, salt).
-            chunk_hashes: Chunk hashes to resolve keys for.
-
-        Returns:
-            The chunk-major flattened list of object keys across all groups.
-        """
-        num_groups = self._ctx.layout_desc_registry.find_attn_desc(
-            key.model_name, key.world_size
-        ).num_object_groups
-        per_group = ipc_key_to_object_keys(key, chunk_hashes, list(range(num_groups)))
-        if num_groups == 1:
-            return per_group[0]
-        # Each per-group list is chunk-major / rank-minor of length
-        # len(chunk_hashes) * num_ranks; recover num_ranks to slice per chunk.
-        num_ranks = len(per_group[0]) // len(chunk_hashes) if chunk_hashes else 0
-        obj_keys: list[ObjectKey] = []
-        for chunk_idx in range(len(chunk_hashes)):
-            lo = chunk_idx * num_ranks
-            hi = lo + num_ranks
-            for group_keys in per_group:
-                obj_keys.extend(group_keys[lo:hi])
-        return obj_keys
-
-    def _register_prefetch_job(self, job: _PrefetchJob) -> None:
-        with self._prefetch_job_lock:
-            self._prefetch_jobs[job.request_id] = job
-
-    def _active_prefetch_count(self) -> int:
-        """Return the number of active prefetch jobs (thread-safe)."""
-        with self._prefetch_job_lock:
-            return len(self._prefetch_jobs)
-
-    def _setup_metrics(self) -> None:
-        """Register OTel observable gauges for lookup module metrics."""
-        _gauge = partial(register_gauge, "lmcache.mp_server")
-        _gauge(
-            "lmcache_mp.active_prefetch_jobs",
-            "Number of active prefetch jobs",
-            self._active_prefetch_count,
-        )

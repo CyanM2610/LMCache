@@ -60,6 +60,9 @@ class ObservabilityConfig:
     """Fraction of chunks/blocks to track for lifecycle histograms (0, 1.0].
     Counters always count all events regardless of this setting."""
 
+    event_jsonl: str | None = None
+    """Opt-in raw event JSONL path; existing files are never overwritten."""
+
     lookup_hash_log: LookupHashLogConfig = field(default_factory=LookupHashLogConfig)
     """Configuration for lookup hash file logging.  Disabled by default
     (empty ``output_dir``)."""
@@ -158,6 +161,11 @@ def add_observability_args(
             "Maximum number of events in the EventBus queue before "
             "tail-drop. Default is 10000."
         ),
+    )
+    group.add_argument(
+        "--event-jsonl",
+        default=None,
+        help="Write raw events and loss counters to a new JSONL file (diagnostic).",
     )
     group.add_argument(
         "--prometheus-port",
@@ -307,6 +315,7 @@ def parse_args_to_observability_config(
         otlp_endpoint=args.otlp_endpoint,
         prometheus_port=args.prometheus_port,
         metrics_sample_rate=args.metrics_sample_rate,
+        event_jsonl=getattr(args, "event_jsonl", None),
         lookup_hash_log=LookupHashLogConfig(
             output_dir=args.lookup_hash_log_dir,
             rotation_interval_sec=args.lookup_hash_log_rotation_interval,
@@ -399,6 +408,14 @@ def init_observability(
             max_queue_size=obs_config.max_queue_size,
         )
     )
+
+    if obs_config.event_jsonl:
+        if not obs_config.enabled:
+            raise ValueError("event-jsonl requires observability to be enabled")
+        # First Party
+        from lmcache.v1.mp_observability.subscribers.jsonl import JsonlSubscriber
+
+        bus.register_subscriber(JsonlSubscriber(obs_config.event_jsonl, bus))
 
     if obs_config.metrics_enabled or obs_config.tracing_enabled:
         # First Party

@@ -31,6 +31,7 @@ from lmcache.v1.distributed.config import (
     get_configured_capacity_bytes,
 )
 from lmcache.v1.distributed.error import L1Error, strerror
+from lmcache.v1.distributed.hybrid_read_lease import HybridReadLease
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
@@ -75,6 +76,7 @@ logger = init_logger(__name__)
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
         self._l1_manager = L1Manager(config.l1_manager_config)
+        self.hybrid_memory = self._l1_manager.hybrid_memory
         # Retained for the L1 half of the capacity report; L1's configured
         # size is a pure function of it.
         self._l1_config = config.l1_manager_config
@@ -235,6 +237,20 @@ class StorageManager:
 
         return result
 
+    def abort_write(self, keys: list[ObjectKey]) -> None:
+        """Release failed STORE reservations after all submitted copies drain.
+
+        Args:
+            keys: Unpublished keys owned by the failed operation.
+        """
+        result = self._l1_manager.abort_write(keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_WRITE_ABORTED,
+                metadata={"keys": keys, "results": [result[k].value for k in keys]},
+            )
+        )
+
     @enable_tracing()
     def finish_write(
         self,
@@ -265,6 +281,9 @@ class StorageManager:
     def read_prefetched_results(
         self,
         keys: list[ObjectKey],
+        *,
+        release_on_error: bool = True,
+        read_lease: HybridReadLease | None = None,
     ) -> Iterator[list[MemoryObj] | None]:
         """
         Read the memory objects from L1 storage that has been prefetched beforehand.
@@ -273,6 +292,11 @@ class StorageManager:
 
         Args:
             keys (list[ObjectKey]): List of object keys to reserve for reading.
+            release_on_error: False transfers error-path lock cleanup to a
+                caller that drains already-submitted DMA asynchronously.
+            read_lease: Required in hybrid mode. Successful reads exchange this
+                lookup's reservation for a physical pin; cancellation cannot
+                release a different lookup's readers or submitted copy's pin.
 
         Returns:
             Iterator[list[MemoryObj] | None]: An iterator yielding an optional list of
@@ -298,7 +322,15 @@ class StorageManager:
                 "StorageManager.read_prefetched_results.__enter__",
                 {"keys": keys},
             )
-        read_results = self._l1_manager.unsafe_read(keys)
+        hybrid = self.hybrid_memory is not None
+        if hybrid:
+            read_results = (
+                read_lease.acquire_transfer(keys)
+                if read_lease is not None
+                else {key: (L1Error.KEY_NOT_READABLE, None) for key in keys}
+            )
+        else:
+            read_results = self._l1_manager.unsafe_read(keys)
         good_keys: list[ObjectKey] = []
         good_objs: list[MemoryObj] = []
         bad_keys: list[ObjectKey] = []
@@ -362,8 +394,11 @@ class StorageManager:
         finally:
             # Decrease the read lock for all successfully read memory objects
             # if None is yielded or exception occurs during caller's processing
-            if not all_good or not successfully_yielded:
-                self._l1_manager.finish_read(good_keys)
+            if not all_good or (not successfully_yielded and release_on_error):
+                if hybrid:
+                    self._l1_manager.release_transfer(good_keys)
+                else:
+                    self._l1_manager.finish_read(good_keys)
                 self._event_bus.publish(
                     Event(
                         event_type=EventType.SM_READ_PREFETCHED_FINISHED,
@@ -379,6 +414,35 @@ class StorageManager:
                     "StorageManager.read_prefetched_results.__exit__",
                     {"keys": keys},
                 )
+
+    def release_transfer(self, keys: list[ObjectKey]) -> None:
+        """Release physical pins after actual device/model completion.
+
+        Args:
+            keys: Exactly one successful acquire_transfer reservation per key.
+        Raises:
+            RuntimeError: If a key is absent or no matching pin remains.
+        Notes:
+            This does not release lookup references; the read lease consumes
+            those when it acquires the physical pins. Never call before DMA drain.
+        """
+        self._l1_manager.release_transfer(keys)
+
+    def create_read_lease(self, keys: list[ObjectKey], readers: int) -> HybridReadLease:
+        """Adopt an existing hybrid lookup's successful retained read references.
+
+        Args:
+            keys: Exact retained keys from the completed L1 prefetch handle.
+            readers: Reserved readers per key; normally num_kv_readers.
+        Returns:
+            An owner that must be closed on request end, including cancellation.
+        Raises:
+            RuntimeError: If this storage manager is not hybrid.
+            ValueError: If readers is not positive.
+        """
+        if self.hybrid_memory is None:
+            raise RuntimeError("explicit lookup leases require hybrid storage")
+        return HybridReadLease(self._l1_manager, keys, readers)
 
     @enable_tracing()
     def finish_read_prefetched(

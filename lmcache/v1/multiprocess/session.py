@@ -13,6 +13,7 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.hybrid_read_lease import HybridReadLease
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.periodic_thread import (
@@ -46,6 +47,7 @@ class Session:
     prefetch_locked_gids: tuple = ()
     prefetch_group_windows: tuple[int, ...] = ()
     extras: dict[str, Any] = field(default_factory=dict)
+    hybrid_read_lease: HybridReadLease | None = field(default=None, repr=False)
     _lookup_generation: int = field(default=0, repr=False)
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
         default_factory=set, repr=False
