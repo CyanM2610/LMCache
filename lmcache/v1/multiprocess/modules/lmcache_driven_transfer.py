@@ -992,6 +992,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         if not entries:
             return
+        # Passive diagnostic: weak references cannot extend IPC ownership.
+        import weakref
+        ipc_release_refs = [
+            (id(e.cache_context), weakref.ref(e.cache_context),
+             tuple(weakref.ref(t) for t in e.cache_context.kv_caches_))
+            for e in entries
+        ]
         for entry in entries:
             if self._hybrid_completion is not None:
                 self._hybrid_completion.drain_context(entry.cache_context)
@@ -1001,6 +1008,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
         del entry
         entries.clear()
+        for identity, context_ref, tensor_refs in ipc_release_refs:
+            logger.info(
+                "IPC_RELEASE_PROBE context_id=%d context_alive=%d "
+                "imported_tensor_count=%d imported_tensors_alive=%d "
+                "phase=after_native_context_close_before_unregister_ack",
+                identity, int(context_ref() is not None), len(tensor_refs),
+                sum(ref() is not None for ref in tensor_refs),
+            )
         # ipc_collect() only unmaps a CUDA-IPC-imported segment once its last
         # tensor reference is gone (LMCache#4014), hence the clear() above.
         torch_dev.empty_cache()
