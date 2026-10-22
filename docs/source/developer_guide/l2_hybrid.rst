@@ -127,3 +127,26 @@ completed native phase samples without enabling heavy tracing or metrics.
 correlation, independent byte checks and OFF/ON overhead. See
 ``PROFILING_CANARIES.md`` for the measured small-shape coverage and overhead;
 these are instrument-validation/training data, not a new blind heldout.
+
+Pending fences and longer training inputs
+-----------------------------------------
+
+``probe_pending_fence.py`` deliberately holds a real CUDA copy behind a device
+semaphore. It verifies END/cancellation with an incomplete fence, protected
+registered source/destination buffers, and both CUDA-first and model-cancel-first
+completion ordering. This is an explicit fault-injection state-machine test,
+not a claim of active copy-engine occupancy or a performance sample.
+
+``generate_context_training.py`` creates independent complete synthetic 1K, 4K,
+8K and 16K prompts, with one/two-request cohorts and first/repeated shape labels.
+Use the frozen plan with ``run_service.py --max-model-len 32768`` and explicit
+``--num-gpu-blocks 2560 --max-num-batched-tokens 1024 --max-num-seqs 2``. Both
+OFF and ON retain the light scheduler observer; ON adds ``--worker-timing``.
+Resolved scheduler limits, actual batches and nonzero root arrivals are audited.
+
+The timing adapter correlates the existing native output-copy completion event
+and delegates native future consumption. Readiness observations and the inclusive
+host consumption envelope do not measure output DMA duration or CPU-active time.
+No new stream wait is added. Inputs beyond the model's position limit require a
+separate explicit model/position decision and independent numerical validation;
+the D2 YaRN candidate is preparation only and is not activated by these runners.

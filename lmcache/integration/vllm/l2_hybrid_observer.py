@@ -97,6 +97,21 @@ class ObservedAsyncScheduler(AsyncScheduler):
         self.observation_step = 0
         self.observation_batches: dict[int, int] = {}
         self.observation_last_state: dict[str, Any] = {}
+        self.observation.emit(
+            "effective_config",
+            async_scheduling=self.scheduler_config.async_scheduling,
+            max_concurrent_batches=self.vllm_config.max_concurrent_batches,
+            max_in_flight_tokens=self.vllm_config.max_in_flight_tokens,
+            use_v2_model_runner=self.vllm_config.use_v2_model_runner,
+            pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            effective_max_scheduled_tokens=self.max_num_scheduled_tokens,
+            max_model_len=self.max_model_len,
+            num_gpu_blocks=self.kv_cache_manager.block_pool.num_gpu_blocks,
+            block_size=self.cache_config.block_size,
+            enforce_eager=self.vllm_config.model_config.enforce_eager,
+        )
 
     def add_request(self, request: Request) -> None:
         """Record actual core enqueue around the inherited enqueue operation."""

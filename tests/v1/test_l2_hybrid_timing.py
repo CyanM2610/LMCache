@@ -77,3 +77,89 @@ def test_timing_preserves_outputs_and_correlates_repeated_steps(
     assert all(r["cuda_elapsed_ms"] == 1.25 for r in cuda)
     assert rows[-1]["dropped"] == 0 and rows[-1]["error"] is None
     assert next(r for r in rows if r["event"] == "timing_drain")["pending"] == 0
+
+
+def test_native_copy_fence_and_future_consumption_are_correlated(
+    tmp_path: Path,
+) -> None:
+    """Ready copy events do not imply native Futures were already consumed."""
+    # Third Party
+    from vllm.v1.executor.uniproc_executor import AsyncOutputFuture
+
+    ready = [False]
+    calls = []
+    expected = object()
+
+    def get_output() -> Any:
+        calls.append("native")
+        ready[0] = True
+        return expected
+
+    native: Any = SimpleNamespace(
+        copy_event=SimpleNamespace(cuda_event=123, query=lambda: ready[0]),
+        get_output=get_output,
+    )
+    sink = timing.TraceSink(tmp_path / "output.jsonl")
+    output = timing.ObservedAsyncOutput(native, sink, {"worker_step_id": 7}, 456)
+    future = AsyncOutputFuture(output, single_value=True)
+    assert not future.done()
+    assert future.result() is expected
+    assert future.result() is expected
+    assert calls == ["native"]
+    sink.close()
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "output.jsonl").read_text().splitlines()
+    ]
+    handoff = next(r for r in records if r["event"] == "async_output_handoff")
+    consumed = next(r for r in records if r["event"] == "async_output_consumed")
+    assert handoff["copy_event_id"] == consumed["copy_event_id"] == 123
+    assert consumed["worker_step_id"] == 7 and consumed["copy_stream_id"] == 456
+    assert consumed["copy_fence_ready_at_entry"] is False
+    assert consumed["copy_fence_ready_at_return"] is True and consumed["error"] is None
+    assert handoff["output_copy_cuda_ms"] is None
+
+
+@pytest.mark.parametrize("native_fails", [False, True])
+def test_copy_observation_errors_preserve_native_result_or_exception(
+    tmp_path: Path, native_fails: bool
+) -> None:
+    """Handoff/entry/return diagnostic failures never replace native consumption."""
+    calls = []
+    expected = object()
+    native_error = ValueError("native output failure")
+
+    def broken_query() -> bool:
+        raise RuntimeError("diagnostic CUDA query failure")
+
+    def get_output() -> Any:
+        calls.append("native")
+        if native_fails:
+            raise native_error
+        return expected
+
+    native: Any = SimpleNamespace(
+        copy_event=SimpleNamespace(cuda_event=123, query=broken_query),
+        get_output=get_output,
+    )
+    sink = timing.TraceSink(tmp_path / "failed-query.jsonl")
+    output = timing.ObservedAsyncOutput(native, sink, {"worker_step_id": 9}, 456)
+    try:
+        if native_fails:
+            with pytest.raises(ValueError) as raised:
+                output.get_output()
+            assert raised.value is native_error
+        else:
+            assert output.get_output() is expected
+    finally:
+        sink.close()
+    assert calls == ["native"]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "failed-query.jsonl").read_text().splitlines()
+    ]
+    consumed = next(r for r in records if r["event"] == "async_output_consumed")
+    assert consumed["copy_fence_ready_at_entry"] is None
+    assert consumed["copy_fence_ready_at_return"] is None
+    assert "diagnostic CUDA query failure" in consumed["copy_fence_entry_query_error"]
+    assert "diagnostic CUDA query failure" in consumed["copy_fence_return_query_error"]
