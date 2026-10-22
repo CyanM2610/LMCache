@@ -2300,6 +2300,11 @@ def lmcache_memcpy_async(
     libcudart = _get_copy_lib()
     if libcudart is not None and hasattr(libcudart, "cudaMemcpy"):
         try:
+            # cudaMemcpy uses the default stream, which does not wait for
+            # PyTorch's nonblocking streams. Preserve producer/consumer order
+            # before using this deliberately synchronous fallback. The caller
+            # selects the device and stream that own the GPU staging buffer.
+            torch.cuda.current_stream().synchronize()
             # Synchronous cudaMemcpy handles cross-cudaHostRegister boundaries
             # internally — no manual alignment splitting needed.
             ret = libcudart.cudaMemcpy(

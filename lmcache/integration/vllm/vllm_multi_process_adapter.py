@@ -1687,8 +1687,11 @@ class LMCacheMPSchedulerAdapter:
         request_type: RequestType,
         payloads: list[Any],
     ) -> bool:
-        if not self._hotprefix_enabled or not self.is_healthy:
+        cleanup = request_type is RequestType.HOT_PREFIX_ABORT
+        if not self._hotprefix_enabled or (not self.is_healthy and not cleanup):
             return False
+        # Compensating cleanup must still reach every server after a timeout.
+        all_succeeded = True
         observe_control = self._hotprefix_observability_enabled
         started_ns = time.monotonic_ns() if observe_control else 0
         method = request_type.name.removeprefix("HOT_PREFIX_").lower()
@@ -1710,13 +1713,23 @@ class LMCacheMPSchedulerAdapter:
                 self._record_hotprefix_control(
                     method, "timeout", started_ns, request_bytes
                 )
+                if cleanup:
+                    all_succeeded = False
+                    continue
                 return False
             if response is not True:
-                self._health_events[url].clear()
+                # A negative domain reply completed the RPC successfully.
+                # Keep transport health so failed publication can immediately
+                # issue its compensating ABORT instead of leaking a reserve.
                 self._record_hotprefix_control(
                     method, "failure", started_ns, request_bytes
                 )
+                if cleanup:
+                    all_succeeded = False
+                    continue
                 return False
+        if not all_succeeded:
+            return False
         self._record_hotprefix_control(
             method,
             "success",
