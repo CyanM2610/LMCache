@@ -987,6 +987,7 @@ class LMCacheMPSchedulerAdapter:
                     return 0
                 # Acknowledgement still in flight; poll again next step.
                 return None
+            wait_emit("lookup_ack_observed", request_id)
             del self._unacked_lookups[request_id]
 
         # Persistent accumulator for this request. A server present in
@@ -1885,9 +1886,14 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
-        wait_emit("restore_trigger", request_id,
-                  start_token=op.start, end_token=op.end,
-                  skip_tokens=op.skip_first_n_tokens, block_ids=op.block_ids)
+        wait_emit(
+            "restore_trigger",
+            request_id,
+            start_token=op.start,
+            end_token=op.end,
+            skip_tokens=op.skip_first_n_tokens,
+            block_ids=op.block_ids,
+        )
         with wait_span("target_store_fence", request_id):
             self.wait_for_kv_access({}, dict(enumerate(op.block_ids)))
         wait_emit("restore_submit", request_id)
@@ -2124,9 +2130,11 @@ class LMCacheMPWorkerAdapter:
                 )
 
         for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
+            wait_emit("worker_restore_poll", request_id)
             if not r_future.query():
                 continue
 
+            wait_emit("worker_restore_observed", request_id)
             r_result = r_future.result(timeout=60)
             terminal = request_id in self._finished_during_receive or (
                 not r_result and self.kv_load_failure_policy == "fail"
@@ -2167,7 +2175,9 @@ class LMCacheMPWorkerAdapter:
         finished_retrieves.update(dropped)
         failed_retrieves.update(dropped)
         for wait_rid in finished_retrieves:
-            wait_emit("worker_recv_ready", wait_rid, failed=wait_rid in failed_retrieves)
+            wait_emit(
+                "worker_recv_ready", wait_rid, failed=wait_rid in failed_retrieves
+            )
         self._record_receive_releases(finished_retrieves, failed_retrieves)
 
         # Update the internal states

@@ -9,6 +9,13 @@ import inspect
 import itertools
 import queue
 import threading
+import time
+
+from lmcache.integration.kv_wait_probe.control_rpc import (
+    client_event as control_client,
+    fingerprint as control_fingerprint,
+    server_event as control_server,
+)
 
 # Third Party
 import msgspec
@@ -332,6 +339,14 @@ class MessageQueueClient:
                             strict=False,
                         )
                     ]
+                    control_client(
+                        "rpc_client_send",
+                        id(self),
+                        request_uid,
+                        wrapped_request.request_type,
+                        wrapped_request.request_payloads,
+                        payload_fingerprint=control_fingerprint(b_payloads),
+                    )
                     self.pending_futures[request_uid] = wrapped_request.future
                     self.socket.send_multipart(
                         [b_request_uid, b_request_type] + b_payloads
@@ -350,6 +365,7 @@ class MessageQueueClient:
         exclusively accessed from the loop thread.
         """
         msg = self.socket.recv_multipart()
+        control_received_ns = time.monotonic_ns()
         if len(msg) < 2:
             logger.error(
                 "Malformed response: expected at least 2 message parts "
@@ -364,11 +380,22 @@ class MessageQueueClient:
 
         if request_uid in self.pending_futures:
             future = self.pending_futures.pop(request_uid)
+            control_publish_before_ns = time.monotonic_ns()
             if b_response:
                 response = msgspec_decode(b_response[0], cls=response_cls)
                 future.set_result(response)
             else:
                 future.set_result(None)
+            control_client(
+                "rpc_client_reply",
+                id(self),
+                request_uid,
+                request_type,
+                received_ns=control_received_ns,
+                publish_before_ns=control_publish_before_ns,
+                publish_after_ns=time.monotonic_ns(),
+                result_is_none=not b_response or response is None,
+            )
 
     def submit_request(
         self,
@@ -389,6 +416,9 @@ class MessageQueueClient:
         """
         future: MessagingFuture[T] = MessagingFuture()
         request_uid = next(self._request_counter)
+        control_client(
+            "rpc_client_queued", id(self), request_uid, request_type, request_payloads
+        )
         self.input_queue.put(
             MessageQueueClient.WrappedRequest(
                 request_uid=request_uid,
@@ -551,6 +581,10 @@ class MessageQueueServer:
         response = handler_entry(payloads)
         response_cls = handler_entry.get_response_class()
         b_response = msgspec_encode(response, cls=response_cls)
+        control_server(
+            "rpc_server_reply_ready", prefix_frames, result_is_none=response is None
+        )
+        control_server("rpc_server_send", prefix_frames)
         if response is not None:
             self.socket.send_multipart(prefix_frames + [b_response])
         else:
@@ -591,6 +625,11 @@ class MessageQueueServer:
                     else prefix_frames
                 )
 
+                control_server(
+                    "rpc_server_reply_ready",
+                    prefix_frames,
+                    result_is_none=response is None,
+                )
                 self.output_queue.put(frames_to_send)
                 self._output_efd.notify()
 
@@ -633,6 +672,11 @@ class MessageQueueServer:
                 )
 
                 identity, b_request_uid, b_request_type, *payloads = msg
+                control_server(
+                    "rpc_server_received",
+                    msg[:3],
+                    payload_fingerprint=control_fingerprint(payloads),
+                )
                 request_type = msgspec_decode(b_request_type, cls=RequestType)
 
                 if handler_entry := self.handlers.get(request_type):
@@ -658,6 +702,7 @@ class MessageQueueServer:
                 # Process the output tasks
                 try:
                     while frames_to_send := self.output_queue.get_nowait():
+                        control_server("rpc_server_send", frames_to_send[:3])
                         self.socket.send_multipart(frames_to_send)
                 except queue.Empty:
                     pass

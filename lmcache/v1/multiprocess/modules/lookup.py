@@ -11,6 +11,7 @@ import uuid
 
 # First Party
 from lmcache.logging import init_logger
+from vllm.v1.kv_wait_trace import emit as wait_emit
 from lmcache.v1.distributed.api import (
     DEFAULT_ATTN_WINDOW_DESC,
     AttnWindowDesc,
@@ -230,7 +231,9 @@ class LookupModule:
                 if self._closing or key.request_id in self._ended_requests:
                     return
                 self._hybrid_requests.add(key.request_id)
+            wait_emit("lookup_server_work_begin", key.request_id)
             self._lookup(key, tp_size)
+            wait_emit("lookup_server_work_end", key.request_id)
 
     def query_prefetch_status(self, request_id: str) -> int | None:
         """Consume lookup status without recreating a cancelled hybrid session.
@@ -243,7 +246,10 @@ class LookupModule:
         with self._lifecycle_lock if self._hybrid else nullcontext():
             if self._hybrid and request_id in self._ended_requests:
                 return 0
-            return self._query_prefetch_status(request_id)
+            wait_emit("lookup_status_work_begin", request_id)
+            result = self._query_prefetch_status(request_id)
+            wait_emit("lookup_server_result_ready", request_id, hit_chunks=result)
+            return result
 
     def free_lookup_locks(self, key: IPCCacheServerKey, tp_size: int) -> None:
         """Release only this request's unused prefix lookup ownership.
@@ -393,6 +399,13 @@ class LookupModule:
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:
             self._prefetch_jobs[job.request_id] = job
+        if job.handle.prefetch_request_id == -1:
+            wait_emit(
+                "lookup_server_data_ready",
+                job.request_id,
+                scope="L1 bitmap fixed; no asynchronous L2 work",
+                l1_hit_chunks=job.handle.l1_hit_chunks,
+            )
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""

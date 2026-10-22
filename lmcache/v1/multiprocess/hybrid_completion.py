@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 import threading
 import time
+from vllm.v1.kv_wait_trace import emit as wait_emit
 
 # First Party
 from lmcache import torch_dev
@@ -368,6 +369,13 @@ class HybridCompletionLoop:
                             "reply_ready_ns": time.monotonic_ns(),
                         },
                     )
+                    if any(a.metadata.get("direction") == "load" for a in job.accesses):
+                        wait_emit(
+                            "restore_terminal_ready",
+                            job.transfer_key.rsplit("#", 1)[0],
+                            transfer_key=job.transfer_key,
+                            success=job.success,
+                        )
                     job.future.set_result(response)
                 except Exception as error:
                     # Finalizer bugs must remain visible; never report success.
