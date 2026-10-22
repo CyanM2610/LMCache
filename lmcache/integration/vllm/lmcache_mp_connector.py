@@ -1241,6 +1241,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return None, True
 
         if ret == 0:
+            if commit_match:
+                # A lower-cache miss can still reuse an HBM prefix. STORE
+                # progress must include it; read-only preparation must not
+                # commit this boundary before native admission.
+                tracker.num_vllm_hit_tokens = (
+                    num_computed_tokens
+                    // self._hit_alignment_tokens
+                    * self._hit_alignment_tokens
+                )
             return 0, False
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
