@@ -194,6 +194,28 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         self.event_ = event
         self._raw_response_processed = True
 
+    def observation_state(self) -> dict[str, Any]:
+        """Read existing completion state without consuming/importing a reply.
+
+        Returns:
+            Raw-message readiness and an optional query of an already imported
+            completion event. None means no event has been imported; it is not
+            proof of GPU completion. No result, wait or synchronize is called.
+        Raises:
+            Exception: Existing event backend query failures propagate; diagnostic
+                callers must retain them without changing the native result path.
+        """
+        return dict(
+            raw_message_ready=self.raw_future_.query(),
+            response_processed=self._raw_response_processed,
+            imported_event_ready=(
+                self._event_backend.query_event(self.event_)
+                if self.event_ is not None
+                else None
+            ),
+            result=self.result_ if self._raw_response_processed else None,
+        )
+
     def wait(self, timeout: Optional[float] = None) -> bool:
         """
         Wait for the future to be done, ordered through the device event.

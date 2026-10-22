@@ -97,6 +97,12 @@ class ObservedAsyncScheduler(AsyncScheduler):
         self.observation_step = 0
         self.observation_batches: dict[int, int] = {}
         self.observation_last_state: dict[str, Any] = {}
+        self.retirement_recorder = None
+        if os.environ.get("L2_HYBRID_RETIREMENT_WITNESS") == "1":
+            # First Party
+            from lmcache.integration.vllm.retirement_witness import RetirementRecorder
+
+            self.retirement_recorder = RetirementRecorder(self, directory)
         self.observation.emit(
             "effective_config",
             async_scheduling=self.scheduler_config.async_scheduling,
@@ -234,11 +240,27 @@ class ObservedAsyncScheduler(AsyncScheduler):
 
     def shutdown(self) -> None:
         """Drain native connectors, then persist the observation footer."""
+        failure = None
+        errors = []
         try:
             super().shutdown()
+        except BaseException as error:
+            failure = error
         finally:
-            self._observe_state()
-            self.observation.close()
+            operations = [self._observe_state, self.observation.close]
+            if self.retirement_recorder is not None:
+                operations.append(self.retirement_recorder.close)
+            for operation in operations:
+                try:
+                    operation()
+                except Exception as error:
+                    errors.append(repr(error))
+        if failure is not None:
+            if errors:
+                failure.add_note("observer cleanup: " + repr(errors))
+            raise failure
+        if errors:
+            raise RuntimeError("scheduler observer cleanup failed: " + repr(errors))
 
     def _observe_state(self) -> None:
         pool = self.kv_cache_manager.block_pool

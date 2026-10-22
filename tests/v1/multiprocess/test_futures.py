@@ -808,6 +808,33 @@ def test_device_future_checks_backend_support_during_initialization(
         )
 
 
+def test_device_future_observation_does_not_consume_or_import_reply() -> None:
+    """A ready raw message is inspectable without a result/wait/event import."""
+    # Standard
+    from types import SimpleNamespace
+    from typing import Any
+
+    # First Party
+    from lmcache.v1.multiprocess.futures import DeviceMessagingFuture
+
+    def forbidden(*args: object) -> None:
+        raise AssertionError("observation must not consume, import, or wait")
+
+    raw: Any = SimpleNamespace(query=lambda: True, result=forbidden, wait=forbidden)
+    backend = SimpleNamespace(import_event=forbidden, synchronize_event=forbidden)
+    future: DeviceMessagingFuture[int] = DeviceMessagingFuture(
+        raw,
+        device="cpu",
+        event_backend=backend,  # type: ignore[arg-type]
+    )
+    assert future.observation_state() == dict(
+        raw_message_ready=True,
+        response_processed=False,
+        imported_event_ready=None,
+        result=None,
+    )
+
+
 def test_device_future_reuses_prevalidated_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

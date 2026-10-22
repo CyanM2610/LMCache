@@ -424,3 +424,91 @@ def test_model_dispatch_hooks_preserve_results_and_failures() -> None:
     observation.close()
     assert model(value) is value
     assert model.calls == 3
+
+
+def test_retirement_observation_failure_preserves_native_call() -> None:
+    """A failed witness callback cannot consume an iterator or change outcomes."""
+    # Third Party
+    from vllm.v1.core.retirement_observation import (
+        retirement_call,
+        retirement_errors,
+        set_retirement_observer,
+    )
+
+    calls = []
+
+    def broken_observer(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("observer failure")
+
+    @retirement_call("test")
+    def native(owner: Any, value: Any) -> Any:
+        calls.append(owner)
+        if isinstance(value, Exception):
+            raise value
+        return list(value)
+
+    set_retirement_observer(broken_observer)
+    try:
+        assert native("first", iter([1, 2])) == [1, 2]
+        failure = ValueError("native failure")
+        with pytest.raises(ValueError) as caught:
+            native("second", failure)
+        assert caught.value is failure
+        assert calls == ["first", "second"]
+        assert len(retirement_errors()) == 4
+    finally:
+        set_retirement_observer(None)
+
+
+def test_retirement_close_exports_snapshot_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Final read failure still disables callbacks and writes terminal evidence."""
+    # First Party
+    from lmcache.integration.vllm import retirement_witness
+
+    monkeypatch.setattr(retirement_witness, "scheduler_snapshot", lambda _: {})
+    recorder = retirement_witness.RetirementRecorder(object(), tmp_path)
+
+    def fail(_: Any) -> Any:
+        raise ValueError("snapshot failed")
+
+    monkeypatch.setattr(retirement_witness, "scheduler_snapshot", fail)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        recorder.close()
+    recorded = [
+        json.loads(line)
+        for line in next(tmp_path.glob("*.jsonl")).read_text().splitlines()
+    ]
+    assert recorded[-1]["event"] == "footer"
+    assert "snapshot failed" in recorded[-2]["errors"][0]
+
+
+def test_scheduler_shutdown_closes_both_observers_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native shutdown failure and state-read failure cannot skip either writer."""
+    # First Party
+    from lmcache.integration.vllm.l2_hybrid_observer import (
+        AsyncScheduler,
+        ObservedAsyncScheduler,
+    )
+
+    def fail_native(_: Any) -> None:
+        raise ValueError("native shutdown failed")
+
+    def fail_snapshot(_: Any) -> None:
+        raise RuntimeError("state failed")
+
+    monkeypatch.setattr(AsyncScheduler, "shutdown", fail_native)
+    # Inject failure at the private read boundary to test public shutdown cleanup.
+    monkeypatch.setattr(ObservedAsyncScheduler, "_observe_state", fail_snapshot)
+    scheduler: Any = ObservedAsyncScheduler.__new__(ObservedAsyncScheduler)
+    closed = []
+    scheduler.observation = SimpleNamespace(close=lambda: closed.append("scheduler"))
+    scheduler.retirement_recorder = SimpleNamespace(
+        close=lambda: closed.append("retirement")
+    )
+    with pytest.raises(ValueError, match="native shutdown failed"):
+        scheduler.shutdown()
+    assert closed == ["scheduler", "retirement"]

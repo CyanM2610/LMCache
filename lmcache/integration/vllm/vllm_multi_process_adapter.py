@@ -21,7 +21,11 @@ from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.hybrid_session_cleanup import ConfirmedSessionCleanup
-from lmcache.integration.vllm.phase_hooks import observed_worker_call
+from lmcache.integration.vllm.phase_hooks import (
+    observed_retirement_call,
+    observed_worker_call,
+    worker_observation_span,
+)
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
@@ -1686,6 +1690,7 @@ class LMCacheMPWorkerAdapter:
 
     @_lmcache_nvtx_annotate
     @observed_worker_call("worker_store_submit")
+    @observed_retirement_call("worker_store")
     def submit_store_request(
         self,
         request_id: str,
@@ -1743,6 +1748,7 @@ class LMCacheMPWorkerAdapter:
 
     @_lmcache_nvtx_annotate
     @observed_worker_call("worker_load_submit")
+    @observed_retirement_call("worker_load")
     def submit_retrieve_request(
         self,
         request_id: str,
@@ -2219,6 +2225,8 @@ class LMCacheMPWorkerAdapter:
         self.error_block_ids.clear()
         return errors
 
+    @observed_retirement_call("worker_preempt")
+    @observed_worker_call("worker_preempt")
     def handle_preemptions(self, need_flush_before_forward: bool) -> None:
         """Handle worker-side preemption hints from connector metadata.
 
@@ -2234,9 +2242,11 @@ class LMCacheMPWorkerAdapter:
             return
         if not self.is_healthy or self.transfer_ctx is None:
             return
-        self.transfer_ctx.flush_inflight_stores()
+        with worker_observation_span("worker_preempt_flush"):
+            self.transfer_ctx.flush_inflight_stores()
         # Force device sync here, compare to preemption, perf panelty is trivial
-        torch_dev.synchronize()
+        with worker_observation_span("worker_preempt_device_sync"):
+            torch_dev.synchronize()
 
     def shutdown(self) -> None:
         """

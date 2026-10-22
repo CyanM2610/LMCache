@@ -217,3 +217,23 @@ envelopes include launch gaps, and output waiting wall depends on prior GPU work
 observer costs, unavailable hardware occupancy counters, a disclosed C-phase
 metadata source-freeze exception, and the remaining cost-identification limits.
 The native004 failed numerical gate remains unchanged.
+
+Native retirement and physical page reuse
+-----------------------------------------
+
+The pinned async ``kv_both`` configuration both drops preempted stale output
+and defers physical block freeing. Retirement captures the global scheduled-step
+fence, which can be later than the request's own last step. Nonempty output
+consumption advances the processed fence and drains old allocations before
+handling sampled output. Rescheduling eligibility does not mean pages are free.
+
+``L2_HYBRID_RETIREMENT_WITNESS=1`` enables optional scheduler/allocator snapshots
+with immutable submitted generations. It preserves native return values and
+waits; callback errors invalidate evidence without replacing native execution.
+The existing preemption flush/device-sync calls have separate optional host
+spans. Future observation does not consume replies or import completion events.
+
+``NATIVE_PREEMPTION_006.md`` describes two complete service witnesses at95 and83
+usable pages, six observed retirements/reuses, output parity and explicit gaps
+for a later global fence and active MP work during preemption. Snapshot overhead
+is material; these traces do not supply OFF cost estimates or BLIS acceptance.
