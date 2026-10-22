@@ -90,6 +90,7 @@ class JsonlSubscriber(EventSubscriber):
                 "sequence": self.count,
                 "event": event.event_type.value,
                 "timestamp_s": event.timestamp,
+                "monotonic_ns": event.monotonic_ns,
                 "session_id": event.session_id,
                 "metadata": event.metadata,
             }

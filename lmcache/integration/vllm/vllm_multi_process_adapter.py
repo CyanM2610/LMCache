@@ -14,6 +14,7 @@ import uuid
 
 # Third Party
 import torch
+from vllm.v1.kv_wait_trace import emit as wait_emit, span as wait_span
 import zmq
 
 # First Party
@@ -875,6 +876,7 @@ class LMCacheMPSchedulerAdapter:
         self._unacked_lookups[request_id] = _LookupAck(
             futures=futures, submitted_at=time.monotonic()
         )
+        wait_emit("lookup_submitted", request_id, tokens=len(token_ids))
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
 
@@ -1040,6 +1042,7 @@ class LMCacheMPSchedulerAdapter:
 
         token_count = min_chunks * self.lmcache_tokens_per_chunk
 
+        wait_emit("lookup_result", request_id, hit_tokens=token_count)
         self._finished_lookup_results[request_id] = token_count
         return token_count
 
@@ -1882,7 +1885,12 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
-        self.wait_for_kv_access({}, dict(enumerate(op.block_ids)))
+        wait_emit("restore_trigger", request_id,
+                  start_token=op.start, end_token=op.end,
+                  skip_tokens=op.skip_first_n_tokens, block_ids=op.block_ids)
+        with wait_span("target_store_fence", request_id):
+            self.wait_for_kv_access({}, dict(enumerate(op.block_ids)))
+        wait_emit("restore_submit", request_id)
         future = self.transfer_ctx.submit_retrieve(
             request_id,
             key,
@@ -2158,6 +2166,8 @@ class LMCacheMPWorkerAdapter:
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
         failed_retrieves.update(dropped)
+        for wait_rid in finished_retrieves:
+            wait_emit("worker_recv_ready", wait_rid, failed=wait_rid in failed_retrieves)
         self._record_receive_releases(finished_retrieves, failed_retrieves)
 
         # Update the internal states

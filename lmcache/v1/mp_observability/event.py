@@ -195,6 +195,7 @@ class Event:
     timestamp: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
     session_id: str = ""
+    monotonic_ns: int = 0
 
 
 # A request issues several store/retrieve operations (one per chunked-prefill

@@ -217,6 +217,7 @@ class EventBus:
             return
 
         event.timestamp = time.time()
+        event.monotonic_ns = time.monotonic_ns()
         self._queue.append(event)
         self._wake.set()
 

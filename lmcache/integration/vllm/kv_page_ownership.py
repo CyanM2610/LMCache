@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 import time
 
+from vllm.v1.kv_wait_trace import span as wait_span
+
 Page = tuple[int, int]
 
 
@@ -100,5 +102,10 @@ class PendingKVPageAccess:
             conflict = access.pages & (reads | writes if access.writes else writes)
             if not conflict:
                 continue
-            access.future.result(timeout=max(0.0, deadline - time.monotonic()))
+            with wait_span(
+                "physical_page_dependency",
+                dependency="LOAD" if access.writes else "STORE",
+                pages=sorted(conflict),
+            ):
+                access.future.result(timeout=max(0.0, deadline - time.monotonic()))
             self._pending.remove(access)

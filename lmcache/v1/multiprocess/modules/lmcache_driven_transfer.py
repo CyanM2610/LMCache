@@ -12,6 +12,7 @@ import time
 
 # Third Party
 import torch
+from vllm.v1.kv_wait_trace import emit as wait_emit, span as wait_span
 
 # First Party
 from lmcache import device_ops, torch_dev
@@ -1565,6 +1566,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             raise RuntimeError("Registered cache context has no event backend")
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
+        wait_emit("restore_handler", key.request_id)
         read_session = self._ctx.session_manager.get(key.request_id) if hybrid else None
         read_lease = (
             read_session.hybrid_read_lease if read_session is not None else None
@@ -1696,6 +1698,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             )
                         )
                     with read_context as window_objs:
+                        wait_emit("source_readable", key.request_id,
+                                  keys=[str(k) for k in in_window_keys],
+                                  available=bool(window_objs))
                         if not window_objs or len(window_objs) != len(in_window_keys):
                             logger.error("Some keys not found during retrieve!")
                             retrieve_succeeded = False
@@ -1730,16 +1735,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                                 self._ctx.chunk_size,
                                 skip_first_n_tokens,
                             )
-                        transfer_kv_per_object_group(
-                            cache_context,
-                            block_ids_per_group_gpu,
-                            copy_objects if hybrid is not None else memory_objs,
-                            object_group_id=obj_group_id,
-                            batch_size=cache_context.max_batch_size,
-                            skip_first_n_tokens=skip_first_n_tokens,
-                            direction=lmcache_native.TransferDirection.H2D,
-                            transfer_key=transfer_key,
-                        )
+                        with wait_span("restore_cuda_submit", key.request_id,
+                                       transfer_key=transfer_key, bytes=total_bytes):
+                            transfer_kv_per_object_group(
+                                cache_context, block_ids_per_group_gpu,
+                                copy_objects if hybrid is not None else memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=cache_context.max_batch_size,
+                                skip_first_n_tokens=skip_first_n_tokens,
+                                direction=lmcache_native.TransferDirection.H2D,
+                                transfer_key=transfer_key,
+                            )
                         if hybrid is not None and inject_failure:
                             self._ctx.event_bus.publish(
                                 Event(
@@ -1800,6 +1806,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     read_keys = list(prefetched_keys)
 
                     def finish_hybrid_read(success: bool) -> tuple[bytes, bool]:
+                        wait_emit("restore_reply_ready", key.request_id,
+                                  transfer_key=transfer_key, success=success)
                         if read_keys:
                             self._ctx.storage_manager.release_transfer(read_keys)
                         if not success:
