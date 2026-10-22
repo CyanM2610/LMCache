@@ -29,6 +29,11 @@ from lmcache.integration.vllm.hybrid_promotion import (
 )
 from lmcache.integration.vllm.hybrid_session_cleanup import ConfirmedSessionCleanup
 from lmcache.integration.vllm.kv_page_ownership import PendingKVPageAccess
+from lmcache.integration.vllm.retained_store import (
+    RequestStoreFence,
+    RetainedStore,
+    StoreReceipt,
+)
 from lmcache.integration.vllm.phase_hooks import (
     observed_retirement_call,
     observed_worker_call,
@@ -100,6 +105,12 @@ class ExtraConfigDefault(enum.Enum):
     # Observe only already-submitted lookups at the end of scheduler steps.
     lookup_independent_progress = False
     lookup_progress_per_step = 32
+    # Step-based operation control. These do not enable eager prefetch or
+    # change producer/completion events; each behavior is opt-in separately.
+    decoupled_control = False
+    prepare_lookup_operations = False
+    decoupled_store = False
+    operation_step_limit = 32
     # Routing mode for ``create_transfer_context``: ``auto`` keeps the
     # historical CUDA -> lmcache_driven / others -> engine_driven dispatch;
     # ``lmcache_driven`` forces the IPC / SHM zero-copy path where the
@@ -676,6 +687,7 @@ class LMCacheMPSchedulerAdapter:
             ExtraConfigDefault.lookup_independent_progress.default
         )
         self._lookup_progress_limit = ExtraConfigDefault.lookup_progress_per_step.default
+        self._decoupled_control = ExtraConfigDefault.decoupled_control.default
         confirmed_cleanup = False
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
@@ -696,6 +708,18 @@ class LMCacheMPSchedulerAdapter:
             if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)):
                 raise ValueError("lookup_progress_per_step must be a positive integer")
             confirmed_cleanup = cfg[ExtraConfigDefault.require_terminal_completion.name]
+            self._decoupled_control = cfg[ExtraConfigDefault.decoupled_control.name]
+            if cfg[ExtraConfigDefault.prepare_lookup_operations.name] and not self._decoupled_control:
+                raise ValueError("prepare_lookup_operations requires decoupled_control")
+            if self._decoupled_control:
+                raw_limit = extra_config.get(
+                    "lmcache.mp.operation_step_limit",
+                    ExtraConfigDefault.operation_step_limit.default,
+                )
+                if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)):
+                    raise ValueError("operation_step_limit must be a positive integer")
+                self._lookup_progress_limit = cfg[ExtraConfigDefault.operation_step_limit.name]
+                self._lookup_progress_enabled = True
         if self._lookup_progress_limit <= 0:
             raise ValueError("lookup_progress_per_step must be a positive integer")
         if self._lookup_progress_enabled and not self._nonblocking_lookup_status:
@@ -709,6 +733,9 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_status_submissions = 0
         self._lookup_progress_status_seen = 0
         self._lookup_progress_sequence = 0
+        self._lookup_operation_sequence = 0
+        self._lookup_operation_ids: dict[str, str] = {}
+        self._lookup_operation_ranges: dict[str, tuple[int, int]] = {}
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -911,13 +938,65 @@ class LMCacheMPSchedulerAdapter:
         wait_emit("lookup_submitted", request_id, tokens=len(token_ids))
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+        # Observation identity is separate from query or source ownership.
+        # It cannot submit work and survives result observation until adoption.
+        self._lookup_operation_sequence += 1
+        self._lookup_operation_ids[request_id] = (
+            f"{request_id}:lookup:0:{aligned_end}:{self._lookup_operation_sequence}"
+        )
+        self._lookup_operation_ranges[request_id] = (0, aligned_end)
         if self._lookup_progress_enabled:
             self._lookup_progress_queue[request_id] = None
+
+    def lookup_operation_state(self, request_id: str) -> dict[str, Any]:
+        """Read native query state without polling, submitting or taking a lease.
+
+        A missing query is unknown, not a completed zero-hit query. The native
+        pending set also retains completed results until foreground adoption;
+        expose that distinction explicitly. ``source_ownership`` describes a
+        logical cleanup obligation, not proof of a readable physical source.
+        Neither observation nor consuming a cached result retires that owner.
+        """
+        known = request_id in self._finished_lookup_results
+        submitted = request_id in self._pending_lookups or known
+        start, end = self._lookup_operation_ranges.get(request_id, (None, None))
+        return {
+            "request_id": request_id,
+            "operation_id": self._lookup_operation_ids.get(request_id),
+            "kind": "lookup",
+            "start_token": start,
+            "end_token": end,
+            "submitted": submitted,
+            "pending": submitted and not known,
+            "result_known": known,
+            "result_tokens": self._finished_lookup_results.get(request_id),
+            "source_ownership": request_id in self._owned_lookup_ids,
+            "source_readable": "unknown",
+            "stage": "completed_observed" if known else (
+                "submitted" if submitted else "discovered"
+            ),
+        }
+
+    def lookup_operation_snapshot(self) -> tuple[dict[str, Any], ...]:
+        """Return a bounded observation of native query records, without polling.
+
+        This is a diagnostic view, not an exhaustive candidate discovery pass.
+        Only the progress queue determines fair advancement. Native consumed
+        queries no longer appear, even when session cleanup still owns leases.
+        """
+        views: dict[str, dict[str, Any]] = {}
+        for records in (self._lookup_progress_queue, self._finished_lookup_results):
+            for request_id in records:
+                if len(views) >= self._lookup_progress_limit:
+                    return tuple(views.values())
+                views[request_id] = self.lookup_operation_state(request_id)
+        return tuple(views.values())
 
     def progress_pending_lookups(self) -> None:
         """Observe a bounded, fair round of submitted lookups on this thread.
 
-        Called once at the end of connector metadata construction. No LOOKUP,
+        Called once at the end of connector metadata construction in legacy
+        progress mode, or at the start of a decoupled-control step. No LOOKUP,
         HBM matching/allocation, request-state adoption or LOAD is performed.
         Final results remain in the native result cache for a later native
         request visit. No scheduler step means no independent progress.
@@ -1183,6 +1262,8 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
         self._lookup_params.pop(request_id, None)
+        self._lookup_operation_ids.pop(request_id, None)
+        self._lookup_operation_ranges.pop(request_id, None)
 
     def shutdown(self) -> None:
         """Drain confirmed logical cleanup before closing transport clients.
@@ -1486,6 +1567,16 @@ class LMCacheMPWorkerAdapter:
 
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
+        self.decoupled_store = (
+            cfg[ExtraConfigDefault.decoupled_store.name]
+            if extra_config is not None
+            else False
+        )
+        self.retained_stores: dict[str, RetainedStore] = {}
+        self.completed_store_operation_ids: set[str] = set()
+        self.store_operation_receipts: list[StoreReceipt] = []
+        if self.decoupled_store and not self.require_terminal_completion:
+            raise ValueError("decoupled STORE requires terminal completion")
         self.page_ownership = PendingKVPageAccess()
         # Both experiment arms use this code and the same scope observation.
         # The conservative full-page behavior remains the default.
@@ -1999,6 +2090,138 @@ class LMCacheMPWorkerAdapter:
             )
         if event is not None:
             self.store_events[request_id] = event
+
+    def retain_store_request(
+        self,
+        operation_id: str,
+        request_id: str,
+        op: LoadStoreOp,
+        event: _IpcEvent | None,
+        cache_salt: str = "",
+        request_configs: dict[str, Any] | None = None,
+    ) -> None:
+        """Commit a STORE obligation with its original post-forward event.
+
+        Args:
+            operation_id: Unique scheduler commitment, including attempt sequence.
+            request_id: Native request identity used for delayed block release.
+            op: Current source range copied into worker metadata.
+            event: Event recorded at the original wait_for_save boundary.
+            cache_salt: Original cache identity salt.
+            request_configs: Original request cache configuration.
+        Raises:
+            ValueError: Unsupported mode, duplicate identity, or released request.
+        """
+        if (
+            not self.decoupled_store
+            or not self.require_terminal_completion
+            or not operation_id
+            or operation_id in self.retained_stores
+            or request_id in self._returned_finished
+        ):
+            raise ValueError("invalid or duplicate retained STORE commitment")
+        if not self.is_kv_writer or self.transfer_ctx is None:
+            raise ValueError("retained STORE requires a registered KV writer")
+        retained = RetainedStore(
+            operation_id, request_id, op, event, cache_salt, request_configs
+        )
+        current = self.store_futures.get(request_id)
+        if current is not None and not isinstance(current, RequestStoreFence):
+            raise ValueError("cannot mix native and retained STOREs for a request")
+        fence = current or RequestStoreFence()
+        fence.operations.append(retained)
+        self.store_futures[request_id] = fence
+        self.finished_stores.discard(request_id)
+        self.retained_stores[operation_id] = retained
+        self.page_ownership.record(
+            retained, dict(enumerate(op.block_ids)), writes=False,
+            request_id=request_id, operation="STORE_RETAINED",
+        )
+        self.store_operation_receipts.append(StoreReceipt(
+            operation_id, request_id, op.start, op.end, "committed"
+        ))
+        wait_emit("store_operation_committed", request_id,
+                  operation_id=operation_id, start=op.start, end=op.end)
+
+    def submit_retained_stores(self, operation_ids: Sequence[str]) -> int:
+        """Submit selected commitments using their retained producer events.
+
+        Args:
+            operation_ids: Existing committed STORE identities in chosen order.
+        Returns:
+            Count of newly submitted transfers. Repeated submitted IDs are no-ops.
+        Raises:
+            KeyError: Unknown operation identity.
+            Exception: Ambiguous submission error, retaining source protection.
+        """
+        count = 0
+        for operation_id in operation_ids:
+            if operation_id in self.completed_store_operation_ids:
+                continue
+            retained = self.retained_stores[operation_id]
+            if retained.submit(self._submit_retained_store):
+                count += 1
+                self.store_operation_receipts.append(StoreReceipt(
+                    operation_id, retained.request_id, retained.op.start,
+                    retained.op.end, "submitted"
+                ))
+                wait_emit("store_operation_submitted", retained.request_id,
+                          operation_id=operation_id, start=retained.op.start,
+                          end=retained.op.end)
+        return count
+
+    def has_store_commitment(self, operation_id: str) -> bool:
+        """Return whether the worker captured this range's original producer event."""
+        return (
+            operation_id in self.retained_stores
+            or operation_id in self.completed_store_operation_ids
+        )
+
+    def get_store_operation_receipts(self) -> tuple[StoreReceipt, ...]:
+        """Observe terminal ranges and drain receipts through native metadata.
+
+        Returns:
+            Committed/submitted/terminal observations, each emitted once.
+        Raises:
+            Exception: Unknown completion outcome; the operation remains retained.
+        """
+        for operation_id, retained in tuple(self.retained_stores.items()):
+            if not retained.query():
+                continue
+            succeeded = retained.result(timeout=0)
+            self.store_operation_receipts.append(StoreReceipt(
+                operation_id, retained.request_id, retained.op.start,
+                retained.op.end, "terminal", succeeded,
+            ))
+            wait_emit(
+                "store_operation_terminal_observed", retained.request_id,
+                operation_id=operation_id, start=retained.op.start,
+                end=retained.op.end, succeeded=succeeded,
+                semantics="worker observed terminal future; not device completion time",
+            )
+            self.completed_store_operation_ids.add(operation_id)
+            del self.retained_stores[operation_id]
+        result = tuple(self.store_operation_receipts)
+        self.store_operation_receipts.clear()
+        return result
+
+    def _submit_retained_store(self, retained: RetainedStore) -> Any:
+        """Use the existing transfer context without replacing request fences."""
+        self._ensure_heartbeat_started()
+        if not self.is_healthy or self.transfer_ctx is None:
+            raise RuntimeError("cannot submit committed STORE without healthy context")
+        op = retained.op
+        key = self._create_key(
+            op.token_ids, op.start, op.end, request_id=retained.request_id,
+            cache_salt=retained.cache_salt, request_configs=retained.request_configs,
+        )
+        with wait_span("store_source_fence", retained.request_id):
+            self.wait_for_kv_access(dict(enumerate(op.block_ids)), {})
+        return self.transfer_ctx.submit_store(
+            retained.request_id, key, self.instance_id, self.kv_caches,
+            self._block_ids_per_group(op), retained.producer_event,
+            self.blocks_in_chunk,
+        )
 
     def submit_promotion(self, command: PromotionCommand, event: _IpcEvent) -> None:
         """Submit post-forward LOAD under independent physical-page ownership.
@@ -2630,6 +2853,22 @@ class LMCacheMPWorkerAdapter:
             TimeoutError: Remote completion is unavailable; do not access pages.
             Exception: An ambiguous transport failure; protection is retained.
         """
+        if getattr(self, "decoupled_store", False) and write_blocks:
+            writes = {
+                (group, block) for group, blocks in write_blocks.items()
+                for block in blocks
+            }
+            conflicts = [
+                operation_id
+                for operation_id, retained in self.retained_stores.items()
+                if retained.future is None and writes.intersection(
+                    (group, block)
+                    for group, blocks in enumerate(retained.op.block_ids)
+                    for block in blocks
+                )
+            ]
+            # Submit first: waiting for an unsent obligation would self-deadlock.
+            self.submit_retained_stores(conflicts)
         if self.require_terminal_completion:
             with worker_observation_span("worker_page_ownership_wait"):
                 self.page_ownership.reap()
@@ -2645,6 +2884,8 @@ class LMCacheMPWorkerAdapter:
         on the closing request client, and a straggler in-flight cycle cannot
         re-register or flip the health event after unregistration.
         """
+        if getattr(self, "decoupled_store", False):
+            self.submit_retained_stores(tuple(self.retained_stores))
         with self._heartbeat_lock:
             if self._heartbeat is not None:
                 self._heartbeat.stop()

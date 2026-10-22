@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Iterable
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 import math
 import sys
@@ -474,6 +476,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     # No controller exists until an explicitly enabled scheduler binds its pool.
     _promotion: PromotionScheduler | None = None
     _promotion_enabled: bool = False
+    decoupled_control_enabled: bool = False
+    prepare_lookup_operations: bool = False
+    decoupled_store_enabled: bool = False
+    operation_step_limit: int = 32
+    store_operation_decider: Callable[[dict[str, Any]], str] | None = None
 
     def __init__(
         self,
@@ -516,6 +523,35 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.eager_prefetch", False
             )
         )
+        operation_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        )
+        for key in (
+            "decoupled_control", "prepare_lookup_operations", "decoupled_store"
+        ):
+            if type(operation_config.get(f"lmcache.mp.{key}", False)) is not bool:
+                raise ValueError(f"lmcache.mp.{key} must be a boolean")
+        self.decoupled_control_enabled = operation_config.get(
+            "lmcache.mp.decoupled_control", False
+        ) is True
+        self.prepare_lookup_operations = operation_config.get(
+            "lmcache.mp.prepare_lookup_operations", False
+        ) is True
+        self.decoupled_store_enabled = operation_config.get(
+            "lmcache.mp.decoupled_store", False
+        ) is True
+        self.operation_step_limit = operation_config.get(
+            "lmcache.mp.operation_step_limit", 32
+        )
+        if type(self.operation_step_limit) is not int or self.operation_step_limit <= 0:
+            raise ValueError("operation_step_limit must be a positive integer")
+        if self.prepare_lookup_operations and not self.decoupled_control_enabled:
+            raise ValueError("LOOKUP preparation requires decoupled_control")
+        self._store_operation_sequence = 0
+        self._store_operation_views: dict[str, dict[str, Any]] = {}
+        self._store_submissions: list[str] = []
+        self._retained_store_candidates: OrderedDict[str, None] = OrderedDict()
+        self._control_step_id: int | None = None
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -600,6 +636,21 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self.lazy_offload = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.lazy_offload", False
         )
+        if self.decoupled_store_enabled and (
+            not self._require_terminal_completion
+            or not vllm_config.use_v2_model_runner
+            or vllm_config.parallel_config.world_size != 1
+            or dp_size != 1 or n_servers != 1 or dcp_size != 1
+            or self.lazy_offload or self.transfer_intermediate_tensors
+            or kv_cache_config is None
+            or len(kv_cache_config.kv_cache_groups) != 1
+            or any(type(spec).__name__ != "FullAttentionSpec"
+                   for spec in _iter_kv_cache_specs(kv_cache_config))
+        ):
+            raise ValueError(
+                "decoupled STORE requires V2, terminal TP1, one dense group "
+                "and non-lazy offload without intermediate tensors"
+            )
         if self._promotion_enabled and (
             not self._require_terminal_completion
             or not vllm_config.use_v2_model_runner
@@ -903,6 +954,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         event = self.worker_adapter.create_recorded_event()
 
+        if self.decoupled_store_enabled:
+            for meta in metadata.requests:
+                if meta.direction != "STORE":
+                    continue
+                self.worker_adapter.retain_store_request(
+                    meta.operation_id, meta.request_id, meta.op, event,
+                    cache_salt=meta.cache_salt,
+                    request_configs=meta.request_configs,
+                )
+                if meta.operation_id not in metadata.defer_store_ids:
+                    self.worker_adapter.submit_retained_stores((meta.operation_id,))
+            return
+
         self.worker_adapter.batched_submit_store_requests(
             request_ids,
             ops,
@@ -944,6 +1008,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
         worker_adapter.handle_preemptions(need_flush_before_forward)
 
+    def prepare_kv_cache_writes(self, scheduler_output: SchedulerOutput) -> None:
+        """Protect retained STORE sources before native zeroing or CoW writes.
+
+        Args:
+            scheduler_output: Native block-zero and block-copy operations.
+        Notes:
+            Only the supported single dense engine group is enabled. This hook
+            precedes the writes and does not move any producer event.
+        """
+        if not self.decoupled_store_enabled:
+            return
+        copies = scheduler_output.kv_cache_block_copies or ()
+        reads = [pair[0] for pair in copies]
+        writes = list(scheduler_output.new_block_ids_to_zero or ())
+        writes.extend(pair[1] for pair in copies)
+        if reads or writes:
+            self.worker_adapter.wait_for_kv_access({0: reads}, {0: writes})
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -978,10 +1060,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if self._promotion_enabled
             else ()
         )
-        if completed_store_requests or receipts:
+        store_receipts = (
+            self.worker_adapter.get_store_operation_receipts()
+            if self.decoupled_store_enabled else ()
+        )
+        if completed_store_requests or receipts or store_receipts:
             return LMCacheMPWorkerMetadata(
                 completed_store_requests=completed_store_requests or {},
                 promotion_receipts=receipts,
+                store_receipts=store_receipts,
             )
         else:
             return None
@@ -992,10 +1079,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Completion and publication remain separated by the native output FIFO.
         Raises the underlying adapter error without releasing HBM ownership.
         """
-        if not self._promotion_enabled:
+        if not self._promotion_enabled and not self.decoupled_store_enabled:
             return
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+        if self.decoupled_store_enabled:
+            for item in metadata.requests:
+                if (
+                    item.direction == "STORE"
+                    and not self.worker_adapter.has_store_commitment(item.operation_id)
+                ):
+                    raise RuntimeError(
+                        "new STORE requires its original post-forward producer event"
+                    )
+            self.worker_adapter.submit_retained_stores(metadata.submit_store_ids)
+        if not self._promotion_enabled:
+            return
         if metadata.promotions:
             event = self.worker_adapter.create_recorded_event()
             for command in metadata.promotions:
@@ -1112,8 +1211,122 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[int | None, bool]:
         return self._get_num_new_matched_tokens(
             request, num_computed_tokens, allow_lookup_submit=True,
-            commit_match=True, idempotent_prefix_accounting=False,
+            commit_match=True,
+            idempotent_prefix_accounting=self.decoupled_control_enabled,
         )
+
+    def begin_prefill_control_step(self, step_id: int) -> None:
+        """Observe existing LOOKUP operations once at a scheduler-step boundary.
+
+        Args:
+            step_id: Native scheduler step identity.
+        Raises:
+            ValueError: The same step tries to advance control twice.
+        """
+        if not self.decoupled_control_enabled:
+            return
+        if self._control_step_id == step_id:
+            raise ValueError("prefill control already advanced in this step")
+        self._control_step_id = step_id
+        self.scheduler_adapter.progress_pending_lookups()
+
+    def lookup_operation_state(self, request_id: str) -> dict[str, Any]:
+        """Read native lookup state without querying, matching or taking resources."""
+        return self.scheduler_adapter.lookup_operation_state(request_id)
+
+    def prepare_lookup_operation(self, request: "Request") -> dict[str, Any]:
+        """Submit one native LOOKUP only when separate preparation is enabled.
+
+        Args:
+            request: Existing arrived request; no future tokens are introduced.
+        Returns:
+            Existing protocol state. This does not perform HBM matching.
+        Raises:
+            ValueError: Independent new-query preparation is disabled.
+        """
+        if not self.decoupled_control_enabled or not self.prepare_lookup_operations:
+            raise ValueError("independent LOOKUP preparation is disabled")
+        tracker = self._get_or_create_request_tracker(request)
+        if (request.status != RequestStatus.PREEMPTED
+                and tracker.state == LMCacheMPRequestState.PREFETCHING):
+            self.scheduler_adapter.maybe_submit_lookup_request(
+                request.request_id, token_ids=tracker.get_token_ids(),
+                cache_salt=tracker.cache_salt, request_configs=tracker.request_configs,
+            )
+        return self.lookup_operation_state(request.request_id)
+
+    def get_operation_snapshot(self) -> tuple[dict[str, Any], ...]:
+        """Return bounded, non-exhaustive operation views without native references."""
+        lookups = self.scheduler_adapter.lookup_operation_snapshot()
+        stores = tuple(
+            dict(view)
+            for view in islice(
+                self._store_operation_views.values(), self.operation_step_limit
+            )
+        )
+        return tuple(lookups) + stores
+
+    def set_operation_decider(
+        self, decider: Callable[[dict[str, Any]], str] | None
+    ) -> None:
+        """Bind a scheduler-owned STORE choice callback; None restores native submit.
+
+        Args:
+            decider: Receives a resource-free candidate view and returns submit/defer.
+        """
+        self.store_operation_decider = decider
+
+    def get_retained_store_candidates(self, limit: int) -> tuple[dict[str, Any], ...]:
+        """Visit committed but unsubmitted STOREs in bounded fair round-robin order.
+
+        Args:
+            limit: Maximum visits, independently capped by operation_step_limit.
+        Returns:
+            Immutable-valued snapshots, not native source block references.
+        Raises:
+            ValueError: The visit bound is not a positive integer.
+        """
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("STORE candidate limit must be a positive integer")
+        count = min(
+            limit, self.operation_step_limit, len(self._retained_store_candidates)
+        )
+        result = []
+        for _ in range(count):
+            operation_id, _ = self._retained_store_candidates.popitem(last=False)
+            self._retained_store_candidates[operation_id] = None
+            result.append(dict(self._store_operation_views[operation_id]))
+        return tuple(result)
+
+    def decide_store_operation(self, candidate: dict[str, Any]) -> str:
+        """Return baseline immediate submission; future policies may return defer.
+
+        Args:
+            candidate: Ephemeral current STORE range with no resource acquisition.
+        Returns:
+            ``submit`` by default. ``defer`` still commits and protects the range.
+        """
+        decider = getattr(self, "store_operation_decider", None)
+        return "submit" if decider is None else decider(dict(candidate))
+
+    def request_store_submission(self, operation_ids: Iterable[str]) -> None:
+        """Queue explicit existing STORE commitments for the next worker step.
+
+        Args:
+            operation_ids: Known commitments retained with their producer events.
+        Raises:
+            ValueError: Disabled mode or an unknown operation identity.
+        """
+        if not self.decoupled_store_enabled:
+            raise ValueError("decoupled STORE is disabled")
+        for operation_id in operation_ids:
+            if operation_id not in self._store_operation_views:
+                raise ValueError("unknown retained STORE operation")
+            if self._store_operation_views[operation_id]["native_phase"] == "submitted":
+                continue
+            if operation_id not in self._store_submissions:
+                self._store_submissions.append(operation_id)
+            self._retained_store_candidates.pop(operation_id, None)
 
     def observe_num_new_matched_tokens(
         self,
@@ -1415,6 +1628,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
+        if self.decoupled_store_enabled:
+            metadata.submit_store_ids = tuple(
+                self._store_submissions[:self.operation_step_limit]
+            )
+            del self._store_submissions[:self.operation_step_limit]
         if self._promotion is not None:
             metadata.promotions = self._promotion.prepare()
 
@@ -1426,7 +1644,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Observe existing LOOKUP work only; adoption stays on a later native
         # request visit. Do not change this step's already-formed metadata.
-        self.scheduler_adapter.progress_pending_lookups()
+        if not self.decoupled_control_enabled:
+            self.scheduler_adapter.progress_pending_lookups()
 
         return metadata
 
@@ -1441,6 +1660,26 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, LMCacheMPWorkerMetadata):
             return
+        if self.decoupled_store_enabled:
+            for receipt in meta.store_receipts:
+                view = self._store_operation_views.get(receipt.operation_id)
+                if view is None:
+                    raise ValueError("unknown STORE completion identity")
+                if (view["request_id"] != receipt.request_id
+                        or view["start_token"] != receipt.start
+                        or view["end_token"] != receipt.end):
+                    raise ValueError("STORE receipt range does not match commitment")
+                view["stage"] = (
+                    "completed_observed" if receipt.phase == "terminal"
+                    else "submitted" if receipt.phase == "submitted"
+                    else "dependencies_checked"
+                )
+                view["native_phase"] = receipt.phase
+                if receipt.phase == "submitted":
+                    self._retained_store_candidates.pop(receipt.operation_id, None)
+                if receipt.phase == "terminal":
+                    self._retained_store_candidates.pop(receipt.operation_id, None)
+                    del self._store_operation_views[receipt.operation_id]
         if meta.promotion_receipts:
             if self._promotion is None:
                 raise ValueError("promotion receipt without enabled scheduler owner")
@@ -1540,6 +1779,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self.role != KVConnectorRole.SCHEDULER:
             return False
+        if self.decoupled_store_enabled and self._store_operation_views:
+            return True
         if self._promotion is not None and self._promotion.has_pending_work:
             return True
         if not self.lazy_offload:
@@ -1624,8 +1865,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
         metadata: LMCacheMPConnectorMetadata,
     ) -> None:
-        lmcache_tokens_per_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
-
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
 
@@ -1639,11 +1878,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     num_new_tokens,
                 )
 
-            r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
-                request_tracker,
-                lmcache_tokens_per_chunk,
-                self._group_tokens_per_block,
-            )
+            r_meta = self._prepare_store_metadata(request_tracker, metadata)
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
                 if self.lazy_offload:
@@ -1663,8 +1898,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
         metadata: LMCacheMPConnectorMetadata,
     ) -> None:
-        lmcache_tokens_per_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
-
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, request_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._get_request_tracker(request_id)
@@ -1686,11 +1919,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     num_new_tokens,
                 )
 
-            r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
-                request_tracker,
-                lmcache_tokens_per_chunk,
-                self._group_tokens_per_block,
-            )
+            r_meta = self._prepare_store_metadata(request_tracker, metadata)
 
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1705,6 +1934,54 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # scheduler_output.total_num_scheduled_tokens > 0
         if scheduler_output.total_num_scheduled_tokens:
             self._process_lazy_offload_store_requests(metadata)
+
+    def _prepare_store_metadata(
+        self, tracker: LMCacheMPRequestTracker, metadata: LMCacheMPConnectorMetadata
+    ) -> LMCacheMPRequestMetadata | None:
+        """Discover and commit a native range; commitment is not physical completion."""
+        chunk_size = self.scheduler_adapter.lmcache_tokens_per_chunk
+        if not self.decoupled_store_enabled:
+            return LMCacheMPRequestMetadata.GetStoreMetadata(
+                tracker, chunk_size, self._group_tokens_per_block
+            )
+        candidate = LMCacheMPRequestMetadata.PeekStoreMetadata(
+            tracker, chunk_size, self._group_tokens_per_block
+        )
+        if candidate is None:
+            return None
+        self._store_operation_sequence += 1
+        operation_id = (
+            f"{candidate.request_id}:STORE:{candidate.op.start}:{candidate.op.end}:"
+            f"{self._store_operation_sequence}"
+        )
+        view = dict(
+            operation_id=operation_id, request_id=candidate.request_id, kind="store",
+            start_token=candidate.op.start, end_token=candidate.op.end,
+            stage="discovered", native_phase="candidate",
+            dependencies=(("source_owned", "confirmed"),
+                          ("producer_event", "not_recorded"),
+                          ("physical_completion", "unknown")),
+            block_reason=None, owner="native_request_and_worker_page_guard",
+            source_ownership=True, physical_ready="unknown",
+            resources=(
+                ("source_pages", sum(len(b) for b in candidate.op.block_ids)),
+                ("logical_tokens", candidate.op.end - candidate.op.start),
+            ),
+        )
+        action = self.decide_store_operation(dict(view))
+        if action not in ("submit", "defer"):
+            raise ValueError("STORE decision must be submit or defer")
+        LMCacheMPRequestMetadata.CommitStoreMetadata(
+            tracker, candidate, chunk_size, self._group_tokens_per_block
+        )
+        candidate.operation_id = operation_id
+        view["stage"] = "dependencies_checked"
+        view["native_phase"] = "committed_metadata"
+        self._store_operation_views[operation_id] = view
+        if action == "defer":
+            metadata.defer_store_ids += (operation_id,)
+            self._retained_store_candidates[operation_id] = None
+        return candidate
 
     def _process_lazy_offload_store_requests(
         self, metadata: LMCacheMPConnectorMetadata

@@ -16,6 +16,7 @@ import torch
 
 # First Party
 from lmcache.integration.vllm.hybrid_promotion import PromotionCommand, PromotionReceipt
+from lmcache.integration.vllm.retained_store import StoreReceipt
 from lmcache.integration.vllm.utils import (
     apply_mm_hashes_to_token_ids,
     extract_mm_features,
@@ -62,9 +63,8 @@ class LMCacheMPRequestTracker:
     # avoid saving tokens whose KV has not been computed yet.
     num_scheduled_tokens: int = 0
 
-    # Number of tokens stored will be initialized when lookup the external
-    # hit tokens and will be updated when processing new requests and cached
-    # requests.
+    # Native watermark: already present in L1 or committed to worker STORE
+    # metadata. This is not evidence that a newly committed DMA has completed.
     num_stored_tokens: int = 0
 
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
@@ -185,6 +185,7 @@ class LMCacheMPRequestMetadata:
     op: LoadStoreOp
     cache_salt: str = ""
     request_configs: dict[str, Any] | None = None
+    operation_id: str = ""
 
     @staticmethod
     def GetStoreMetadata(
@@ -192,8 +193,7 @@ class LMCacheMPRequestMetadata:
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
     ) -> "LMCacheMPRequestMetadata | None":
-        """
-        Generate the store metadata for the current request tracker.
+        """Generate and commit native STORE metadata (compatibility entry point).
 
         Args:
             tracker: The request tracker to generate the metadata from.
@@ -202,6 +202,30 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+        """
+        candidate = LMCacheMPRequestMetadata.PeekStoreMetadata(
+            tracker, lmcache_tokens_per_chunk, group_tokens_per_block
+        )
+        if candidate is not None:
+            LMCacheMPRequestMetadata.CommitStoreMetadata(
+                tracker, candidate, lmcache_tokens_per_chunk, group_tokens_per_block
+            )
+        return candidate
+
+    @staticmethod
+    def PeekStoreMetadata(
+        tracker: LMCacheMPRequestTracker,
+        lmcache_tokens_per_chunk: int,
+        group_tokens_per_block: list[int],
+    ) -> "LMCacheMPRequestMetadata | None":
+        """Discover the native storable range without changing ownership/progress.
+
+        Args:
+            tracker: Native request allocation and scheduled-token record.
+            lmcache_tokens_per_chunk: Native STORE alignment.
+            group_tokens_per_block: Per-engine-group physical page geometry.
+        Returns:
+            An ephemeral range view, or None. Block IDs are not pinned by this call.
         """
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
@@ -275,11 +299,40 @@ class LMCacheMPRequestMetadata:
                 request_configs=tracker.request_configs,
             )
 
-            # Update the request tracker
-            tracker.increase_num_stored_tokens(end_token_idx - start_token_idx)
             return ret
 
         return None
+
+    @staticmethod
+    def CommitStoreMetadata(
+        tracker: LMCacheMPRequestTracker,
+        candidate: "LMCacheMPRequestMetadata",
+        lmcache_tokens_per_chunk: int,
+        group_tokens_per_block: list[int],
+    ) -> None:
+        """Commit a freshly revalidated native range; this is not DMA completion.
+
+        Args:
+            tracker: Request still owning the source allocation.
+            candidate: Candidate immediately selected for worker metadata.
+            lmcache_tokens_per_chunk: Native chunk alignment.
+            group_tokens_per_block: Per-engine-group page geometry.
+        Raises:
+            ValueError: Candidate no longer matches native progress or allocation.
+        """
+        current = LMCacheMPRequestMetadata.PeekStoreMetadata(
+            tracker, lmcache_tokens_per_chunk, group_tokens_per_block
+        )
+        if (
+            current is None
+            or candidate.request_id != current.request_id
+            or candidate.direction != "STORE"
+            or candidate.op != current.op
+            or candidate.cache_salt != current.cache_salt
+            or candidate.request_configs != current.request_configs
+        ):
+            raise ValueError("STORE candidate changed before commitment")
+        tracker.increase_num_stored_tokens(candidate.op.end - candidate.op.start)
 
     @staticmethod
     def GetRetrieveMetadata(
@@ -364,6 +417,8 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         self.need_flush_before_forward: bool = False
         self.kv_read_blocks: dict[int, tuple[int, ...]] = {}
         self.kv_write_blocks: dict[int, tuple[int, ...]] = {}
+        self.defer_store_ids: tuple[str, ...] = ()
+        self.submit_store_ids: tuple[str, ...] = ()
 
     def add_compute_access(
         self,
@@ -437,6 +492,7 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
 
     completed_store_requests: dict[str, int]
     promotion_receipts: tuple[PromotionReceipt, ...] = ()
+    store_receipts: tuple[StoreReceipt, ...] = ()
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -448,4 +504,5 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
         return LMCacheMPWorkerMetadata(
             completed_store_requests=merged,
             promotion_receipts=self.promotion_receipts + other.promotion_receipts,
+            store_receipts=self.store_receipts + other.store_receipts,
         )
