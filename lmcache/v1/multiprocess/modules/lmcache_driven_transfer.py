@@ -1,3 +1,4 @@
+from vllm.v1 import host_diagnostic as _host_diag
 # SPDX-License-Identifier: Apache-2.0
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
@@ -1209,7 +1210,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         hybrid_accesses: list[HybridAccess] = []
         deferred_response = None
 
-        entry = self.get_and_touch_context_entry(instance_id)
+        with _host_diag.span('store.context', key.request_id):
+            entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
             # The worker can reconnect to a replacement server before its next
             # registration probe. No device work was submitted in that window,
@@ -1236,11 +1238,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # A queued STORE may outlive demand; hashing must not recreate
                 # a session that END_SESSION already retired.
                 store_session = Session(key.request_id, self._ctx.token_hasher)
-        obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
-            key,
-            list(range(num_object_groups)),
-            **({"session": store_session} if hybrid is not None else {}),
-        )
+        with _host_diag.span('store.resolve', key.request_id):
+            obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
+                key,
+                list(range(num_object_groups)),
+                **({"session": store_session} if hybrid is not None else {}),
+            )
         num_chunks = len(obj_keys_per_obj_group[0])
 
         # NOTE: different engine groups may have different block sizes, so
@@ -1294,14 +1297,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 num_chunks,
             )
 
-            block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
-            )
+            with _host_diag.span('store.stage_blocks', key.request_id):
+                block_ids_per_group_gpu = downsample_and_stage_block_ids(
+                    cache_context, gpu_block_ids
+                )
 
-            producer_event = event_backend.import_event(
-                event_ipc_handle, cache_context.device
-            )
-            event_backend.wait_event(producer_event, cache_context.stream)
+            with _host_diag.span('store.producer_import', key.request_id):
+                producer_event = event_backend.import_event(
+                    event_ipc_handle, cache_context.device
+                )
+            with _host_diag.span('store.producer_wait_enqueue', key.request_id):
+                event_backend.wait_event(producer_event, cache_context.stream)
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -1321,7 +1327,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if key.worker_id == 0 and self._ctx.event_bus.has_subscribers(
                 EventType.MP_TOKENS
             ):
-                self._publish_token_bindings(key, obj_keys_per_obj_group[0])
+                with _host_diag.span('store.publish_tokens', key.request_id):
+                    self._publish_token_bindings(key, obj_keys_per_obj_group[0])
 
             transfer_key = next_transfer_key(key.request_id)
             self._ctx.event_bus.publish_on_stream(
@@ -1354,9 +1361,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
-                    reserved_dict = self._ctx.storage_manager.reserve_write(
-                        keys_to_reserve, layout_desc, "new"
-                    )
+                    with _host_diag.span('store.reserve_write', key.request_id):
+                        reserved_dict = self._ctx.storage_manager.reserve_write(
+                            keys_to_reserve, layout_desc, "new"
+                        )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
                         total_bytes += next(
@@ -1386,25 +1394,27 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             for i, obj in enumerate(memory_objs)
                         ]
                     if hybrid is not None:
-                        hybrid.begin_objects(
-                            hybrid_accesses,
+                        with _host_diag.span('store.begin_objects', key.request_id):
+                            hybrid.begin_objects(
+                                hybrid_accesses,
+                                copy_objects,
+                                obj_keys,
+                                "store",
+                                transfer_key,
+                                gpu_block_ids,
+                                self._ctx.chunk_size,
+                            )
+                    with _host_diag.span('store.transfer_plan', key.request_id):
+                        transfer_kv_per_object_group(
+                            cache_context,
+                            block_ids_per_group_gpu,
                             copy_objects,
-                            obj_keys,
-                            "store",
-                            transfer_key,
-                            gpu_block_ids,
-                            self._ctx.chunk_size,
+                            object_group_id=obj_group_id,
+                            batch_size=1,
+                            skip_first_n_tokens=0,
+                            direction=lmcache_native.TransferDirection.D2H,
+                            transfer_key=transfer_key,
                         )
-                    transfer_kv_per_object_group(
-                        cache_context,
-                        block_ids_per_group_gpu,
-                        copy_objects,
-                        object_group_id=obj_group_id,
-                        batch_size=1,
-                        skip_first_n_tokens=0,
-                        direction=lmcache_native.TransferDirection.D2H,
-                        transfer_key=transfer_key,
-                    )
                     if inject_failure:
                         self._ctx.event_bus.publish(
                             Event(
@@ -1477,14 +1487,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.event_bus.publish(end_event)
                         return handle, success
 
-                    deferred_response = hybrid.defer(
-                        event,
-                        cache_context,
-                        hybrid_accesses,
-                        store_succeeded,
-                        finish_hybrid_store,
-                        transfer_key,
-                    )
+                    with _host_diag.span('store.defer', key.request_id):
+                        deferred_response = hybrid.defer(
+                            event,
+                            cache_context,
+                            hybrid_accesses,
+                            store_succeeded,
+                            finish_hybrid_store,
+                            transfer_key,
+                        )
 
         ed = time.perf_counter()
         if stored_count:

@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Callable
 import itertools
+from vllm.v1 import host_diagnostic as _hd
 import os
 import threading
 import time
@@ -70,28 +71,30 @@ def observed_mp_call(name: str) -> Callable:
                     time.process_time_ns(),
                 )
                 _parent.reset(token)
-                phase_publish(
-                    Event(
-                        event_type=EventType.MP_HOST_PHASE,
-                        session_id=request_id,
-                        metadata=dict(
-                            name=name,
-                            span_id=span,
-                            parent_span_id=parent,
-                            request_id=request_id,
-                            token_start=getattr(key, "start", None),
-                            token_end=getattr(key, "end", None),
-                            begin_wall_ns=before[0],
-                            end_wall_ns=after[0],
-                            begin_thread_cpu_ns=before[1],
-                            end_thread_cpu_ns=after[1],
-                            begin_process_cpu_ns=before[2],
-                            end_process_cpu_ns=after[2],
-                            thread_id=threading.get_ident(),
-                            error=error,
-                        ),
+                _hd.record(name, before, after, request_id)
+                if os.environ.get("HOST_DIAGNOSTIC_MEMORY_PHASES") != "1":
+                    phase_publish(
+                        Event(
+                            event_type=EventType.MP_HOST_PHASE,
+                            session_id=request_id,
+                            metadata=dict(
+                                name=name,
+                                span_id=span,
+                                parent_span_id=parent,
+                                request_id=request_id,
+                                token_start=getattr(key, "start", None),
+                                token_end=getattr(key, "end", None),
+                                begin_wall_ns=before[0],
+                                end_wall_ns=after[0],
+                                begin_thread_cpu_ns=before[1],
+                                end_thread_cpu_ns=after[1],
+                                begin_process_cpu_ns=before[2],
+                                end_process_cpu_ns=after[2],
+                                thread_id=threading.get_ident(),
+                                error=error,
+                            ),
+                        )
                     )
-                )
 
         return wrapped
 
