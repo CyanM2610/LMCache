@@ -491,6 +491,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert vllm_config.kv_transfer_config is not None
 
+        self._require_terminal_completion = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.require_terminal_completion", False
+            )
+        )
+
         self._eager_prefetch: bool = bool(
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "lmcache.mp.eager_prefetch", False
@@ -892,6 +898,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             isinstance(kv_connector_metadata, LMCacheMPConnectorMetadata)
             and kv_connector_metadata.need_flush_before_forward
         )
+        if (
+            isinstance(kv_connector_metadata, LMCacheMPConnectorMetadata)
+            and worker_adapter.require_terminal_completion
+        ):
+            worker_adapter.wait_for_kv_access(
+                kv_connector_metadata.kv_read_blocks,
+                kv_connector_metadata.kv_write_blocks,
+            )
         worker_adapter.handle_preemptions(need_flush_before_forward)
 
     def get_finished(
@@ -1420,6 +1434,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            if self._require_terminal_completion:
+                metadata.add_compute_access(
+                    request_tracker.allocated_block_ids,
+                    self._group_tokens_per_block,
+                    new_request.num_computed_tokens,
+                    num_new_tokens,
+                )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
@@ -1460,6 +1481,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # stay consistent with _process_new_requests.
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            if self._require_terminal_completion:
+                metadata.add_compute_access(
+                    request_tracker.allocated_block_ids,
+                    self._group_tokens_per_block,
+                    cached_reqs.num_computed_tokens[idx],
+                    num_new_tokens,
+                )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
@@ -359,6 +360,42 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
         self.need_flush_before_forward: bool = False
+        self.kv_read_blocks: dict[int, tuple[int, ...]] = {}
+        self.kv_write_blocks: dict[int, tuple[int, ...]] = {}
+
+    def add_compute_access(
+        self,
+        block_ids: dict[int, list[int]],
+        tokens_per_block: Sequence[int],
+        start: int,
+        count: int,
+    ) -> None:
+        """Record current-batch page reads/writes from native scheduled positions.
+
+        Args:
+            block_ids: Current physical allocation by engine group.
+            tokens_per_block: Token geometry of each engine group.
+            start: Native computed-token position before this batch.
+            count: Tokens scheduled in this batch, not future output length.
+        Raises:
+            ValueError: Scheduled writes exceed the provided physical allocation.
+        """
+        if count <= 0:
+            return
+        for group, size in enumerate(tokens_per_block):
+            end = (start + count + size - 1) // size
+            blocks = block_ids.get(group, [])
+            if start < 0 or end > len(blocks):
+                raise ValueError("scheduled KV access exceeds physical allocation")
+            self.kv_read_blocks[group] = tuple(
+                sorted(set(self.kv_read_blocks.get(group, ())) | set(blocks[:end]))
+            )
+            self.kv_write_blocks[group] = tuple(
+                sorted(
+                    set(self.kv_write_blocks.get(group, ()))
+                    | set(blocks[start // size : end])
+                )
+            )
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
@@ -21,6 +21,7 @@ from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.hybrid_session_cleanup import ConfirmedSessionCleanup
+from lmcache.integration.vllm.kv_page_ownership import PendingKVPageAccess
 from lmcache.integration.vllm.phase_hooks import (
     observed_retirement_call,
     observed_worker_call,
@@ -1362,6 +1363,7 @@ class LMCacheMPWorkerAdapter:
 
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
+        self.page_ownership = PendingKVPageAccess()
         # request_id -> (future, block_ids)
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
@@ -1733,6 +1735,7 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting store requests."
             )
+        self.wait_for_kv_access(dict(enumerate(op.block_ids)), {})
         future = self.transfer_ctx.submit_store(
             request_id,
             key,
@@ -1743,6 +1746,10 @@ class LMCacheMPWorkerAdapter:
             self.blocks_in_chunk,
         )
         self.store_futures[request_id] = future
+        if self.require_terminal_completion:
+            self.page_ownership.record(
+                future, dict(enumerate(op.block_ids)), writes=False
+            )
         if event is not None:
             self.store_events[request_id] = event
 
@@ -1794,6 +1801,7 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
+        self.wait_for_kv_access({}, dict(enumerate(op.block_ids)))
         future = self.transfer_ctx.submit_retrieve(
             request_id,
             key,
@@ -1805,6 +1813,10 @@ class LMCacheMPWorkerAdapter:
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
+        if self.require_terminal_completion:
+            self.page_ownership.record(
+                future, dict(enumerate(op.block_ids)), writes=True
+            )
         if event is not None:
             self.retrieve_events[request_id] = event
 
@@ -1960,6 +1972,8 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
+        if self.require_terminal_completion:
+            self.page_ownership.reap()
         self._finished_during_receive.update(
             finished_req_ids_from_engine
             & (self.retrieve_futures.keys() | self._dropped_retrieves)
@@ -2105,6 +2119,9 @@ class LMCacheMPWorkerAdapter:
                 "get_finished_with_lazy_offload is only available in lazy offload mode"
             )
 
+        if self.require_terminal_completion:
+            self.page_ownership.reap()
+
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
@@ -2247,6 +2264,27 @@ class LMCacheMPWorkerAdapter:
         # Force device sync here, compare to preemption, perf panelty is trivial
         with worker_observation_span("worker_preempt_device_sync"):
             torch_dev.synchronize()
+
+    def wait_for_kv_access(
+        self,
+        read_blocks: Mapping[int, Sequence[int]],
+        write_blocks: Mapping[int, Sequence[int]],
+    ) -> None:
+        """Wait for conflicting MP physical accesses, even without a preempt hint.
+
+        Args:
+            read_blocks: Actual upcoming reads indexed by engine group.
+            write_blocks: Actual upcoming writes indexed by engine group.
+        Raises:
+            TimeoutError: Remote completion is unavailable; do not access pages.
+            Exception: An ambiguous transport failure; protection is retained.
+        """
+        if self.require_terminal_completion:
+            with worker_observation_span("worker_page_ownership_wait"):
+                self.page_ownership.reap()
+                self.page_ownership.wait(
+                    read_blocks, write_blocks, timeout=self._mq_timeout
+                )
 
     def shutdown(self) -> None:
         """
