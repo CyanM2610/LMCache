@@ -179,3 +179,21 @@ elapsed time includes launch gaps and is not DMA-active time. Async client CPU
 clock deltas can include other tasks. Do not add these durations as independent
 service costs. ``NATIVE_EXECUTION_003.md`` links the bounded training evidence and
 remaining transport/queue/contention gaps; it does not declare a calibrated model.
+
+D2 numerical acceptance gate
+----------------------------
+
+``prepare_d2_numeric.py`` freezes complete supplied documents and synthetic short
+inputs, hashes local model shards, and checks an independent NumPy YaRN formula
+against pinned vLLM and Transformers CPU implementations. ``run_d2_numeric.py``
+uses separate native and HF/PyTorch processes, full reference prefill and complete
+past, retaining all vocabulary logprobs for four independently generated tokens.
+``analyze_d2_numeric.py`` requires distinct backends, frozen input/config hashes,
+normalized complete vectors, exact greedy IDs and the predeclared probability
+thresholds. A failed short gate prevents longer inference and the capacity canary.
+
+The native004 short gate failed its top10-union tolerance despite matching greedy
+IDs. An operator diagnosis confirmed different BF16 RMSNorm casting order before
+attention; it did not establish exclusive attribution of the full-model error.
+The reference and thresholds were retained. See ``NATIVE_D2_004.md`` for the
+failure evidence and deferred long-context/capacity work.
