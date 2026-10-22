@@ -20,6 +20,11 @@ import zmq
 from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.hybrid_promotion import (
+    PromotionCommand,
+    PromotionCompletions,
+    PromotionReceipt,
+)
 from lmcache.integration.vllm.hybrid_session_cleanup import ConfirmedSessionCleanup
 from lmcache.integration.vllm.kv_page_ownership import PendingKVPageAccess
 from lmcache.integration.vllm.phase_hooks import (
@@ -1372,6 +1377,8 @@ class LMCacheMPWorkerAdapter:
         # event object to stay alive until the consumer is done with it.
         self.store_events: dict[str, _IpcEvent] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
+        self.promotion_completions = PromotionCompletions()
+        self._uncertain_promotion: tuple[_IpcEvent, LoadStoreOp] | None = None
 
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
@@ -1626,7 +1633,10 @@ class LMCacheMPWorkerAdapter:
             (event stays cleared; retried on the next successful PING).
         """
         if self.require_terminal_completion and (
-            self.store_futures or self.retrieve_futures
+            self.store_futures
+            or self.retrieve_futures
+            or self.promotion_completions.pending
+            or self._uncertain_promotion is not None
         ):
             # Retain the exporting context while a previous server may still
             # own its IPC mappings. A lost terminal response requires restart.
@@ -1752,6 +1762,77 @@ class LMCacheMPWorkerAdapter:
             )
         if event is not None:
             self.store_events[request_id] = event
+
+    def submit_promotion(self, command: PromotionCommand, event: _IpcEvent) -> None:
+        """Submit post-forward LOAD under independent physical-page ownership.
+
+        Args:
+            command: TP1/dense-group control from scheduler-owned reservations.
+            event: Live producer event recorded after this worker's forward.
+        Raises:
+            ValueError: Invalid geometry, unsupported mode or duplicate control.
+            Exception: Ambiguous submission failure; do not release the targets.
+        """
+        if (
+            not self.require_terminal_completion
+            or self.parallel_strategy.vllm_world_size != 1
+            or command.chunk_size != self.lmcache_tokens_per_chunk
+            or command.block_size <= 0
+            or command.block_size * self.blocks_in_chunk != command.chunk_size
+            or command.chunk_size % command.block_size
+            or len(command.token_ids) != len(command.block_ids) * command.block_size
+            or len(command.token_ids) % command.chunk_size
+            or not 0 <= command.num_cached_blocks < len(command.block_ids)
+            or len(set(command.block_ids)) != len(command.block_ids)
+            or any(block <= 0 for block in command.block_ids)
+            or self.promotion_completions.contains(command.control_id)
+            or self._uncertain_promotion is not None
+        ):
+            raise ValueError("unsupported or duplicate promotion command")
+        self._ensure_heartbeat_started()
+        if not self.is_healthy:
+            self.promotion_completions.record(command.control_id, None, None)
+            return
+        if self.transfer_ctx is None:
+            raise RuntimeError("promotion requires a registered transfer context")
+        cached_tokens = command.num_cached_blocks * command.block_size
+        start = cached_tokens // command.chunk_size * command.chunk_size
+        op = LoadStoreOp(
+            token_ids=list(command.token_ids),
+            block_ids=[list(command.block_ids[start // command.block_size :])],
+            start=start,
+            end=len(command.token_ids),
+            skip_first_n_tokens=cached_tokens - start,
+        )
+        targets = {0: command.block_ids[command.num_cached_blocks :]}
+        self.wait_for_kv_access({}, targets)
+        key = self._create_key(
+            op.token_ids, op.start, op.end, request_id=command.control_id
+        )
+        self._uncertain_promotion = (event, op)
+        future = self.transfer_ctx.submit_retrieve(
+            command.control_id,
+            key,
+            self.instance_id,
+            self.kv_caches,
+            self._block_ids_per_group(op),
+            event,
+            self.blocks_in_chunk,
+            skip_first_n_tokens=op.skip_first_n_tokens,
+        )
+        self.page_ownership.record(future, targets, writes=True)
+        self.promotion_completions.record(command.control_id, future, (event, op))
+        self._uncertain_promotion = None
+
+    def get_promotion_receipts(self) -> tuple[PromotionReceipt, ...]:
+        """Poll independent terminal results without native request completion IDs.
+
+        Returns:
+            Successful/failed terminal receipts, at most once per control.
+        Raises:
+            Exception: Ambiguous completion failure, retaining future ownership.
+        """
+        return self.promotion_completions.poll()
 
     @_lmcache_nvtx_annotate
     @observed_worker_call("worker_load_submit")
@@ -2309,7 +2390,10 @@ class LMCacheMPWorkerAdapter:
             future.result(timeout=self._mq_timeout)
         except TimeoutError:
             if self.require_terminal_completion and (
-                self.store_futures or self.retrieve_futures
+                self.store_futures
+                or self.retrieve_futures
+                or self.promotion_completions.pending
+                or self._uncertain_promotion is not None
             ):
                 raise RuntimeError(
                     "cannot close hybrid GPU context without a terminal drain reply"

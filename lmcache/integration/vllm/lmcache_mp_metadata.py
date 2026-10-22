@@ -15,6 +15,7 @@ from vllm.v1.utils import ConstantList
 import torch
 
 # First Party
+from lmcache.integration.vllm.hybrid_promotion import PromotionCommand, PromotionReceipt
 from lmcache.integration.vllm.utils import (
     apply_mm_hashes_to_token_ids,
     extract_mm_features,
@@ -359,6 +360,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
+        self.promotions: tuple[PromotionCommand, ...] = ()
         self.need_flush_before_forward: bool = False
         self.kv_read_blocks: dict[int, tuple[int, ...]] = {}
         self.kv_write_blocks: dict[int, tuple[int, ...]] = {}
@@ -434,6 +436,7 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_store_requests: dict[str, int]
+    promotion_receipts: tuple[PromotionReceipt, ...] = ()
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -442,4 +445,7 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
         merged = dict(self.completed_store_requests)
         for k, v in other.completed_store_requests.items():
             merged[k] = merged.get(k, 0) + v
-        return LMCacheMPWorkerMetadata(completed_store_requests=merged)
+        return LMCacheMPWorkerMetadata(
+            completed_store_requests=merged,
+            promotion_receipts=self.promotion_receipts + other.promotion_receipts,
+        )

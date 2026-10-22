@@ -36,6 +36,7 @@ import zmq
 # First Party
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.hybrid_promotion import PromotionScheduler
 from lmcache.integration.vllm.kv_cache_group_edits import (
     apply_kv_cache_group_edits,
     validate_kv_cache_groups,
@@ -55,6 +56,7 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (
     LMCacheMPWorkerMetadata,
 )
 from lmcache.integration.vllm.utils import (
+    extract_request_configs_from_request,
     mla_only,
     vllm_layout_hints,
 )
@@ -102,6 +104,7 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.block_pool import ExternalPrefix
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -464,7 +467,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
       heartbeat pings.
     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
       enters vLLM's waiting queue. Disabled by default.
+    - lmcache.mp.promotion_control: enable independent V2 worker controls for
+      terminal TP1, single dense-group prefixes. Disabled by default.
     """
+
+    # No controller exists until an explicitly enabled scheduler binds its pool.
+    _promotion: PromotionScheduler | None = None
+    _promotion_enabled: bool = False
 
     def __init__(
         self,
@@ -494,6 +503,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._require_terminal_completion = bool(
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "lmcache.mp.require_terminal_completion", False
+            )
+        )
+        self._promotion_enabled = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.promotion_control", False
             )
         )
 
@@ -586,6 +600,28 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self.lazy_offload = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.lazy_offload", False
         )
+        if self._promotion_enabled and (
+            not self._require_terminal_completion
+            or not vllm_config.use_v2_model_runner
+            or vllm_config.parallel_config.world_size != 1
+            or dp_size != 1
+            or n_servers != 1
+            or dcp_size != 1
+            or self.lazy_offload
+            or self.transfer_intermediate_tensors
+            or not vllm_config.cache_config.enable_prefix_caching
+            or kv_cache_config is None
+            or len(kv_cache_config.kv_cache_groups) != 1
+            or any(
+                type(spec).__name__ != "FullAttentionSpec"
+                for spec in _iter_kv_cache_specs(kv_cache_config)
+            )
+        ):
+            raise ValueError(
+                "promotion_control requires V2 runner, terminal TP1, "
+                "a single dense group, "
+                "prefix caching and non-lazy offload"
+            )
 
         if self.role == KVConnectorRole.SCHEDULER:
             # Banner from the scheduler role only, so tensor-parallel
@@ -932,15 +968,38 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         return val
 
     def build_connector_worker_meta(self):
-        if not self.lazy_offload:
-            return None
-        completed_store_requests = self.worker_adapter.get_completed_store_requests()
-        if completed_store_requests:
+        completed_store_requests = (
+            self.worker_adapter.get_completed_store_requests()
+            if self.lazy_offload
+            else {}
+        )
+        receipts = (
+            self.worker_adapter.get_promotion_receipts()
+            if self._promotion_enabled
+            else ()
+        )
+        if completed_store_requests or receipts:
             return LMCacheMPWorkerMetadata(
-                completed_store_requests=completed_store_requests
+                completed_store_requests=completed_store_requests or {},
+                promotion_receipts=receipts,
             )
         else:
             return None
+
+    def submit_control(self) -> None:
+        """Submit independent Promotion LOADs in normal or empty worker steps.
+
+        Completion and publication remain separated by the native output FIFO.
+        Raises the underlying adapter error without releasing HBM ownership.
+        """
+        if not self._promotion_enabled:
+            return
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, LMCacheMPConnectorMetadata)
+        if metadata.promotions:
+            event = self.worker_adapter.create_recorded_event()
+            for command in metadata.promotions:
+                self.worker_adapter.submit_promotion(command, event)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -968,6 +1027,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         is shutting down to ensure that all the async operations are
         completed and the connector is cleaned up properly.
         """
+        if self._promotion is not None and self._promotion.has_pending_work:
+            raise RuntimeError(
+                "promotion controls must drain before scheduler shutdown"
+            )
         if hasattr(self, "worker_adapter"):
             self.worker_adapter.shutdown()
         if hasattr(self, "scheduler_adapter"):
@@ -990,8 +1053,55 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if self.role == KVConnectorRole.SCHEDULER:
             logger.info("Bind GPU block pool in LMCacheMPConnector scheduler")
             self._gpu_block_pool = gpu_block_pool
+            if self._promotion_enabled:
+                if self._group_tokens_per_block != [gpu_block_pool.hash_block_size]:
+                    raise ValueError(
+                        "promotion requires native single-group hash geometry"
+                    )
+                self._promotion = PromotionScheduler(
+                    gpu_block_pool, self.scheduler_adapter
+                )
             if self.lazy_offload:
                 self._pending_store.bind_gpu_block_pool(gpu_block_pool)
+
+    def snapshot_promotion_prefix(
+        self, request: "Request", num_tokens: int
+    ) -> "ExternalPrefix":
+        """Snapshot known text/hashes; the native frontend Request is not retained.
+
+        Args:
+            request: Already observed native request, not a synthetic control.
+            num_tokens: Whole-block known prefix length.
+        Returns:
+            Immutable prefix descriptor for later policy selection.
+        Raises:
+            ValueError: Disabled control, unbound pool, or unsupported text input.
+        """
+        if self._promotion is None or self._gpu_block_pool is None:
+            raise ValueError("promotion control is not enabled and bound")
+        if extract_request_configs_from_request(request):
+            raise ValueError(
+                "promotion does not yet support per-request LMCache configs"
+            )
+        return self._gpu_block_pool.snapshot_external_prefix(request, num_tokens)
+
+    def queue_promotion(
+        self, prefix: "ExternalPrefix", max_new_blocks: int
+    ) -> str | None:
+        """Queue one observed prefix; runtime owns capacity and source leases.
+
+        Returns a control ID or None for duplicate/queue rejection. Raises
+        ValueError for disabled control or invalid geometry/budget.
+        """
+        if self._promotion is None:
+            raise ValueError("promotion control is not enabled and bound")
+        return self._promotion.enqueue(prefix, max_new_blocks)
+
+    def cancel_promotion(self, control_id: str) -> None:
+        """Cancel a control while retaining captured copies until terminal output."""
+        if self._promotion is None:
+            raise ValueError("promotion control is not enabled and bound")
+        self._promotion.cancel(control_id)
 
     def get_num_new_matched_tokens(
         self,
@@ -1233,6 +1343,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
+        if self._promotion is not None:
+            metadata.promotions = self._promotion.prepare()
 
         if len(metadata) > 0:
             logger.debug("Final connector metadata: %s", metadata)
@@ -1250,13 +1362,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        meta = connector_output.kv_connector_worker_meta
+        if not isinstance(meta, LMCacheMPWorkerMetadata):
+            return
+        if meta.promotion_receipts:
+            if self._promotion is None:
+                raise ValueError("promotion receipt without enabled scheduler owner")
+            for receipt in meta.promotion_receipts:
+                self._promotion.adopt(receipt)
         if not self.lazy_offload:
             return
         if not self._gpu_block_pool:
             raise ValueError("Lazy offload is enabled but gpu block pool is not binded")
-        meta = connector_output.kv_connector_worker_meta
-        if not isinstance(meta, LMCacheMPWorkerMetadata):
-            return
         for req_id, count in meta.completed_store_requests.items():
             if self.scheduler_adapter.update_pending_store_count(req_id, count):
                 gpu_block_ids = self._pending_store.get_request_gpu_block_ids(req_id)
@@ -1345,7 +1462,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             during a connector-only step. Non-lazy mode uses vLLM's normal
             delayed-free path and does not need this keepalive.
         """
-        if self.role != KVConnectorRole.SCHEDULER or not self.lazy_offload:
+        if self.role != KVConnectorRole.SCHEDULER:
+            return False
+        if self._promotion is not None and self._promotion.has_pending_work:
+            return True
+        if not self.lazy_offload:
             return False
 
         pending_store = getattr(self, "_pending_store", None)
