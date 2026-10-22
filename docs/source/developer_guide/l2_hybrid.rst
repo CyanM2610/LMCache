@@ -197,3 +197,23 @@ IDs. An operator diagnosis confirmed different BF16 RMSNorm casting order before
 attention; it did not establish exclusive attribution of the full-model error.
 The reference and thresholds were retained. See ``NATIVE_D2_004.md`` for the
 failure evidence and deferred long-context/capacity work.
+
+Bounded host-cost attribution
+-----------------------------
+
+``run_service.py --capture-environment`` records actual worker threads, affinity,
+normalization dispatch and resolved settings before and after measurement.
+``CustomOp.get_dispatch_info`` reads the stored callable without redispatch.
+Configured IR priority must be distinguished from executed kernel evidence.
+
+Native005 completed six short HBM-only OFF/phase processes and two explanatory
+CPU+CUDA profiles. The optional ``L2_HYBRID_MODEL_DISPATCH=1`` hook in the heavy
+processes records model-call host boundaries, preserving native output, waits
+and exceptions. Profiler durations are explanatory and cannot be used as OFF
+service costs. API/kernel correlations show asynchronous overlap; stream event
+envelopes include launch gaps, and output waiting wall depends on prior GPU work.
+
+``NATIVE_HOST_COSTS_005.md`` documents exact shapes, actual RMSNorm dispatch,
+observer costs, unavailable hardware occupancy counters, a disclosed C-phase
+metadata source-freeze exception, and the remaining cost-identification limits.
+The native004 failed numerical gate remains unchanged.

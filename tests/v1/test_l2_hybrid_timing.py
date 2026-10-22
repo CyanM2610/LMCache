@@ -353,3 +353,74 @@ def test_failed_phase_drain_is_audited_without_interrupting_native_work(
         for s in (tmp_path / "failed-phase.jsonl").read_text().splitlines()
     ]
     assert next(r for r in rows if r["event"] == "phase_drain")["errors"]
+
+
+def test_dispatch_description_reports_stored_callable_without_redispatch() -> None:
+    """Changing the surrounding config cannot change a constructed-op observation."""
+    # Third Party
+    from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.custom_op import CustomOp
+
+    class Probe(CustomOp):
+        name = "native005_dispatch_probe"
+
+        def forward_native(self) -> str:
+            return "forward_native"
+
+        def forward_cuda(self) -> str:
+            return "forward_cuda"
+
+        def forward_cpu(self) -> str:
+            return "forward_cpu"
+
+    enabled = VllmConfig(
+        compilation_config=CompilationConfig(mode=0, custom_ops=["all"])
+    )
+    disabled = VllmConfig(
+        compilation_config=CompilationConfig(mode=0, custom_ops=["none"])
+    )
+    with set_current_vllm_config(enabled):
+        op = Probe()
+        expected = op()
+        description = op.get_dispatch_info()
+        assert description["method_qualname"].endswith(expected)
+    with set_current_vllm_config(disabled):
+        assert op.get_dispatch_info() == description
+        assert op() == expected
+        assert Probe().get_dispatch_info()["method_qualname"].endswith("forward_native")
+
+
+# Contract: public nn.Module hooks must preserve identity, exceptions and call
+# counts; a CPU dummy is sufficient and must require no GPU setup.
+def test_model_dispatch_hooks_preserve_results_and_failures() -> None:
+    """Optional explanatory hooks preserve native calls and always pair exits."""
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.integration.vllm.model_dispatch_observer import ModelDispatchObserver
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, value: object) -> object:
+            self.calls += 1
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    model = Model()
+    observation = ModelDispatchObserver(model)
+    value = object()
+    assert model(value) is value
+    error = ValueError("native forward failed")
+    with pytest.raises(ValueError) as caught:
+        model(error)
+    assert caught.value is error
+    assert model.calls == 2
+    assert observation.status() == {"pending": 0, "errors": []}
+    observation.close()
+    assert model(value) is value
+    assert model.calls == 3
