@@ -317,7 +317,7 @@ def select_witnesses(rows: list[dict]) -> dict:
 
 
 class Timeline:
-    """Stream a gzip Chrome trace without retaining millions of GPU kernels."""
+    """Stream Chrome events with separate logical tracks for CPU observers."""
 
     def __init__(self, path: Path, origin: int):
         self.file = gzip.open(path, "wt", encoding="utf-8")
@@ -334,6 +334,11 @@ class Timeline:
         self.file.write(json.dumps(row, separators=(",", ":"), default=str))
 
     def add(self, name, start, end=None, *, pid=0, tid=0, args=None, cat="host"):
+        if cat in ("host", "nvtx") and isinstance(pid, int) and isinstance(tid, int):
+            args = {**(args or {}), "real_pid": pid, "real_tid": tid}
+            source = "NVTX" if cat == "nvtx" else "host"
+            pid = f"{source} / process:{pid}"
+            tid = f"thread:{tid}"
         if isinstance(pid, str):
             label = pid
             if label not in self.processes:

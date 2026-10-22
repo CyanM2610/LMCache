@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Diagnostic intervals must neither double-count TTFT nor invent history."""
 
+import gzip
+import json
 import unittest
+from io import StringIO
+from unittest.mock import patch
 
 from lmcache.integration.kv_wait_probe.analyze import (
     INGRESS_MILESTONES,
+    Timeline,
     group_request_events,
     ingress_intervals,
     partition,
@@ -13,6 +18,43 @@ from lmcache.integration.kv_wait_probe.workload import actual_input
 
 
 class WaitAttributionTests(unittest.TestCase):
+    def test_crossing_cpu_observations_have_distinct_tracks_and_unchanged_times(self):
+        stream = StringIO()
+        host_args = {"request_id": "chat:a:0", "pid": 42, "tid": 7}
+        with patch.object(gzip, "open", return_value=stream):
+            timeline = Timeline("unused.json.gz", 0)
+            timeline.add("model_forward", 1000, 4000, pid=42, tid=7, args=host_args)
+            timeline.add(
+                "model_forward",
+                2000,
+                5000,
+                pid=42,
+                tid=7,
+                args={"request_id": "chat:a:0"},
+                cat="nvtx",
+            )
+            timeline.add("next_step", 5000, 6000, pid=42, tid=7)
+            payload = stream.getvalue() + '],"displayTimeUnit":"ms"}'
+            timeline.close()
+        events = json.loads(payload)["traceEvents"]
+        host, nvtx, next_step = [r for r in events if r["ph"] == "X"]
+        self.assertNotEqual(host["pid"], nvtx["pid"])
+        self.assertNotEqual(host["tid"], nvtx["tid"])
+        self.assertEqual(
+            (host["pid"], host["tid"]), (next_step["pid"], next_step["tid"])
+        )
+        self.assertEqual((host["ts"], host["dur"]), (1.0, 3.0))
+        self.assertEqual((nvtx["ts"], nvtx["dur"]), (2.0, 3.0))
+        for row in (host, nvtx):
+            self.assertIsInstance(row["pid"], int)
+            self.assertIsInstance(row["tid"], int)
+            self.assertEqual(row["args"]["request_id"], "chat:a:0")
+            self.assertEqual(
+                (row["args"]["real_pid"], row["args"]["real_tid"]), (42, 7)
+            )
+        self.assertNotIn("real_pid", host_args)
+        self.assertEqual(len([r for r in events if r["name"] == "process_name"]), 2)
+
     def test_logical_api_and_pre_randomization_events_join_native_chain(self) -> None:
         events = [
             dict(event="engine_request_received", request_id="native-4", ts_ns=30),
