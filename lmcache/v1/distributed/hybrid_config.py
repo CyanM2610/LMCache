@@ -17,20 +17,22 @@ class HybridMemoryConfig:
     modeled_control: str
     client_library: str
     alignment: int = 4096
-    policy: Literal["dram_first", "force_dram", "force_cxl"] = "dram_first"
+    policy: Literal["dram_first", "force_dram", "force_cxl", "all_lru"] = "dram_first"
     completion_timeout_s: float = 30.0
     poll_interval_s: float = 0.0002
     diagnostic_failure: Literal["store_partial", "load_partial"] | None = None
     diagnostic_lookup_delay_s: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.dram_bytes < 0 or self.cxl_bytes <= 0:
-            raise ValueError("DRAM quota must be nonnegative and CXL positive")
+        if min(self.dram_bytes, self.cxl_bytes) < 0 or (
+            self.dram_bytes + self.cxl_bytes == 0
+        ):
+            raise ValueError("pool quotas must be nonnegative with positive total")
         if self.alignment <= 0 or self.alignment & (self.alignment - 1):
             raise ValueError("alignment must be a positive power of two")
         if any(n % self.alignment for n in (self.dram_bytes, self.cxl_bytes)):
             raise ValueError("pool quotas must be aligned")
-        if self.policy not in ("dram_first", "force_dram", "force_cxl"):
+        if self.policy not in ("dram_first", "force_dram", "force_cxl", "all_lru"):
             raise ValueError("unsupported hybrid placement policy")
         if self.completion_timeout_s <= 0 or self.poll_interval_s <= 0:
             raise ValueError("completion timeout and polling interval must be positive")

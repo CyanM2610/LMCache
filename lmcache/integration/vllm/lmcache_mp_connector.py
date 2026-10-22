@@ -1086,7 +1086,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         return self._gpu_block_pool.snapshot_external_prefix(request, num_tokens)
 
     def queue_promotion(
-        self, prefix: "ExternalPrefix", max_new_blocks: int
+        self, prefix: "ExternalPrefix", max_new_blocks: int, *, min_free_blocks: int = 0
     ) -> str | None:
         """Queue one observed prefix; runtime owns capacity and source leases.
 
@@ -1095,7 +1095,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self._promotion is None:
             raise ValueError("promotion control is not enabled and bound")
-        return self._promotion.enqueue(prefix, max_new_blocks)
+        return self._promotion.enqueue(
+            prefix, max_new_blocks, min_free_blocks=min_free_blocks
+        )
 
     def cancel_promotion(self, control_id: str) -> None:
         """Cancel a control while retaining captured copies until terminal output."""

@@ -79,3 +79,15 @@ class ForcedPoolPolicy(DramFirstPolicy):
     def victims(self, candidates: list[EvictionCandidate]) -> list[str]:
         """Keep the same legal CXL-only eviction rule, even in diagnostics."""
         return super().victims(candidates) if self.medium == "cxl_sim" else []
+
+
+class AllPoolsLRUPolicy(DramFirstPolicy):
+    """Prefer free DRAM, then CXL; reclaim legal objects from either pool."""
+
+    def victims(self, candidates: list[EvictionCandidate]) -> list[str]:
+        """Order only legal objects by runtime access time and stable identity."""
+        eligible = [entry for entry in candidates if entry.evictable]
+        return [
+            entry.object_id
+            for entry in sorted(eligible, key=lambda e: (e.last_access_ns, e.object_id))
+        ]

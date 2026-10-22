@@ -22,6 +22,7 @@ from lmcache.v1.distributed.cxl_sim_client import (
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.hybrid_config import HybridMemoryConfig
 from lmcache.v1.distributed.hybrid_policy import (
+    AllPoolsLRUPolicy,
     DramFirstPolicy,
     ForcedPoolPolicy,
     Medium,
@@ -48,8 +49,10 @@ class HybridL1MemoryManager:
             ValueError: For invalid capacities/alignment or quota beyond backing.
             RuntimeError: If CUDA registration or the server protocol fails.
         """
-        if config.dram_bytes < 0 or config.cxl_bytes <= 0:
-            raise ValueError("DRAM capacity must be nonnegative and CXL positive")
+        if min(config.dram_bytes, config.cxl_bytes) < 0 or (
+            config.dram_bytes + config.cxl_bytes == 0
+        ):
+            raise ValueError("pool quotas must be nonnegative with positive total")
         if config.alignment <= 0 or config.alignment & (config.alignment - 1):
             raise ValueError("alignment must be a positive power of two")
         if any(
@@ -58,7 +61,9 @@ class HybridL1MemoryManager:
             raise ValueError("pool quotas must be aligned")
         self.config = config
         self.policy = policy or (
-            DramFirstPolicy()
+            AllPoolsLRUPolicy()
+            if config.policy == "all_lru"
+            else DramFirstPolicy()
             if config.policy == "dram_first"
             else ForcedPoolPolicy(
                 "dram" if config.policy == "force_dram" else "cxl_sim"
@@ -85,10 +90,11 @@ class HybridL1MemoryManager:
             ):
                 raise RuntimeError("CUDA registration of CXLMemSim payload failed")
             self.registered = True
-            cxl_tensor = torch.frombuffer(
-                self.mapping.mapping, dtype=torch.uint8, count=config.cxl_bytes
-            )
-            self.pools["cxl_sim"] = TensorMemoryAllocator(cxl_tensor, config.alignment)
+            if config.cxl_bytes:
+                cxl_tensor = torch.frombuffer(
+                    self.mapping.mapping, dtype=torch.uint8, count=config.cxl_bytes
+                )
+                self.pools["cxl_sim"] = TensorMemoryAllocator(cxl_tensor, config.alignment)
             if config.dram_bytes:
                 dram_tensor = torch.empty(
                     config.dram_bytes, dtype=torch.uint8, device="cpu", pin_memory=True

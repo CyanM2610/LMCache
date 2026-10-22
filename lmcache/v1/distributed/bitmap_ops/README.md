@@ -1,1 +1,0 @@
-../../../../docs/design/v1/distributed/bitmap_ops/README.md

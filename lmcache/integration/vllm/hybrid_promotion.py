@@ -111,6 +111,7 @@ class PendingPromotion:
     reservation: ExternalPrefixReservation | None = None
     cancelled: bool = False
     settled: bool = False
+    min_free_blocks: int = 0
 
 
 class PromotionScheduler:
@@ -153,12 +154,15 @@ class PromotionScheduler:
         """Keep native empty worker iterations alive until receipt adoption."""
         return bool(self._pending)
 
-    def enqueue(self, prefix: ExternalPrefix, max_new_blocks: int) -> str | None:
+    def enqueue(
+        self, prefix: ExternalPrefix, max_new_blocks: int, *, min_free_blocks: int = 0
+    ) -> str | None:
         """Lease a known host prefix without allocating or changing frontend work.
 
         Args:
             prefix: Immutable native snapshot; must end at a host chunk boundary.
             max_new_blocks: Positive HBM allocation limit for this control.
+            min_free_blocks: Headroom enforced at actual native reservation.
         Returns:
             Unique control ID, or None for a duplicate/full pending queue.
         Raises:
@@ -168,6 +172,7 @@ class PromotionScheduler:
         chunk_size = self._adapter.lmcache_tokens_per_chunk
         if (
             max_new_blocks <= 0
+            or min_free_blocks < 0
             or not prefix.token_ids
             or chunk_size <= 0
             or len(prefix.token_ids) % chunk_size
@@ -178,7 +183,9 @@ class PromotionScheduler:
         ):
             return None
         control_id = "lmcache-promotion-" + uuid.uuid4().hex
-        self._pending[control_id] = PendingPromotion(prefix, max_new_blocks)
+        self._pending[control_id] = PendingPromotion(
+            prefix, max_new_blocks, min_free_blocks=min_free_blocks
+        )
         self._adapter.maybe_submit_lookup_request(control_id, list(prefix.token_ids))
         self._emit("lookup_submitted", control_id, tokens=len(prefix.token_ids))
         return control_id
@@ -206,8 +213,12 @@ class PromotionScheduler:
             if matched < len(prefix.token_ids):
                 self._retire(control_id, "host_miss")
                 continue
+            reserve_options = (
+                {"min_free_blocks": pending.min_free_blocks}
+                if pending.min_free_blocks else {}
+            )
             reservation = self._pool.reserve_external_prefix(
-                prefix, pending.max_new_blocks
+                prefix, pending.max_new_blocks, **reserve_options
             )
             if reservation is None:
                 self._retire(control_id, "hbm_hit_or_capacity")
