@@ -1220,7 +1220,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         return self._get_num_new_matched_tokens(
             request, num_computed_tokens, allow_lookup_submit=True,
             commit_match=True,
-            idempotent_prefix_accounting=self.decoupled_control_enabled,
+            # Typed actions may defer after matching even when control is OFF.
+            # A repeated match observes the same absolute stored prefix; only
+            # actual STORE commitments advance the incremental suffix watermark.
+            idempotent_prefix_accounting=(self.decoupled_control_enabled or
+                getattr(self, "_operation_feedback_observer", None) is not None),
         )
 
     def begin_prefill_control_step(self, step_id: int) -> None:
