@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from typing import Any
 import threading
+import time
 
 # Third Party
 import pytest
@@ -58,6 +59,7 @@ class Client:
         self.queries: list[str] = []
         self.frees: list[Any] = []
         self.ends: list[str] = []
+        self.ended = threading.Event()
         self.free_ack = ready(None)
         self.end_ack: MessagingFuture[Any] = MessagingFuture()
 
@@ -85,11 +87,34 @@ class Client:
     def end_session(self, request_id: str) -> MessagingFuture[Any]:
         """Record session removal after its preceding obligations."""
         self.ends.append(request_id)
+        self.ended.set()
         return self.end_ack
 
     def close(self) -> None:
         """Close the stub, which owns no transport resources."""
         pass
+
+    def ping(self, instance_id: int | None) -> MessagingFuture[Any]:
+        """Let the actual scheduler heartbeat observe a recovered server."""
+        return ready(True)
+
+    def get_server_generation(self) -> MessagingFuture[Any]:
+        """Identify this test peer's fixed incarnation."""
+        return ready("test-generation")
+
+    def lookup_guarded(
+        self, key: Any, tp_size: int, generation: str
+    ) -> MessagingFuture[Any]:
+        """Record a generation-bound lookup using its actual controllable future."""
+        assert generation == "test-generation"
+        return self.lookup(key, tp_size)
+
+    def end_session_guarded(
+        self, request_id: str, generation: str
+    ) -> MessagingFuture[Any]:
+        """Record a generation-bound cleanup acknowledgement."""
+        assert generation == "test-generation"
+        return self.end_session(request_id)
 
 
 AdapterFactory = Callable[..., tuple[LMCacheMPSchedulerAdapter, list[Client]]]
@@ -401,3 +426,57 @@ def test_end_waits_for_already_sent_status_only(
         client.status.set_result(reply)
         thread.join(timeout=6)
         assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("stage", ["lookup_ack", "status"])
+def test_hybrid_cleanup_survives_timeout_and_late_reply(
+    make_adapter: AdapterFactory, stage: str
+) -> None:
+    """Native end/local cleanup must leave a confirmed owner across recovery."""
+    adapter, (client,) = make_adapter(
+        extra_config={
+            "lmcache.mp.require_terminal_completion": True,
+            "lmcache.mp.mq_timeout": 0.03,
+            "lmcache.mp.heartbeat_interval": 0.02,
+        }
+    )
+    adapter.maybe_submit_lookup_request("lost-ack", list(range(256)))
+    if stage == "status":
+        client.ack.set_result(True)
+        assert adapter.check_lookup_result("lost-ack") is None
+    time.sleep(0.04)
+    assert adapter.check_lookup_result("lost-ack") == 0
+    assert not adapter.is_healthy
+    adapter.end_session("lost-ack")
+    adapter.cleanup_lookup_result("lost-ack")
+    client.ack.set_result(True)
+    client.status.set_result(2)
+    client.end_ack.set_result(True)
+    deadline = time.monotonic() + 1
+    while not client.ends and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client.ends, "recovered backend never receives orphaned END_SESSION"
+    while not adapter.is_healthy and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert adapter.is_healthy
+    assert adapter.cleanup_status()["pending"] == 0
+
+
+def test_hybrid_result_cleanup_preserves_demand_until_retrieve_and_request_end(
+    make_adapter: AdapterFactory,
+) -> None:
+    """Allocation consumes a lookup result before the worker acquires LOAD pins."""
+    adapter, (client,) = make_adapter(
+        extra_config={"lmcache.mp.require_terminal_completion": True}
+    )
+    adapter.maybe_submit_lookup_request("r", list(range(256)))
+    client.ack.set_result(True)
+    client.status.set_result(2)
+    client.end_ack.set_result(True)
+    assert resolved(adapter) == 128
+    adapter.cleanup_lookup_result("r")
+    assert not client.ended.wait(0.1), (
+        "allocation cleanup prematurely ended LOAD ownership"
+    )
+    adapter.end_session("r")
+    assert client.ended.wait(1)

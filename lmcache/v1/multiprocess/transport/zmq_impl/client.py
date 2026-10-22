@@ -148,6 +148,44 @@ class ZmqMultiprocessClient(RequestClient):
         """End a request session."""
         return self._call(RequestType.END_SESSION, request_id)
 
+    def get_server_generation(self) -> MessagingFuture[Any]:
+        """Return Future[str] identifying the hybrid incarnation before LOOKUP.
+
+        Awaiting an unavailable endpoint may time out. Keep this generation
+        fixed for that adapter's ownership; do not replace it after a restart.
+        """
+        return self._call(RequestType.GET_SERVER_GENERATION)
+
+    def lookup_guarded(
+        self, key: Any, tp_size: int, generation: str
+    ) -> MessagingFuture[Any]:
+        """Reserve only on the original hybrid incarnation.
+
+        Args:
+            key: Request identity and prefix.
+            tp_size: Legacy wire field; reader count comes from key.
+            generation: Original generation obtained before LOOKUP submission.
+        Returns:
+            Future[bool]: True if accepted, False for mismatch/retired request.
+            Awaiting the future may raise a transport error or time out.
+        """
+        return self._call(RequestType.LOOKUP_GUARDED, key, tp_size, generation)
+
+    def end_session_guarded(
+        self, request_id: str, generation: str
+    ) -> MessagingFuture[Any]:
+        """Confirm cleanup only on the server that could own this request.
+
+        Args:
+            request_id: Unique engine demand that has ended.
+            generation: Original generation that could own its logical lease.
+        Returns:
+            Future[bool]: True confirms logical cleanup while DMA pins remain
+            owned by submitted transfers; False means generation mismatch.
+            Awaiting the future may raise a transport error or time out.
+        """
+        return self._call(RequestType.END_SESSION_GUARDED, request_id, generation)
+
     def register_kv_cache_engine_driven_context(
         self, payload: Any
     ) -> MessagingFuture[Any]:

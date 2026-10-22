@@ -3,6 +3,7 @@
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
 import math
@@ -19,6 +20,7 @@ import zmq
 from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.hybrid_session_cleanup import ConfirmedSessionCleanup
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
@@ -654,6 +656,7 @@ class LMCacheMPSchedulerAdapter:
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
         )
+        confirmed_cleanup = False
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
@@ -661,6 +664,7 @@ class LMCacheMPSchedulerAdapter:
             self._nonblocking_lookup_status = cfg[
                 ExtraConfigDefault.nonblocking_lookup_status.name
             ]
+            confirmed_cleanup = cfg[ExtraConfigDefault.require_terminal_completion.name]
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -727,6 +731,18 @@ class LMCacheMPSchedulerAdapter:
             ev.set()
             self._health_events[url] = ev
 
+        self._owned_lookup_ids: set[str] = set()
+        self._session_cleanup: ConfirmedSessionCleanup | None = None
+        if confirmed_cleanup:
+            try:
+                self._session_cleanup = ConfirmedSessionCleanup(
+                    self.req_clients, self._health_events, self._mq_timeout
+                )
+            except BaseException:
+                for client in self.req_clients.values():
+                    client.close()
+                raise
+
         # Heartbeat thread is created but NOT started yet.
         # It will be lazily started on the first lookup
         # request, by which time vLLM is fully ready.
@@ -756,10 +772,10 @@ class LMCacheMPSchedulerAdapter:
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""
-        if self._heartbeats is not None:
+        if self._heartbeats:
             return
         with self._heartbeat_lock:
-            if self._heartbeats is not None:
+            if self._heartbeats:
                 return
             for url, client in self.req_clients.items():
                 hb = HeartbeatThread(
@@ -767,8 +783,11 @@ class LMCacheMPSchedulerAdapter:
                     health_event=self._health_events[url],
                     interval=self._heartbeat_interval,
                 )
-                hb.start()
+                owner = self._session_cleanup
+                if owner is not None:
+                    hb.register_recover_callback(partial(owner.recover, url))
                 self._heartbeats[url] = hb
+                hb.start()
 
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
@@ -826,8 +845,16 @@ class LMCacheMPSchedulerAdapter:
             request_configs=request_configs,
         ).no_worker_id_version()
 
-        futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(key, self.tp_size)
+        if self._session_cleanup is not None:
+            self._owned_lookup_ids.add(request_id)
+        futures: dict[str, MessagingFuture[Any]] = {
+            url: (
+                self.req_clients[url].lookup_guarded(
+                    key, self.tp_size, self._session_cleanup.generations[url]
+                )
+                if self._session_cleanup is not None
+                else self.req_clients[url].lookup(key, self.tp_size)
+            )
             for url in self._server_urls
         }
 
@@ -925,9 +952,20 @@ class LMCacheMPSchedulerAdapter:
             # pool and may be reordered, and a status query for an unknown
             # request_id answers 0: a spurious miss whose prefetch locks are
             # never released. So never query until every server has acked.
-            ack.futures = {
-                url: fut for url, fut in ack.futures.items() if not fut.query()
-            }
+            waiting = {}
+            for url, future in ack.futures.items():
+                if not future.query():
+                    waiting[url] = future
+                elif self._session_cleanup is not None:
+                    try:
+                        accepted = future.result(timeout=0)
+                    except Exception:
+                        accepted = False
+                    if accepted is not True:
+                        self._mark_lookup_timed_out(url)
+                        del self._unacked_lookups[request_id]
+                        return 0
+            ack.futures = waiting
             if ack.futures:
                 if time.monotonic() - ack.submitted_at >= self._mq_timeout:
                     for url in ack.futures:
@@ -1002,10 +1040,15 @@ class LMCacheMPSchedulerAdapter:
         return self.blocks_in_chunk
 
     def cleanup_lookup_result(self, request_id: str) -> None:
-        """
-        Clean up lookup state for a finished request to prevent memory leak.
+        """Discard consumed lookup results while preserving request ownership.
+
         Args:
-            request_id: The ID of the finished request.
+            request_id: Request whose result has been consumed or abandoned.
+        Notes:
+            Native allocation calls this before worker RETRIEVE. It must not
+            retire the server lease. Request end/shutdown separately transfers
+            ownership to the confirmed cleanup owner, even after these result
+            records have been removed and even while the backend is unhealthy.
         """
         self._pending_lookups.discard(request_id)
         self._unacked_lookups.pop(request_id, None)
@@ -1015,12 +1058,27 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_params.pop(request_id, None)
 
     def shutdown(self) -> None:
-        """Shutdown the scheduler adapter and its resources."""
-        for client in self.req_clients.values():
-            client.close()
+        """Drain confirmed logical cleanup before closing transport clients.
+
+        Raises:
+            RuntimeError: If hybrid cleanup cannot be confirmed. Clients and
+                the cleanup owner remain live; backend restart is required.
+        """
         with self._heartbeat_lock:
             for hb in self._heartbeats.values():
                 hb.stop()
+        if self._session_cleanup is not None:
+            for request_id in list(self._owned_lookup_ids):
+                self.end_session(request_id)
+            self._session_cleanup.close(timeout=max(1.0, min(self._mq_timeout, 5.0)))
+        for client in self.req_clients.values():
+            client.close()
+
+    def cleanup_status(self) -> dict[str, Any]:
+        """Return confirmed hybrid ownership separately from lookup-result state."""
+        if self._session_cleanup is None:
+            return {"enabled": False, "pending": 0}
+        return {"enabled": True, **self._session_cleanup.report_status()}
 
     def free_lookup_locks(
         self,
@@ -1072,13 +1130,24 @@ class LMCacheMPSchedulerAdapter:
         """
         Notify LMCache server to remove the session for a finished request.
 
-        For unacked lookup results, this function will block waiting until
+        Hybrid mode transfers cleanup to a generation-bound background owner;
+        unhealthy state and late replies cannot discard that obligation. The
+        original server must confirm END before it is retired. No DMA pin is
+        released by this control path.
+
+        For legacy unacked lookup results, this function will block waiting until
         they are acked. Already-submitted status requests are also drained
         before END_SESSION so their handlers cannot recreate the session.
 
         Args:
             request_id: The ID of the finished request.
         """
+        if self._session_cleanup is not None:
+            if request_id in self._owned_lookup_ids:
+                self._session_cleanup.retire(request_id)
+                self._owned_lookup_ids.remove(request_id)
+            return
+
         if not self.is_healthy:
             return
 

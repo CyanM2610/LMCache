@@ -1586,6 +1586,15 @@ class AddressManager:
         """
         return self._size - self.total_allocated_size
 
+    @synchronized("_lock")
+    def get_free_ranges(self) -> list[tuple[int, int]]:
+        """Return an independent snapshot of contiguous free (offset, size) pairs.
+
+        Callers using this for admission must prevent allocator mutations until
+        their admission decision is committed. The returned list owns no memory.
+        """
+        return [(block.start, block.size) for block in self._explicit_list]
+
     def check_consistency(self) -> bool:
         """
         Check if the address manager is consistent.

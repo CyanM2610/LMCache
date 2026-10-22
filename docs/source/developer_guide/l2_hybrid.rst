@@ -93,3 +93,21 @@ an interval bounded by the scheduler call. Consult ``STATUS.md`` and the raw
 reports for verified coverage. ``PROFILING.md`` indexes independent copy,
 contention, heldout, and full-model compute samples. ``ACCEPTANCE_REPORT.md``
 records the requirement-by-requirement audit and measurement limits.
+
+Confirmed cleanup and bounded arrivals
+--------------------------------------
+
+Hybrid lookup cleanup is confirmed against the original server generation.
+Result consumption preserves demand until worker LOAD or explicit END; END
+releases logical reservations without releasing physical transfer pins. A
+shutdown with unconfirmed cleanup fails closed. Impossible allocation previews
+aligned free ranges and legal victims before evicting valid objects.
+
+The service runner accepts ``--max-model-len``, ``--num-gpu-blocks``,
+``--max-num-seqs`` and ``--max-num-batched-tokens`` (defaults 1024, 96, 2, 1024).
+Root arrival adds ``root_arrival_s`` and ``think_s`` to the run origin. Dependent
+requests use actual predecessor completions plus think time. Inputs above the
+configured context are rejected. Async scheduling remains enabled. The pinned
+model has 32768 positions; longer inputs require a separately validated model
+or position configuration. ``NATIVE_FIXES.md`` distinguishes repaired-source
+validation from the original measured results.

@@ -1093,7 +1093,14 @@ class L1Manager:
             )
             for identity, key in identities.items()
         ]
-        for identity in manager.policy.victims(candidates):
+        victims = list(dict.fromkeys(manager.policy.victims(candidates)))
+        if not manager.can_allocate_after_free(
+            layout,
+            count,
+            [self._objects[identities[identity]].memory_obj for identity in victims],
+        ):
+            return L1Error.OUT_OF_MEMORY, []
+        for identity in victims:
             key = identities[identity]
             # The shared directory lock is held across selection and deletion.
             if self.delete([key])[key] != L1Error.SUCCESS:

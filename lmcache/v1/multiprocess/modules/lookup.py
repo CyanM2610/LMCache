@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from functools import partial
 import threading
 import time
+import uuid
 
 # First Party
 from lmcache.logging import init_logger
@@ -131,6 +132,7 @@ class LookupModule:
         # Retain only request-ID tombstones, not payload references, until close.
         self._ended_requests: set[str] = set()
         self._closing = False
+        self._generation = uuid.uuid4().hex
         self._setup_metrics()
 
     @property
@@ -161,6 +163,55 @@ class LookupModule:
                 for request_id in list(self._hybrid_requests):
                     self.end_session(request_id)
                 self._ended_requests.clear()
+
+    def get_server_generation(self) -> str:
+        """Return this hybrid backend's incarnation, fixed until server close.
+
+        Raises:
+            ValueError: If confirmed hybrid ownership is not supported here.
+        """
+        if not self._hybrid:
+            raise ValueError("confirmed ownership requires the hybrid backend")
+        return self._generation
+
+    def lookup_guarded(
+        self, key: IPCCacheServerKey, tp_size: int, generation: str
+    ) -> bool:
+        """Reserve only in the named incarnation, rejecting late ended requests.
+
+        Args:
+            key: Unique engine request identity and prefix.
+            tp_size: Ignored legacy wire field; readers come from key.num_kv_readers.
+            generation: Incarnation identified before LOOKUP submission.
+        Returns:
+            True only if this incarnation accepted the request.
+        Raises:
+            RuntimeError: If underlying reservation/cleanup fails.
+        """
+        with self._lifecycle_lock:
+            if not self._hybrid or generation != self._generation or self._closing:
+                return False
+            if key.request_id in self._ended_requests:
+                return False
+            self.lookup(key, tp_size)
+            return True
+
+    def end_session_guarded(self, request_id: str, generation: str) -> bool:
+        """Confirm unused lease cleanup while leaving submitted DMA pins intact.
+
+        Args:
+            request_id: Unique engine demand to retire, including a late LOOKUP.
+            generation: Incarnation that originally accepted the lookup.
+        Returns:
+            True after idempotent cleanup in this incarnation; False otherwise.
+        Raises:
+            RuntimeError: If owned logical cleanup cannot complete.
+        """
+        with self._lifecycle_lock:
+            if not self._hybrid or generation != self._generation or self._closing:
+                return False
+            self.end_session(request_id)
+            return True
 
     def lookup(self, key: IPCCacheServerKey, tp_size: int) -> None:
         """Reserve a prefix lookup unless its request has already ended.

@@ -443,6 +443,7 @@ class LiveProtocolTests(unittest.TestCase):
 
         if not torch.cuda.is_available():
             self.client.close()
+
             self.skipTest("requires actual CUDA registration")
         cfg = HybridMemoryConfig(
             4096,
@@ -516,6 +517,362 @@ class LiveProtocolTests(unittest.TestCase):
                 if state.write_lock.is_locked():
                     manager.abort_write([key])
             manager.close()
+            self.client.close()
+
+    def test_impossible_admission_preserves_existing_kv_and_fragmented_slots(
+        self,
+    ) -> None:
+        """An impossible batch must not evict useful KV, including pinned holes."""
+        # Third Party
+        import torch
+
+        # First Party
+        from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+        from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
+        from lmcache.v1.distributed.error import L1Error
+        from lmcache.v1.distributed.hybrid_config import HybridMemoryConfig
+        from lmcache.v1.distributed.l1_manager import L1Manager
+
+        small = MemoryLayoutDesc([torch.Size([4096])], [torch.uint8])
+        for cxl_slots, pin_index, new_bytes, new_count in (
+            (2, None, 4096, 3),
+            (2, 3, 4096, 2),
+            (3, 3, 4097, 1),
+        ):
+            with self.subTest(
+                cxl_slots=cxl_slots, pin=pin_index, size=new_bytes, count=new_count
+            ):
+                manager = L1Manager(
+                    L1ManagerConfig(
+                        L1MemoryManagerConfig(8192, False, shm_name=""),
+                        hybrid_config=HybridMemoryConfig(
+                            8192,
+                            cxl_slots * 4096,
+                            self.bulk,
+                            self.modeled,
+                            str(self.build / "libcxlmemsim_modeled_client.so"),
+                        ),
+                    )
+                )
+                old = [
+                    ObjectKey(bytes([i]), "admission", 0) for i in range(2 + cxl_slots)
+                ]
+                new = [
+                    ObjectKey(bytes([20 + i]), "admission", 0) for i in range(new_count)
+                ]
+                pinned = [] if pin_index is None else [old[pin_index]]
+                try:
+                    reserved = manager.reserve_write(
+                        old, [False] * len(old), small, "new"
+                    )
+                    for index, key in enumerate(old):
+                        error, obj = reserved[key]
+                        self.assertEqual(error, L1Error.SUCCESS)
+                        assert obj is not None and obj.raw_tensor is not None
+                        obj.raw_tensor.fill_(index + 10)
+                    manager.finish_write(old)
+                    if pinned:
+                        manager.reserve_read(pinned)
+                        manager.unsafe_read(pinned, pin_transfer=True)
+                        manager.finish_read(pinned)
+                    before = manager.get_memory_usage()
+                    result = manager.reserve_write(
+                        new,
+                        [False] * len(new),
+                        MemoryLayoutDesc([torch.Size([new_bytes])], [torch.uint8]),
+                        "new",
+                    )
+                    self.assertTrue(
+                        all(
+                            error == L1Error.OUT_OF_MEMORY
+                            for error, _ in result.values()
+                        )
+                    )
+                    self.assertEqual(manager.get_memory_usage(), before)
+                    for index, key in enumerate(old):
+                        state = manager.get_object_state(key)
+                        self.assertIsNotNone(state, f"failed admission evicted {key}")
+                        assert state is not None
+                        self.assertTrue(
+                            torch.all(state.memory_obj.raw_tensor == index + 10)
+                        )
+                    self.assertTrue(manager.memcheck())
+                finally:
+                    if pinned:
+                        manager.release_transfer(pinned)
+                    manager.close()
+        self.client.close()
+
+    def test_native_transport_confirms_cleanup_after_late_lookup_and_status(
+        self,
+    ) -> None:
+        """Real ZMQ, registered pools and heartbeat recovery retire every lease."""
+        # Standard
+        from concurrent.futures import Future
+        from dataclasses import replace
+        from typing import Any
+        import threading
+
+        # Third Party
+        import torch
+        import zmq
+
+        # First Party
+        from lmcache.integration.vllm.vllm_multi_process_adapter import (
+            LMCacheMPSchedulerAdapter,
+            ParallelStrategy,
+        )
+        from lmcache.v1.distributed.api import MemoryLayoutDesc
+        from lmcache.v1.distributed.config import (
+            EvictionConfig,
+            L1ManagerConfig,
+            L1MemoryManagerConfig,
+            StorageManagerConfig,
+        )
+        from lmcache.v1.distributed.hybrid_config import HybridMemoryConfig
+        from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+        from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+        from lmcache.v1.multiprocess.modules.lookup import LookupModule
+        from lmcache.v1.multiprocess.mq import MessageQueueServer
+        from lmcache.v1.multiprocess.protocol import RequestType
+        from lmcache.v1.multiprocess.transport.zmq_impl.server import (
+            add_handler_helper,
+            get_zmq_handler_specs,
+        )
+
+        ctx = MPCacheServerContext(
+            StorageManagerConfig(
+                L1ManagerConfig(
+                    L1MemoryManagerConfig(4096, False, shm_name=""),
+                    hybrid_config=HybridMemoryConfig(
+                        4096,
+                        8192,
+                        self.bulk,
+                        self.modeled,
+                        str(self.build / "libcxlmemsim_modeled_client.so"),
+                        policy="force_cxl",
+                    ),
+                ),
+                EvictionConfig(eviction_policy="noop"),
+            ),
+            chunk_size=4,
+        )
+        lookup = LookupModule(ctx)
+        layout = MemoryLayoutDesc([torch.Size([4096])], [torch.uint8])
+        ctx.layout_desc_registry.register("recovery", 1, layout)
+        key = IPCCacheServerKey(
+            model_name="recovery",
+            world_size=1,
+            num_kv_readers=1,
+            worker_id=0,
+            token_ids=tuple(range(8)),
+            start=0,
+            end=8,
+            request_id="seed",
+        )
+        keys = ctx.resolve_obj_keys(key, [0])[0]
+        ctx.session_manager.remove("seed")
+        ctx.storage_manager.reserve_write(keys, layout, "new")
+        ctx.storage_manager.finish_write(keys)
+        context = zmq.Context()
+        endpoint = "inproc://recovery-" + uuid.uuid4().hex
+        server = MessageQueueServer(endpoint, context)
+        held: list[tuple[Future, Any]] = []
+        reached = threading.Event()
+
+        def delay(value: Any) -> Future:
+            reply: Future = Future()
+            held.append((reply, value))
+            reached.set()
+            return reply
+
+        def reserve(
+            key: IPCCacheServerKey, tp_size: int, generation: str | None = None
+        ) -> Any:
+            value: Any = None
+            if generation is None:
+                lookup.lookup(key, tp_size)
+            else:
+                value = lookup.lookup_guarded(key, tp_size, generation)
+            if key.request_id.startswith(("ack", "cancel")):
+                return delay(value)
+            reached.set()
+            return value
+
+        def query(request_id: str) -> Future[int | None]:
+            value = lookup.query_prefetch_status(request_id)
+            if request_id == "status":
+                return delay(value)
+            reply: Future[int | None] = Future()
+            reply.set_result(value)
+            return reply
+
+        def guarded_lookup(
+            key: IPCCacheServerKey, tp_size: int, generation: str
+        ) -> bool | Future[bool]:
+            return reserve(key, tp_size, generation)
+
+        def legacy_lookup(key: IPCCacheServerKey, tp_size: int) -> None:
+            value = reserve(key, tp_size)
+            if isinstance(value, Future):
+                value.result(timeout=5)
+
+        delayed_end = False
+
+        def end(request_id: str, generation: str) -> bool | Future[bool]:
+            nonlocal delayed_end
+            value = lookup.end_session_guarded(request_id, generation)
+            if request_id == "end-ack" and not delayed_end:
+                delayed_end = True
+                return delay(value)
+            return value
+
+        def chunk_size() -> int:
+            return 4
+
+        def ping(instance_id: int | None) -> bool:
+            return True
+
+        try:
+            for spec in get_zmq_handler_specs(lookup):
+                handler = spec.handler
+                if spec.request_type == RequestType.LOOKUP:
+                    handler = legacy_lookup
+                elif spec.request_type == RequestType.LOOKUP_GUARDED:
+                    handler = guarded_lookup
+                elif spec.request_type == RequestType.QUERY_PREFETCH_STATUS:
+                    handler = query
+                elif spec.request_type == RequestType.END_SESSION_GUARDED:
+                    handler = end
+                add_handler_helper(server, spec.request_type, handler)
+            add_handler_helper(server, RequestType.GET_CHUNK_SIZE, chunk_size)
+            add_handler_helper(server, RequestType.PING, ping)
+            server.add_normal_thread_pool(
+                [spec.request_type for spec in get_zmq_handler_specs(lookup)]
+                + [RequestType.PING],
+                max_workers=4,
+            )
+            server.start()
+        except BaseException:
+            server.close()
+            context.term()
+            lookup.close()
+            ctx.close()
+            self.client.close()
+            raise
+        try:
+            for request_id in ("normal", "ack", "cancel", "status", "end-ack"):
+                with self.subTest(request_id=request_id):
+                    reached.clear()
+                    adapter = LMCacheMPSchedulerAdapter(
+                        [endpoint],
+                        context,
+                        "recovery",
+                        1,
+                        ParallelStrategy(False, 1, 0, 1, 1, 1),
+                        extra_config={
+                            "lmcache.mp.require_terminal_completion": True,
+                            "lmcache.mp.mq_timeout": 0.1,
+                            "lmcache.mp.heartbeat_interval": 0.05,
+                        },
+                    )
+                    pinned = False
+                    try:
+                        adapter.maybe_submit_lookup_request(request_id, list(range(8)))
+                        self.assertTrue(reached.wait(2))
+                        status = ctx.storage_manager.report_status()["l1_manager"]
+                        self.assertEqual(status["read_locked_count"], 2)
+                        if request_id == "ack":
+                            time.sleep(0.12)
+                            self.assertEqual(adapter.check_lookup_result(request_id), 0)
+                        elif request_id != "cancel":
+                            deadline = time.monotonic() + 2
+                            while adapter.check_lookup_result(request_id) is None:
+                                self.assertLess(time.monotonic(), deadline)
+                                time.sleep(0.01)
+                        if request_id == "normal":
+                            adapter.cleanup_lookup_result(request_id)
+                            time.sleep(0.05)
+                            self.assertEqual(
+                                ctx.storage_manager.report_status()["l1_manager"][
+                                    "read_locked_count"
+                                ],
+                                2,
+                            )
+                            session = ctx.session_manager.get(request_id)
+                            assert session is not None
+                            with ctx.storage_manager.read_prefetched_results(
+                                keys,
+                                read_lease=session.hybrid_read_lease,
+                                release_on_error=False,
+                            ) as objects:
+                                self.assertIsNotNone(objects)
+                                pinned = True
+                        adapter.end_session(request_id)
+                        adapter.cleanup_lookup_result(request_id)
+                        deadline = time.monotonic() + 2
+                        while ctx.storage_manager.report_status()["l1_manager"][
+                            "read_locked_count"
+                        ]:
+                            self.assertLess(
+                                time.monotonic(),
+                                deadline,
+                                "native lease lost its cleanup owner",
+                            )
+                            time.sleep(0.01)
+                        for reply, value in held:
+                            if not reply.done():
+                                reply.set_result(value)
+                        while (
+                            adapter.cleanup_status()["pending"]
+                            or not adapter.is_healthy
+                        ):
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.01)
+                        if pinned:
+                            self.assertEqual(
+                                ctx.storage_manager.report_status()["l1_manager"][
+                                    "transfer_reservation_count"
+                                ],
+                                2,
+                            )
+                        self.assertEqual(
+                            lookup.report_status()["active_prefetch_jobs"], 0
+                        )
+                        self.assertIsNone(ctx.session_manager.get(request_id))
+                        self.assertFalse(
+                            lookup.lookup_guarded(
+                                replace(key, worker_id=None, request_id=request_id),
+                                1,
+                                lookup.get_server_generation(),
+                            )
+                        )
+                    finally:
+                        for reply, value in held:
+                            if not reply.done():
+                                reply.set_result(value)
+                        if pinned:
+                            ctx.storage_manager.release_transfer(keys)
+                        lookup.end_session(request_id)
+                        adapter.shutdown()
+            generation = lookup.get_server_generation()
+            self.assertFalse(lookup.end_session_guarded("foreign", "different"))
+            self.assertFalse(
+                lookup.lookup_guarded(
+                    replace(key, request_id="foreign"), 1, "different"
+                )
+            )
+            self.assertTrue(lookup.end_session_guarded("ended-first", generation))
+            self.assertFalse(
+                lookup.lookup_guarded(
+                    replace(key, request_id="ended-first"), 1, generation
+                )
+            )
+        finally:
+            server.close()
+            context.term()
+            lookup.close()
+            ctx.close()
             self.client.close()
 
 

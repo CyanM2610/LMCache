@@ -6,7 +6,6 @@ request-transport round-trip, server handler, and client-side adapter API.
 
 # Standard
 from unittest.mock import MagicMock, patch
-import threading
 
 # Third Party
 import pytest
@@ -307,7 +306,9 @@ def test_server_handler_registered():
 # ============================================================================
 
 
-def test_adapter_free_lookup_locks_sends_request():
+def test_adapter_free_lookup_locks_sends_request(
+    request: pytest.FixtureRequest,
+) -> None:
     """LMCacheMPSchedulerAdapter.free_lookup_locks should send a FREE_LOOKUP_LOCKS
     request with the correct key payload."""
     # First Party
@@ -316,21 +317,24 @@ def test_adapter_free_lookup_locks_sends_request():
         ParallelStrategy,
     )
 
-    adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
-    adapter.model_name = "test_model"
-    adapter.lmcache_tokens_per_chunk = 256
-    adapter.blocks_in_chunk = 16
-    adapter.parallel_strategy = ParallelStrategy(False, 1, 0, 1, 1, 1)
-    adapter._health_events = {"tcp://test:0": threading.Event()}
-    adapter._health_events["tcp://test:0"].set()
-    adapter._server_urls = ["tcp://test:0"]
-    adapter._mq_timeout = 30.0
-
     mock_client = MagicMock(spec=RequestClient)
     mock_future = MagicMock()
+    mock_future.result.return_value = None
+    mock_client.lookup.return_value = mock_future
     mock_client.free_lookup_locks.return_value = mock_future
-    adapter.req_clients = {"tcp://test:0": mock_client}
-    adapter._pending_lookups = set()
+    mock_client.get_chunk_size.return_value.result.return_value = 256
+    with patch(
+        "lmcache.integration.vllm.vllm_multi_process_adapter.RequestClientFactory.create",
+        return_value=mock_client,
+    ):
+        adapter = LMCacheMPSchedulerAdapter(
+            ["tcp://test:0"],
+            MagicMock(),
+            "test_model",
+            16,
+            ParallelStrategy(False, 1, 0, 1, 1, 1),
+        )
+    request.addfinalizer(adapter.shutdown)
 
     token_ids = list(range(512))
     adapter.free_lookup_locks(
@@ -351,7 +355,9 @@ def test_adapter_free_lookup_locks_sends_request():
     assert tp_size == 1
 
 
-def test_adapter_free_lookup_locks_key_matches_lookup():
+def test_adapter_free_lookup_locks_key_matches_lookup(
+    request: pytest.FixtureRequest,
+) -> None:
     """The key created by free_lookup_locks should match the key created by
     maybe_submit_lookup_request (no_worker_id_version, same start/end)."""
     # First Party
@@ -360,33 +366,29 @@ def test_adapter_free_lookup_locks_key_matches_lookup():
         ParallelStrategy,
     )
 
-    adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
-    adapter.model_name = "test_model"
-    adapter.lmcache_tokens_per_chunk = 256
-    adapter.blocks_in_chunk = 16
-    adapter.parallel_strategy = ParallelStrategy(False, 1, 0, 1, 1, 1)
-    adapter._server_urls = ["tcp://test:0"]
-    adapter._health_events = {"tcp://test:0": threading.Event()}
-    adapter._health_events["tcp://test:0"].set()
-    adapter._mq_timeout = 30.0
-    adapter._heartbeats: dict[str, object] = {}
-    adapter._heartbeat_lock = threading.Lock()
-    adapter._heartbeat_interval = 5.0
-
     mock_client = MagicMock(spec=RequestClient)
     mock_future = MagicMock()
-    mock_future.result.return_value = None  # LOOKUP returns None
+    mock_future.result.return_value = None
     mock_client.lookup.return_value = mock_future
     mock_client.free_lookup_locks.return_value = mock_future
-    adapter.req_clients = {"tcp://test:0": mock_client}
-    adapter._pending_lookups = set()
-    adapter._unacked_lookups = {}
-    adapter._lookup_params = {}
+    mock_client.get_chunk_size.return_value.result.return_value = 256
+    with patch(
+        "lmcache.integration.vllm.vllm_multi_process_adapter.RequestClientFactory.create",
+        return_value=mock_client,
+    ):
+        adapter = LMCacheMPSchedulerAdapter(
+            ["tcp://test:0"],
+            MagicMock(),
+            "test_model",
+            16,
+            ParallelStrategy(False, 1, 0, 1, 1, 1),
+        )
+    request.addfinalizer(adapter.shutdown)
 
     token_ids = list(range(512))
 
     # Submit lookup – patch heartbeat to avoid spawning a real thread
-    with patch.object(adapter, "_ensure_heartbeat_started"):
+    with patch("lmcache.integration.vllm.vllm_multi_process_adapter.HeartbeatThread"):
         adapter.maybe_submit_lookup_request(
             "req-1",
             token_ids,

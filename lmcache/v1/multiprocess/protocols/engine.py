@@ -48,6 +48,9 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "GET_SERVER_GENERATION",
+    "LOOKUP_GUARDED",
+    "END_SESSION_GUARDED",
 ]
 
 # Type alias for cache keys
@@ -62,6 +65,19 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         Dictionary mapping request names to their protocol definitions
     """
     return {
+        "GET_SERVER_GENERATION": ProtocolDefinition(
+            payload_classes=[], response_class=str, handler_type=HandlerType.BLOCKING
+        ),
+        "LOOKUP_GUARDED": ProtocolDefinition(
+            payload_classes=[KeyType, int, str],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "END_SESSION_GUARDED": ProtocolDefinition(
+            payload_classes=[str, str],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
         # Register KV Cache
         # Payload:
         #   - instance_id: int - Unique identifier for the engine instance

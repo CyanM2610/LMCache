@@ -90,6 +90,19 @@ def get_zmq_handler_specs(module: EngineModule) -> list[HandlerSpec]:
     """
     if isinstance(module, LookupModule):
         return [
+            HandlerSpec(
+                RequestType.GET_SERVER_GENERATION,
+                module.get_server_generation,
+                ThreadPoolType.NORMAL,
+            ),
+            HandlerSpec(
+                RequestType.LOOKUP_GUARDED, module.lookup_guarded, ThreadPoolType.NORMAL
+            ),
+            HandlerSpec(
+                RequestType.END_SESSION_GUARDED,
+                module.end_session_guarded,
+                ThreadPoolType.NORMAL,
+            ),
             HandlerSpec(RequestType.LOOKUP, module.lookup, ThreadPoolType.NORMAL),
             HandlerSpec(
                 RequestType.QUERY_PREFETCH_STATUS,

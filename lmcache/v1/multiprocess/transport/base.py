@@ -76,6 +76,43 @@ class RequestClient(Protocol):
 
     def end_session(self, request_id: str) -> MessagingFuture[Any]: ...
 
+    def get_server_generation(self) -> MessagingFuture[Any]:
+        """Return a Future[str] identifying the original hybrid server incarnation.
+
+        The generation is captured before LOOKUP; it must not be silently
+        replaced on recovery. Waiting on an unavailable peer can time out.
+        """
+        ...
+
+    def lookup_guarded(
+        self, key: Any, tp_size: int, generation: str
+    ) -> MessagingFuture[Any]:
+        """Return Future[bool] confirming lookup acceptance by the named server.
+
+        Args:
+            key: Request identity and prefix.
+            tp_size: Legacy wire field; actual reader count is in key.
+            generation: Original incarnation from get_server_generation.
+        Returns:
+            True on acceptance; False for a changed server or retired request.
+            The future may raise a transport error or time out when awaited.
+        """
+        ...
+
+    def end_session_guarded(
+        self, request_id: str, generation: str
+    ) -> MessagingFuture[Any]:
+        """Return Future[bool] confirming logical cleanup, preserving DMA pins.
+
+        Args:
+            request_id: Unique engine demand that has ended.
+            generation: Original incarnation that could own its lookup lease.
+        Returns:
+            True only after cleanup in that incarnation; False for a mismatch.
+            The future may raise a transport error or time out when awaited.
+        """
+        ...
+
     def register_kv_cache_engine_driven_context(
         self, payload: Any
     ) -> MessagingFuture[Any]: ...

@@ -221,6 +221,64 @@ class HybridL1MemoryManager:
                 for medium, pool in self.pools.items()
             }
 
+    def can_allocate_after_free(
+        self, layout: MemoryLayoutDesc, count: int, victims: list[MemoryObj]
+    ) -> bool:
+        """Check exact aligned-slot feasibility without changing retained payload.
+
+        Args:
+            layout: Common layout of the requested objects.
+            count: Nonnegative number of requested objects.
+            victims: Distinct live objects that the directory may legally evict.
+        Returns:
+            Whether actual free ranges plus those victims can hold the batch.
+            Separate holes are not combined across protected objects or pools.
+        Raises:
+            ValueError: For invalid counts or foreign/duplicate victim objects.
+        Notes:
+            The caller must hold the directory mutation lock through subsequent
+            eviction/allocation. This preview neither frees nor copies payload.
+        """
+        if count < 0:
+            raise ValueError("count must be nonnegative")
+        with self.lock:
+            pointers = [obj.data_ptr for obj in victims]
+            if len(set(pointers)) != len(pointers) or any(
+                pointer not in self.live for pointer in pointers
+            ):
+                raise ValueError("preview requires distinct owned victim objects")
+            ranges = {
+                medium: pool.address_manager.get_free_ranges()
+                for medium, pool in self.pools.items()
+            }
+            for obj in victims:
+                ranges[self.live[obj.data_ptr]].append(
+                    (obj.meta.address, obj.meta.phy_size)
+                )
+            raw_size = sum(
+                shape.numel() * dtype.itemsize
+                for shape, dtype in zip(layout.shapes, layout.dtypes, strict=True)
+            )
+            slots = 0
+            for medium in dict.fromkeys(self.policy.pool_order()):
+                if medium not in self.pools:
+                    continue
+                size = self.pools[medium].address_manager.compute_aligned_size(raw_size)
+                if size <= 0:
+                    return count == 0
+                end, length = 0, 0
+                for start, span in sorted(ranges[medium]):
+                    if start < end:
+                        raise ValueError("overlapping free or victim ranges")
+                    if start == end:
+                        length += span
+                    else:
+                        slots += length // size
+                        length = span
+                    end = start + span
+                slots += length // size
+            return slots >= count
+
     def get_memory_usage(self) -> tuple[int, int]:
         """Return summed actual physical allocation and quota bytes."""
         usage = self.pool_usage().values()
