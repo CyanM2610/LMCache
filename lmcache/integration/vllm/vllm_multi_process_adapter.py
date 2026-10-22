@@ -47,6 +47,7 @@ from lmcache.v1.multiprocess.group_view import (
 from lmcache.v1.multiprocess.mq import MessagingFuture
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
+    LMCacheDrivenTransferContext,
     TransferContext,
     create_transfer_context,
 )
@@ -1373,6 +1374,11 @@ class LMCacheMPWorkerAdapter:
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
         self.page_ownership = PendingKVPageAccess()
+        # Both experiment arms use this code and the same scope observation.
+        # The conservative full-page behavior remains the default.
+        self.load_page_scope = os.environ.get("LMCACHE_LOAD_PAGE_SCOPE", "full")
+        if self.load_page_scope not in ("full", "written"):
+            raise ValueError("LMCACHE_LOAD_PAGE_SCOPE must be full or written")
         # request_id -> (future, block_ids)
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
@@ -1545,6 +1551,88 @@ class LMCacheMPWorkerAdapter:
             layout_hints if layout_hints is not None else vllm_layout_hints()
         )
         self._send_register_kv_caches_request(kv_caches)
+
+    def load_write_block_ids(
+        self, op: LoadStoreOp
+    ) -> tuple[dict[int, Sequence[int]], dict[str, Any]]:
+        """Return proven LOAD write pages without changing transfer coordinates.
+
+        Args:
+            op: Original engine-group block lists already sliced to [start, end).
+                skip_first_n_tokens is relative to that range, not token zero.
+
+        Returns:
+            Per-engine-group pages that may be written, and observation reasons.
+            Unknown geometry/layout retains every original page. Only full
+            skipped blocks of the pinned dense BF16 CUDA path are excluded;
+            the kernel can overwrite the entire partially skipped block.
+
+        The result is only an access footprint. It must never replace op's
+        block lists passed to transfer, error handling or lifetime management.
+        """
+        full = dict(enumerate(op.block_ids))
+        details: dict[str, Any] = {"reason": "dense_full_attention", "groups": {}}
+        if (
+            not self.require_terminal_completion
+            or type(self.transfer_ctx) is not LMCacheDrivenTransferContext
+            or self.parallel_strategy.vllm_world_size != 1
+            or self.parallel_strategy.dcp_size != 1
+            or self.parallel_strategy.mla_only
+        ):
+            details["reason"] = "unsupported_execution_path"
+            return full, details
+        skip = op.skip_first_n_tokens
+        length = op.end - op.start
+        if op.start < 0 or length < 0 or not 0 <= skip <= length:
+            details["reason"] = "invalid_restore_range"
+            return full, details
+        tensors = list(self.kv_caches.values())
+        result = dict(full)
+        for group_id, blocks in full.items():
+            infos = [info for info in self.engine_group_infos
+                     if info.engine_group_id == group_id]
+            group: dict[str, Any] = {"reason": "unknown_geometry", "skip_full_blocks": 0}
+            details["groups"][group_id] = group
+            if not infos:
+                continue
+            sizes = {info.tokens_per_block for info in infos}
+            if len(sizes) != 1 or next(iter(sizes)) <= 0:
+                continue
+            block_tokens = next(iter(sizes))
+            group["tokens_per_block"] = block_tokens
+            if any(info.sw_size_tokens != -1 or info.recurrent_state
+                   or info.extra_object_group_tag != 0 for info in infos):
+                group["reason"] = "unsupported_attention_group"
+                continue
+            if (op.start % block_tokens or op.end % block_tokens
+                    or self.lmcache_tokens_per_chunk % block_tokens
+                    or len(blocks) != length // block_tokens):
+                group["reason"] = "unaligned_or_inconsistent_range"
+                continue
+            indices = {index for info in infos for index in info.layer_indices}
+            if not indices or any(index < 0 or index >= len(tensors) for index in indices):
+                group["reason"] = "unknown_layer_geometry"
+                continue
+            # The frozen Qwen path registers per-layer [NB, BS, NH, CS].
+            # Requiring physical BS == logical tokens_per_block excludes
+            # compressed/recurrent layouts and avoids guessing from model names.
+            try:
+                supported_layout = all(
+                    tensors[index].dtype == torch.bfloat16
+                    and tensors[index].ndim == 4
+                    and tensors[index].shape[1] == block_tokens
+                    and tensors[index].is_contiguous() for index in indices
+                )
+            except (AttributeError, IndexError, TypeError):
+                supported_layout = False
+            if not supported_layout:
+                group["reason"] = "unsupported_physical_layout"
+                continue
+            skipped_blocks = skip // block_tokens
+            result[group_id] = blocks[skipped_blocks:]
+            group["skip_full_blocks"] = skipped_blocks
+            group["reason"] = "full_skipped_blocks_only"
+        return result, details
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1756,7 +1844,8 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting store requests."
             )
-        self.wait_for_kv_access(dict(enumerate(op.block_ids)), {})
+        with wait_span("store_source_fence", request_id):
+            self.wait_for_kv_access(dict(enumerate(op.block_ids)), {})
         future = self.transfer_ctx.submit_store(
             request_id,
             key,
@@ -1905,8 +1994,21 @@ class LMCacheMPWorkerAdapter:
             skip_tokens=op.skip_first_n_tokens,
             block_ids=op.block_ids,
         )
+        full_blocks = dict(enumerate(op.block_ids))
+        write_blocks, write_scope = self.load_write_block_ids(op)
+        protected_blocks = (
+            write_blocks if self.load_page_scope == "written" else full_blocks
+        )
+        wait_emit(
+            "load_page_scope", request_id,
+            mode=self.load_page_scope,
+            start_token=op.start, end_token=op.end,
+            skip_tokens=op.skip_first_n_tokens,
+            full_block_ids=full_blocks, write_block_ids=write_blocks,
+            protected_block_ids=protected_blocks, **write_scope,
+        )
         with wait_span("target_store_fence", request_id):
-            self.wait_for_kv_access({}, dict(enumerate(op.block_ids)))
+            self.wait_for_kv_access({}, protected_blocks)
         wait_emit("restore_submit", request_id)
         future = self.transfer_ctx.submit_retrieve(
             request_id,
@@ -1921,7 +2023,7 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         if self.require_terminal_completion:
             self.page_ownership.record(
-                future, dict(enumerate(op.block_ids)), writes=True,
+                future, protected_blocks, writes=True,
                 request_id=request_id, operation="LOAD"
             )
         if event is not None:
