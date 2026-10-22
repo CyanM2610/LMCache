@@ -478,6 +478,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     _promotion_enabled: bool = False
     decoupled_control_enabled: bool = False
     prepare_lookup_operations: bool = False
+    prepare_load_operations: bool = True  # Absent key preserves enabled v4 semantics.
     decoupled_store_enabled: bool = False
     operation_step_limit: int = 32
     store_operation_decider: Callable[[dict[str, Any]], str] | None = None
@@ -527,13 +528,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         )
         for key in (
-            "decoupled_control", "prepare_lookup_operations", "decoupled_store"
+            "decoupled_control", "prepare_lookup_operations", "prepare_load_operations", "decoupled_store"
         ):
             if type(operation_config.get(f"lmcache.mp.{key}", False)) is not bool:
                 raise ValueError(f"lmcache.mp.{key} must be a boolean")
         self.decoupled_control_enabled = operation_config.get(
             "lmcache.mp.decoupled_control", False
         ) is True
+        # Only the EXTRA restoration entry is gated. Native WAITING and
+        # completion adoption are unaffected. Omission preserves v4.
+        self.prepare_load_operations = operation_config.get(
+            "lmcache.mp.prepare_load_operations", self.decoupled_control_enabled
+        ) is True
+        if self.prepare_load_operations and not self.decoupled_control_enabled:
+            raise ValueError("extra LOAD preparation requires decoupled_control")
         self.prepare_lookup_operations = operation_config.get(
             "lmcache.mp.prepare_lookup_operations", False
         ) is True
