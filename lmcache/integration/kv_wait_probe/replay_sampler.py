@@ -52,8 +52,8 @@ class DeviceReferenceState:
         flat, offsets, lengths = [], [], []
         for rid in sorted(catalog):
             seq = catalog[rid]
-            if not seq or seq[-1] != 151645 or 151645 in seq[:-1]:
-                raise ValueError("invalid dataset terminal token")
+            if len(seq) != 1 or type(seq[0]) is not int or seq[0] < 0:
+                raise ValueError("P catalog must contain exactly the first reference token")
             offsets.append(len(flat))
             lengths.append(len(seq))
             flat.extend(seq)
@@ -72,7 +72,7 @@ class DeviceReferenceState:
         rid = (sampling_params.extra_args or {}).get("native_token_replay_id")
         ref = 0
         if rid is not None:
-            if sampling_params.ignore_eos or sampling_params.max_tokens != 2048:
+            if sampling_params.ignore_eos or sampling_params.max_tokens != 1:
                 raise ValueError("public output budget or EOS changed")
             ref = self.ids[rid] + 1
             self.registrations.add(rid)
@@ -95,8 +95,8 @@ class DeviceReferenceState:
                     device_bytes=sum(t.numel()*t.element_size() for t in tensors),
                     device=str(self.tokens.device), gpu_resident=True,
                     reference_requests=len(self.ids), registered_ids=sorted(self.registrations),
-                    gather_calls=self.gather_calls, public_max_tokens=2048,
-                    stopping="native EOS; no trace_decode_token_ids normalization")
+                    gather_calls=self.gather_calls, public_max_tokens=1,
+                    stopping="native max_tokens=1 or EOS; full reference answer is external history")
 
 
 source = inspect.getsource(sampler_module.Sampler.__call__)

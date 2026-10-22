@@ -12,6 +12,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import gzip
 import json
+import math
+import re
 import sqlite3
 import statistics
 
@@ -339,6 +341,51 @@ class Timeline:
             source = "NVTX" if cat == "nvtx" else "host"
             pid = f"{source} / process:{pid}"
             tid = f"thread:{tid}"
+        pid, tid = self._track(pid, tid)
+        row = dict(
+            name=name,
+            ts=(start - self.origin) / 1000,
+            pid=pid,
+            tid=tid,
+            cat=cat,
+            args=args or {},
+        )
+        if end is None:
+            row.update(ph="i", s="t")
+        else:
+            row.update(ph="X", dur=max(0, end - start) / 1000)
+        self._write(row)
+
+    def counter(
+        self, name: str, stamp: int, value: float, *, source: str, device: str
+    ) -> None:
+        """Write one unscaled, finite numeric counter on a source/device track.
+
+        Args:
+            name: Native metric name including its known unit.
+            stamp: Monotonic nanoseconds, already aligned to host observations.
+            value: Native sample value; absent values must not call this method.
+            source: Measurement provider; keeps NVML and Nsight independent.
+            device: Device/type identity, never a CUDA-visible ordinal guess.
+        Raises:
+            ValueError: A nonfinite value would produce invalid trace JSON.
+        """
+        if not math.isfinite(value):
+            raise ValueError("nonfinite GPU counter")
+        pid, tid = self._track(f"{source} counters / {device}", name)
+        self._write(
+            dict(
+                name=name,
+                ph="C",
+                ts=(stamp - self.origin) / 1000,
+                pid=pid,
+                tid=tid,
+                cat="gpu_counter",
+                args={"value": value},
+            )
+        )
+
+    def _track(self, pid: int | str, tid: int | str) -> tuple[int, int]:
         if isinstance(pid, str):
             label = pid
             if label not in self.processes:
@@ -367,19 +414,7 @@ class Timeline:
                     )
                 )
             tid = self.threads[key]
-        row = dict(
-            name=name,
-            ts=(start - self.origin) / 1000,
-            pid=pid,
-            tid=tid,
-            cat=cat,
-            args=args or {},
-        )
-        if end is None:
-            row.update(ph="i", s="t")
-        else:
-            row.update(ph="X", dur=max(0, end - start) / 1000)
-        self._write(row)
+        return pid, tid
 
     def close(self):
         self.file.write('],"displayTimeUnit":"ms"}\n')
@@ -517,6 +552,272 @@ def gpu_evidence(path: Path, timeline: Timeline) -> dict:
     return result
 
 
+def _metric_unit(definition: dict) -> tuple[str | None, str]:
+    for column in ("unit", "metricUnit", "units"):
+        if isinstance(definition.get(column), str) and definition[column]:
+            return definition[column], f"TARGET_INFO_GPU_METRICS.{column}"
+    name = definition["metricName"]
+    suffix = re.search(r"\[([^\]]+)\]$", name)
+    if suffix:
+        return suffix.group(1), "native metric name suffix"
+    # Only documented names have a fallback unit. Unknown future metrics remain
+    # unscaled and explicitly unit-unknown; in particular not all are percent.
+    if name in {
+        "SMs Active",
+        "SM Issue",
+        "DRAM Read Bandwidth",
+        "DRAM Write Bandwidth",
+        "PCIe Read Throughput",
+        "PCIe Write Throughput",
+    }:
+        return (
+            "%",
+            "https://docs.nvidia.com/nsight-systems/UserGuide/index.html#gpu-metrics",
+        )
+    return None, "unknown; raw value preserved"
+
+
+def _metric_device(definition: dict, devices: list[dict]) -> dict:
+    # NVIDIA documents low 8 bits of GPU metric typeId as the GPU id, and the
+    # upper 16 bits as hardware/VM. Verify against TARGET_INFO_GPU where present.
+    # https://forums.developer.nvidia.com/t/338545/6
+    explicit = next(
+        (definition[key] for key in ("gpuId", "deviceId") if key in definition),
+        None,
+    )
+    gpu_id = explicit if explicit is not None else definition["typeId"] & 0xFF
+    scope = definition["typeId"] & 0xFFFF000000000000
+    matches = [
+        row
+        for row in devices
+        if row.get("id", row.get("gpuId")) == gpu_id
+        and ("vmId" not in row or row["vmId"] & 0xFFFF000000000000 == scope)
+    ]
+    return dict(
+        gpu_id=gpu_id,
+        mapping="explicit definition column"
+        if explicit is not None
+        else "documented typeId low 8 bits",
+        metadata=matches[0] if len(matches) == 1 else None,
+        metadata_matched=len(matches) == 1,
+        label=f"GPU:{gpu_id} / type:{definition['typeId']}",
+    )
+
+
+def nsight_counters(path: Path, timeline: Timeline, clock: dict) -> dict:
+    """Export native GPU_METRICS samples without estimating missing counters.
+
+    Args:
+        path: Optional Nsight SQLite export; opened read-only.
+        timeline: Counter destination, preserving raw values and names.
+        clock: gpu_evidence result with measured host/NVTX offset and anchors.
+    Returns:
+        Availability, schema, per-metric units/device/coverage and clock evidence.
+        No samples are emitted without an observed clock anchor. Unknown schemas
+        remain explicitly unavailable, without affecting host-event attribution.
+    """
+    result = dict(available=False, emitted_samples=0, raw_samples=0, metrics=[])
+    result["clock"] = {
+        key: clock.get(key)
+        for key in ("offset_ns", "anchor_count", "anchor_offset_spread_ns")
+    }
+    if not path.exists():
+        result["reason"] = "Nsight SQLite absent"
+        return result
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        tables = {
+            r[0]
+            for r in db.execute("select name from sqlite_master where type='table'")
+        }
+        required = {
+            "GPU_METRICS": {"timestamp", "typeId", "metricId", "value"},
+            "TARGET_INFO_GPU_METRICS": {"typeId", "metricId", "metricName"},
+        }
+        result["schema"] = {
+            table: [r[1] for r in db.execute(f"pragma table_info({table})")]
+            for table in required
+        }
+        if any(
+            not columns.issubset(result["schema"][table])
+            for table, columns in required.items()
+        ):
+            result["reason"] = "GPU metric tables absent or schema unsupported"
+            return result
+        result["raw_samples"] = db.execute(
+            "select count(*) from GPU_METRICS"
+        ).fetchone()[0]
+        devices = (
+            [dict(r) for r in db.execute("select * from TARGET_INFO_GPU")]
+            if "TARGET_INFO_GPU" in tables
+            else []
+        )
+        definitions = {}
+        for raw in db.execute("select * from TARGET_INFO_GPU_METRICS"):
+            definition = dict(raw)
+            key = (definition["typeId"], definition["metricId"])
+            if key in definitions:
+                result["reason"] = "ambiguous duplicate GPU metric definition"
+                return result
+            unit, evidence = _metric_unit(definition)
+            definitions[key] = dict(
+                definition=definition,
+                unit=unit,
+                unit_evidence=evidence,
+                device=_metric_device(definition, devices),
+                samples=0,
+                first_ns=None,
+                last_ns=None,
+                invalid_samples=0,
+            )
+        result["metrics"] = list(definitions.values())
+        if (
+            not clock.get("available")
+            or not clock.get("anchor_count")
+            or not isinstance(clock.get("offset_ns"), int)
+        ):
+            result["reason"] = "GPU metrics captured but no host/NVTX clock alignment"
+            return result
+        offset = clock["offset_ns"]
+        result["unmapped_samples"] = 0
+        result["invalid_timestamps"] = 0
+        for row in db.execute(
+            "select timestamp,typeId,metricId,value from GPU_METRICS order by timestamp"
+        ):
+            stamp, type_id, metric_id, value = row
+            metric = definitions.get((type_id, metric_id))
+            if metric is None:
+                result["unmapped_samples"] += 1
+                continue
+            if not isinstance(stamp, int) or stamp < 0 or stamp + offset < 0:
+                result["invalid_timestamps"] += 1
+                metric["invalid_samples"] += 1
+                continue
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                metric["invalid_samples"] += 1
+                continue
+            aligned = stamp + offset
+            name = metric["definition"]["metricName"]
+            if not re.search(r"\[[^\]]+\]$", name):
+                name += f" [{metric['unit'] or 'unit unknown'}]"
+            timeline.counter(
+                name,
+                aligned,
+                value,
+                source="Nsight GPU Metrics",
+                device=metric["device"]["label"],
+            )
+            metric["samples"] += 1
+            metric["first_ns"] = (
+                aligned if metric["first_ns"] is None else metric["first_ns"]
+            )
+            metric["last_ns"] = aligned
+            result["emitted_samples"] += 1
+        result["available"] = result["emitted_samples"] > 0
+        if not result["available"]:
+            result["reason"] = "no usable GPU metric samples"
+    finally:
+        db.close()
+    return result
+
+
+def gpu_counters(out: Path, timeline: Timeline, clock: dict) -> dict:
+    """Add optional Nsight and NVML counters and return coverage/provenance.
+
+    Args:
+        out: Run directory containing SQLite and optional telemetry/status files.
+        timeline: Raw trace destination; missing values do not become zeros.
+        clock: Clock alignment returned by gpu_evidence for this same run.
+    Returns:
+        Independent provider availability and sampling limitations. NVML sample
+        timestamps are query midpoints, not exact hardware interval boundaries.
+    """
+    nsight = nsight_counters(out / "gpu.sqlite", timeline, clock)
+    telemetry = dict(available=False, samples=0, emitted_samples=0, metrics={})
+    result = dict(
+        nsight=nsight,
+        nvml=telemetry,
+        interpretation=[
+            "Device-wide sampled counters are not per-request attribution.",
+            "NVML GPU busy is time with any kernel, not the fraction of active SMs.",
+            "NVML memory busy is temporal utilization, not bandwidth in GB/s.",
+            "PCIe samples cover the device and cannot identify modeled CXL traffic.",
+            "No interpolation or zero fill; gaps and absent counters stay unmeasured.",
+        ],
+    )
+    for filename, key in (
+        ("gpu-metrics-status.json", "capture_status"),
+        ("gpu-telemetry-status.json", "telemetry_status"),
+    ):
+        path = out / filename
+        if path.exists():
+            result[key] = json.loads(path.read_text())
+    path = out / "gpu-telemetry.jsonl"
+    if not path.exists():
+        telemetry["reason"] = "NVML telemetry absent"
+        return result
+    status = result.get("telemetry_status", {})
+    fields = {
+        "gpu_kernel_active_percent": ("GPU kernel busy", "%"),
+        "memory_busy_percent": ("Device memory busy", "%"),
+        "pcie_rx_kb_per_s": ("PCIe Rx", "KB/s"),
+        "pcie_tx_kb_per_s": ("PCIe Tx", "KB/s"),
+    }
+    rows = read_jsonl(path)
+    telemetry["samples"] = len(rows)
+    telemetry["invalid_timestamps"] = 0
+    telemetry["max_query_duration_ns"] = None
+    telemetry["devices"] = {}
+    for row in rows:
+        stamp = row.get("monotonic_ns")
+        if not isinstance(stamp, int):
+            telemetry["invalid_timestamps"] += 1
+            continue
+        gpu, uuid = row.get("gpu"), row.get("gpu_uuid")
+        device = f"GPU:{gpu} / {uuid or 'UUID unavailable'}"
+        telemetry["devices"][device] = dict(gpu=gpu, uuid=uuid)
+        duration = row.get("query_duration_ns")
+        if isinstance(duration, int):
+            telemetry["max_query_duration_ns"] = max(
+                telemetry["max_query_duration_ns"] or 0, duration
+            )
+        for field, (label, default_unit) in fields.items():
+            unit = status.get("units", {}).get(field, default_unit)
+            key = f"{device} / {field}"
+            metric = telemetry["metrics"].setdefault(
+                key,
+                dict(
+                    name=field,
+                    device=device,
+                    unit=unit,
+                    samples=0,
+                    missing_samples=0,
+                    first_ns=None,
+                    last_ns=None,
+                ),
+            )
+            value = row.get(field)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                metric["missing_samples"] += 1
+                continue
+            timeline.counter(
+                f"{label} [{unit}]", stamp, value, source="NVML", device=device
+            )
+            metric["samples"] += 1
+            metric["first_ns"] = (
+                stamp if metric["first_ns"] is None else min(metric["first_ns"], stamp)
+            )
+            metric["last_ns"] = (
+                stamp if metric["last_ns"] is None else max(metric["last_ns"], stamp)
+            )
+            telemetry["emitted_samples"] += 1
+    telemetry["available"] = telemetry["emitted_samples"] > 0
+    if not telemetry["available"]:
+        telemetry["reason"] = "no usable NVML samples"
+    return result
+
+
 def analyze(out: str | Path) -> dict:
     """Write coverage, attribution, selected chains and raw visual timeline."""
     out = Path(out)
@@ -574,6 +875,7 @@ def analyze(out: str | Path) -> dict:
             cat="cache",
         )
     gpu = gpu_evidence(out / "gpu.sqlite", timeline)
+    counters = gpu_counters(out, timeline, gpu)
     accesses = defaultdict(list)
     for event in bus:
         metadata = event.get("metadata", {})
@@ -883,6 +1185,7 @@ def analyze(out: str | Path) -> dict:
         witnesses=witnesses,
         trace_footer=footer,
         gpu=gpu,
+        gpu_counters=counters,
         requests=rows,
         limits=[
             "one diagnostic run with instrumentation and Nsight; not a policy speedup",
@@ -964,6 +1267,25 @@ def analyze(out: str | Path) -> dict:
     lines += [
         "",
         "事件链见 analysis.json；timeline.json.gz 可直接导入 Perfetto。",
+        "",
+        "## GPU 资源采样",
+        "",
+        f"Nsight GPU Metrics：{counters['nsight']['emitted_samples']} 个已对齐样本；"
+        + (
+            "可用。"
+            if counters["nsight"]["available"]
+            else counters["nsight"].get("reason", "未观测")
+        ),
+        f"NVML：{counters['nvml']['emitted_samples']} 个数值样本；"
+        + (
+            "可用。"
+            if counters["nvml"]["available"]
+            else counters["nvml"].get("reason", "未观测")
+        ),
+        "原生指标名、单位依据、设备映射及样本覆盖见 analysis.json 的 gpu_counters；"
+        "Perfetto 中按 Nsight GPU Metrics / NVML 独立显示 counter。",
+        "NVML GPU busy 不等于 SM active，memory busy 不等于 GB/s；"
+        "设备级采样不归因到单个请求，也不代表模拟 CXL 的物理带宽。缺测不补零。",
         "",
         "## 解释边界",
         "",
