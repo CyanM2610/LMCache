@@ -16,6 +16,175 @@ import sqlite3
 import statistics
 
 
+INGRESS_MILESTONES = (
+    "api_request_received",
+    "api_body_received",
+    "api_handler_enter",
+    "api_preprocess_begin",
+    "api_preprocess_end",
+    "engine_input_process_begin",
+    "engine_input_process_end",
+    "engine_ipc_submit_begin",
+    "engine_ipc_submit_end",
+    "engine_request_received",
+    "engine_request_preprocessed",
+    "engine_request_dequeued",
+)
+
+
+def group_request_events(hosts: list[dict]) -> tuple[dict, dict]:
+    """Join logical API IDs and native IDs without losing early input events.
+
+    Args:
+        hosts: Host records containing event, request_id and optional logical_id.
+    Returns:
+        Native-to-logical scheduler aliases and chronologically grouped records.
+        Explicit logical_id wins for records emitted before native ID assignment.
+    """
+    aliases = {
+        row["request_id"]: row["logical_id"]
+        for row in hosts
+        if row["event"] == "input_known" and row.get("logical_id")
+    }
+    grouped = defaultdict(list)
+    for row in sorted(hosts, key=lambda record: record["ts_ns"]):
+        rid = row.get("logical_id") or aliases.get(
+            row.get("request_id"), row.get("request_id")
+        )
+        grouped[rid].append(row)
+    return aliases, grouped
+
+
+def ingress_intervals(milestones: dict) -> tuple[list[tuple], dict]:
+    """Split observed ingress boundaries, retaining holes and IPC concurrency.
+
+    Args:
+        milestones: Event names mapped to integer monotonic nanoseconds; dispatch
+            and input_known bound the old coarse interval when present.
+    Returns:
+        Priority intervals for partition() and coverage/ordering diagnostics.
+        Client IPC completion may overlap core receipt, so its raw span is
+        reported independently and is never added to a concurrent core stage.
+        Old traces without ingress probes retain their explicitly coarse stage.
+    """
+    measured = any(name in milestones for name in INGRESS_MILESTONES)
+    intervals, observed, violations = [], [], []
+
+    def add(left: str, right: str, stage: str, priority: int = 1) -> None:
+        if left not in milestones or right not in milestones:
+            return
+        start, end = milestones[left], milestones[right]
+        if start > end:
+            violations.append(dict(left=left, right=right, delta_ns=end - start))
+            return
+        intervals.append((start, end, stage, priority))
+        if priority:
+            observed.append(
+                dict(stage=stage, left=left, right=right, start_ns=start, end_ns=end)
+            )
+
+    add(
+        "dispatch",
+        "input_known",
+        "ingress_unexplained" if measured else "ingress_and_preprocessing",
+        0,
+    )
+    if measured:
+        for left, right, stage in (
+            ("dispatch", "api_request_received", "client_submit_to_api_receive"),
+            ("api_request_received", "api_body_received", "api_body_receive"),
+            ("api_body_received", "api_handler_enter", "api_parse_validate_dispatch"),
+            ("api_handler_enter", "api_preprocess_begin", "api_handler_setup"),
+            ("api_preprocess_begin", "api_preprocess_end", "api_preprocessing"),
+            (
+                "api_preprocess_end",
+                "engine_input_process_begin",
+                "api_to_engine_handoff",
+            ),
+            (
+                "engine_input_process_begin",
+                "engine_input_process_end",
+                "engine_input_processing",
+            ),
+            (
+                "engine_input_process_end",
+                "engine_ipc_submit_begin",
+                "engine_submit_preparation",
+            ),
+        ):
+            add(left, right, stage)
+        receipt = (
+            "engine_socket_received"
+            if "engine_socket_received" in milestones
+            else "engine_request_received"
+        )
+        # Sending and the receiver's decode/preprocessing run in parallel. Use
+        # completion to split only when it lies on the pre-receipt path.
+        begin = milestones.get("engine_ipc_submit_begin")
+        end = milestones.get("engine_ipc_submit_end")
+        received = milestones.get(receipt)
+        if (
+            begin is not None
+            and end is not None
+            and received is not None
+            and begin <= end <= received
+        ):
+            add(
+                "engine_ipc_submit_begin",
+                "engine_ipc_submit_end",
+                "ipc_serialize_and_submit",
+            )
+            add("engine_ipc_submit_end", receipt, "ipc_submit_to_core_receive")
+        else:
+            add("engine_ipc_submit_begin", receipt, "ipc_submission_and_delivery")
+        if receipt == "engine_socket_received":
+            add(receipt, "engine_request_received", "engine_message_decode")
+        add(
+            "engine_request_received",
+            "engine_request_preprocessed",
+            "engine_core_preprocessing",
+        )
+        add(
+            "engine_request_preprocessed",
+            "engine_request_dequeued",
+            "engine_input_queue",
+        )
+        add("engine_request_dequeued", "input_known", "engine_dispatch_to_scheduler")
+    begin, end = (
+        milestones.get("engine_ipc_submit_begin"),
+        milestones.get("engine_ipc_submit_end"),
+    )
+    client_span = None
+    if begin is not None and end is not None:
+        if begin <= end:
+            client_span = (end - begin) / 1e6
+        else:
+            violations.append(
+                dict(
+                    left="engine_ipc_submit_begin",
+                    right="engine_ipc_submit_end",
+                    delta_ns=end - begin,
+                )
+            )
+    decoded = milestones.get("engine_request_received")
+    return intervals, dict(
+        mode="milestone_split" if measured else "legacy_coarse",
+        missing=[name for name in INGRESS_MILESTONES if name not in milestones],
+        order_violations=violations,
+        client_ipc_span_ms=client_span,
+        client_ipc_overlaps_decoded_receipt=(
+            end > decoded if end is not None and decoded is not None else None
+        ),
+        intervals=observed,
+        chain=[
+            dict(event=name, ts_ns=stamp)
+            for name, stamp in sorted(milestones.items(), key=lambda item: item[1])
+            if name in INGRESS_MILESTONES
+            or name in ("dispatch", "engine_socket_received", "input_known")
+        ],
+    )
+
+
 def read_jsonl(path: Path) -> list[dict]:
     """Read complete records; fail rather than silently ignore trace corruption."""
     return [json.loads(line) for line in path.read_text().splitlines() if line]
@@ -358,18 +527,11 @@ def analyze(out: str | Path) -> dict:
     bus_path = out / "events.jsonl"
     bus = read_jsonl(bus_path) if bus_path.exists() else []
     validity = evidence_validity(out, replay, hosts, bus)
-    aliases = {
-        r["request_id"]: r["logical_id"]
-        for r in hosts
-        if r["event"] == "input_known" and r.get("logical_id")
-    }
-    grouped = defaultdict(list)
+    aliases, grouped = group_request_events(hosts)
     # Absolute MONOTONIC timestamps keep startup GPU events nonnegative too.
     # Trace viewers normalize their display origin while preserving intervals.
     timeline = Timeline(out / "timeline.json.gz", 0)
     for event in hosts:
-        rid = aliases.get(event.get("request_id"), event.get("request_id"))
-        grouped[rid].append(event)
         if event["event"].endswith(".end") and "begin_ns" in event:
             timeline.add(
                 event["event"][:-4],
@@ -437,6 +599,11 @@ def analyze(out: str | Path) -> dict:
             dispatch=req["dispatch_ns"],
             first_token_client=req["first_token_ns"],
         )
+        socket_received = first.get("engine_request_received", {}).get(
+            "socket_received_ns"
+        )
+        if socket_received is not None:
+            milestones["engine_socket_received"] = socket_received
         native = native_for.get(rid)
         gpu_restore = gpu["restores"].get(native)
         if gpu_restore and (
@@ -459,7 +626,12 @@ def analyze(out: str | Path) -> dict:
                     intervals.append((a, b, stage, priority))
 
         interval("eligible", "dispatch", "client_arrival_lag")
-        interval("dispatch", "input_known", "ingress_and_preprocessing")
+        ingress_parts, ingress = ingress_intervals(milestones)
+        intervals.extend(ingress_parts)
+        for boundary in ingress["chain"]:
+            boundary["since_origin_ms"] = (
+                boundary["ts_ns"] - replay["origin_ns"]
+            ) / 1e6
         interval("input_known", "lookup_submitted", "lookup_trigger_delay")
         interval("lookup_submitted", "lookup_result", "lookup_and_result_polling")
         restore = "restore_submit" in first
@@ -576,6 +748,7 @@ def analyze(out: str | Path) -> dict:
                 capacity_denials=len(denials),
                 stage_ms={k: v / 1e6 for k, v in durations.items()},
                 milestones_ns=milestones,
+                ingress=ingress,
                 gpu_restore=gpu_restore,
                 partition=parts,
                 event_chain=[e for e in events if e["ts_ns"] <= req["first_token_ns"]],
@@ -614,7 +787,38 @@ def analyze(out: str | Path) -> dict:
     ]
     footer = next((r for r in reversed(bus) if r["record"] == "footer"), None)
     witnesses = select_witnesses(good)
-    unknown_names = {"unexplained", "admission_unexplained"}
+    unknown_names = {"unexplained", "admission_unexplained", "ingress_unexplained"}
+    ingress_measured = [r for r in good if r["ingress"]["mode"] == "milestone_split"]
+    ingress_incomplete = {
+        r["id"]: r["ingress"]["missing"] for r in good if r["ingress"]["missing"]
+    }
+    ingress_invalid = {
+        r["id"]: r["ingress"]["order_violations"]
+        for r in good
+        if r["ingress"]["order_violations"]
+    }
+    if ingress_measured and ingress_incomplete:
+        validity["unconfirmed"].append(
+            "ingress instrumentation has missing request boundaries"
+        )
+        validity["passed"] = False
+        if validity["status"] == "valid":
+            validity["status"] = "unconfirmed"
+    if ingress_invalid:
+        validity["failures"].append("ingress milestone order violations")
+        validity["passed"] = False
+        validity["status"] = "invalid"
+    workload_path = out / "workload.json"
+    workload_requests = (
+        json.loads(workload_path.read_text()).get("requests", [])
+        if workload_path.exists()
+        else []
+    )
+    root_ids = {r["id"] for r in workload_requests if r.get("parent") is None}
+    ingress_stages = defaultdict(list)
+    for request in good:
+        for value in request["ingress"]["intervals"]:
+            ingress_stages[value["stage"]].append(value)
     report = dict(
         complete=bool(replay["complete"] and validity["passed"]),
         replay_complete=bool(replay["complete"]),
@@ -635,6 +839,29 @@ def analyze(out: str | Path) -> dict:
             restore_requests_waiting_after_input_known=len(known_wait),
             capacity_denied_requests=sum(r["capacity_denials"] > 0 for r in good),
             actual_gpu_restore_boundaries=sum(bool(r["gpu_restore"]) for r in restored),
+        ),
+        ingress=dict(
+            interpretation="observed wall-clock intervals include CPU execution and queuing; not pure wait or causal savings",
+            measured_requests=len(ingress_measured),
+            complete_boundary_requests=sum(not r["ingress"]["missing"] for r in good),
+            milestone_requests={
+                name: sum(name in r["milestones_ns"] for r in good)
+                for name in (
+                    *INGRESS_MILESTONES,
+                    "engine_socket_received",
+                    "input_known",
+                )
+            },
+            incomplete_requests=ingress_incomplete,
+            order_violations=ingress_invalid,
+            observed_interval_requests={
+                name: len(values) for name, values in ingress_stages.items()
+            },
+            first_roots=[
+                dict(id=r["id"], chain=r["ingress"]["chain"], stage_ms=r["stage_ms"])
+                for r in sorted(good, key=lambda r: r["milestones_ns"]["dispatch"])
+                if r["id"] in root_ids
+            ][:3],
         ),
         stages=[
             dict(
@@ -661,6 +888,8 @@ def analyze(out: str | Path) -> dict:
             "capacity refusal-to-retry is an observed upper bound, not all proven capacity wait",
             "CXL uses modeled registered shared memory, not physical CXL",
             "no trace-off comparison; observer and profiler overhead remains in measured latency",
+            "client IPC send completion may overlap EngineCore receipt; its independent span is not added twice",
+            "legacy traces without ingress probes keep their coarse ingress interval; missing new boundaries remain unknown",
         ],
     )
     (out / "analysis.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -681,6 +910,40 @@ def analyze(out: str | Path) -> dict:
         f"| {s['stage']} | {s['mean_all_requests_ms']:.3f} | {s['ttft_fraction']:.2%} | {s['requests']} |"
         for s in report["stages"]
     ]
+    lines += [
+        "",
+        "## 入口细分",
+        "",
+        f"带入口探针 {len(ingress_measured)}/{len(good)} 请求；全部新边界齐全 {report['ingress']['complete_boundary_requests']}/{len(good)}。",
+        "缺失边界保留为未知；客户端 IPC 提交完成可能晚于 EngineCore 收到请求，其独立跨度不重复计入 TTFT。",
+        "",
+        "| 时间点 | 已观测请求数 |",
+        "|---|---:|",
+    ]
+    lines += [
+        f"| {name} | {count} |"
+        for name, count in report["ingress"]["milestone_requests"].items()
+    ]
+    roots = report["ingress"]["first_roots"]
+    if roots:
+        lines += [
+            "",
+            "首批三个根请求，时间为相对回放起点的 ms；表格为逻辑路径，原始 chain 按实际时间排序。",
+            "",
+            "| 时间点 | " + " | ".join(r["id"] for r in roots) + " |",
+            "|---|" + "---:|" * len(roots),
+        ]
+        for name in (
+            "dispatch",
+            *INGRESS_MILESTONES,
+            "engine_socket_received",
+            "input_known",
+        ):
+            stamps = []
+            for request in roots:
+                point = next((b for b in request["chain"] if b["event"] == name), None)
+                stamps.append(f"{point['since_origin_ms']:.3f}" if point else "未观测")
+            lines.append("| " + name + " | " + " | ".join(stamps) + " |")
     lines += [
         "",
         "## 典型事件链",
