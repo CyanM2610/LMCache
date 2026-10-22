@@ -7,6 +7,7 @@ submission behind a modeled delay. A pending reply retains vLLM's block hold.
 """
 
 # Standard
+from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -353,8 +354,9 @@ class HybridCompletionLoop:
                     if self.closing:
                         return
                     self.condition.wait()
-                jobs = list(self.pending)
-            for job in jobs:
+                jobs = deque(self.pending)
+            while jobs:
+                job = jobs.popleft()
                 try:
                     if not self._advance(job):
                         continue
@@ -387,6 +389,11 @@ class HybridCompletionLoop:
                     self.failed += int(
                         not job.success or job.future.exception() is not None
                     )
+                    # Do not retain the last completed context while this
+                    # thread sleeps. Release snapshot/local ownership before
+                    # drain_context can observe an empty pending set and ACK
+                    # UNREGISTER; otherwise imported IPC tensors outlive it.
+                    del job
                     self.condition.notify_all()
             with self.condition:
                 if self.pending:
