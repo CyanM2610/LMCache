@@ -528,7 +528,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         )
         for key in (
-            "decoupled_control", "prepare_lookup_operations", "prepare_load_operations", "decoupled_store"
+            "decoupled_control", "prepare_lookup_operations", "prepare_load_operations", "decoupled_store", "action_feedback"
         ):
             if type(operation_config.get(f"lmcache.mp.{key}", False)) is not bool:
                 raise ValueError(f"lmcache.mp.{key} must be a boolean")
@@ -1284,6 +1284,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         self.store_operation_decider = decider
 
+    def set_operation_feedback_observer(self, observer) -> None:
+        """Native-boundary observations only; no new transport or polling."""
+        self._operation_feedback_observer = observer
+        self._feedback_store_receipts = {}
+        self._feedback_ended_stores = OrderedDict()
+        self.scheduler_adapter._operation_feedback_observer = observer
+
+    def _notify_operation_feedback(self, view, result, **fields):
+        observer = getattr(self, "_operation_feedback_observer", None)
+        if observer is not None:
+            observer(dict(view), result, **fields)
+
     def get_retained_store_candidates(self, limit: int) -> tuple[dict[str, Any], ...]:
         """Visit committed but unsubmitted STOREs in bounded fair round-robin order.
 
@@ -1641,6 +1653,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 self._store_submissions[:self.operation_step_limit]
             )
             del self._store_submissions[:self.operation_step_limit]
+            if getattr(self, "_operation_feedback_observer", None) is not None:
+                for identity in metadata.submit_store_ids:
+                    self._notify_operation_feedback(self._store_operation_views[identity],
+                                                    "metadata_formed", native_phase="submit_control_metadata")
         if self._promotion is not None:
             metadata.promotions = self._promotion.prepare()
 
@@ -1670,6 +1686,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return
         if self.decoupled_store_enabled:
             for receipt in meta.store_receipts:
+                feedback_enabled = getattr(self, "_operation_feedback_observer", None) is not None
+                if feedback_enabled:
+                    fingerprint = (receipt.request_id, receipt.start, receipt.end,
+                                   receipt.phase, receipt.succeeded)
+                    if receipt.phase not in ("committed", "submitted", "terminal"):
+                        raise ValueError("unknown STORE receipt phase")
+                    seen = self._feedback_store_receipts.get(receipt.operation_id)
+                    ended = self._feedback_ended_stores.get(receipt.operation_id)
+                    if fingerprint in (seen or ()) or fingerprint in (ended or ()):
+                        continue
+                    if ended is not None:
+                        raise ValueError("late STORE receipt contradicts completed operation")
                 view = self._store_operation_views.get(receipt.operation_id)
                 if view is None:
                     raise ValueError("unknown STORE completion identity")
@@ -1683,11 +1711,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     else "dependencies_checked"
                 )
                 view["native_phase"] = receipt.phase
+                if feedback_enabled:
+                    seen = self._feedback_store_receipts.setdefault(receipt.operation_id, set())
+                    seen.add(fingerprint)
+                    outcome = ("failure_received" if receipt.phase == "terminal" and receipt.succeeded is False
+                               else "completion_received" if receipt.phase == "terminal"
+                               else "submission_observed" if receipt.phase == "submitted"
+                               else "resources_acquired")
+                    self._notify_operation_feedback(view, outcome, native_phase="worker_" + receipt.phase)
                 if receipt.phase == "submitted":
                     self._retained_store_candidates.pop(receipt.operation_id, None)
                 if receipt.phase == "terminal":
                     self._retained_store_candidates.pop(receipt.operation_id, None)
                     del self._store_operation_views[receipt.operation_id]
+                    if feedback_enabled:
+                        self._notify_operation_feedback(view, "completion_adopted", native_phase="store_receipt_adopted",
+                                                        reason="store_failed" if receipt.succeeded is False else None)
+                        self._notify_operation_feedback(view, "obligation_ended", native_phase="native_store_terminal",
+                                                        reason="terminal_failure" if receipt.succeeded is False else None)
+                        self._feedback_ended_stores[receipt.operation_id] = self._feedback_store_receipts.pop(receipt.operation_id)
+                        while len(self._feedback_ended_stores) > self.operation_step_limit:
+                            self._feedback_ended_stores.popitem(last=False)
         if meta.promotion_receipts:
             if self._promotion is None:
                 raise ValueError("promotion receipt without enabled scheduler owner")
@@ -1866,6 +1910,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
+                if getattr(self, "_operation_feedback_observer", None) is not None:
+                    self._notify_operation_feedback(dict(
+                        operation_id="", request_id=r_metadata.request_id, kind="load",
+                        start_token=r_metadata.op.start, end_token=r_metadata.op.end,
+                        skip_first_n_tokens=r_metadata.op.skip_first_n_tokens),
+                        "metadata_formed", native_phase="connector_retrieve_metadata")
             request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(
@@ -1949,9 +1999,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """Discover and commit a native range; commitment is not physical completion."""
         chunk_size = self.scheduler_adapter.lmcache_tokens_per_chunk
         if not self.decoupled_store_enabled:
-            return LMCacheMPRequestMetadata.GetStoreMetadata(
+            candidate = LMCacheMPRequestMetadata.GetStoreMetadata(
                 tracker, chunk_size, self._group_tokens_per_block
             )
+            if candidate is not None and getattr(self, "_operation_feedback_observer", None) is not None:
+                self._store_operation_sequence += 1
+                view = dict(operation_id=f"{candidate.request_id}:native-store:{self._store_operation_sequence}",
+                            request_id=candidate.request_id, kind="store",
+                            start_token=candidate.op.start, end_token=candidate.op.end)
+                # Observation identity only. Do not change native metadata or
+                # turn immediate STORE into a retained worker operation.
+                self._notify_operation_feedback(view, "resources_acquired", native_phase="native_store_metadata_commitment")
+                self._notify_operation_feedback(view, "metadata_formed", native_phase="native_store_metadata")
+            return candidate
         candidate = LMCacheMPRequestMetadata.PeekStoreMetadata(
             tracker, chunk_size, self._group_tokens_per_block
         )
@@ -1986,6 +2046,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         view["stage"] = "dependencies_checked"
         view["native_phase"] = "committed_metadata"
         self._store_operation_views[operation_id] = view
+        if getattr(self, "_operation_feedback_observer", None) is not None:
+            self._notify_operation_feedback(view, "resources_acquired", native_phase="store_metadata_commitment")
+            self._notify_operation_feedback(view, "metadata_formed", native_phase="store_metadata")
         if action == "defer":
             metadata.defer_store_ids += (operation_id,)
             self._retained_store_candidates[operation_id] = None

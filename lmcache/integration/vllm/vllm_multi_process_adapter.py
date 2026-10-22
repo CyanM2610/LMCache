@@ -960,6 +960,10 @@ class LMCacheMPSchedulerAdapter:
             f"{request_id}:lookup:0:{aligned_end}:{self._lookup_operation_sequence}"
         )
         self._lookup_operation_ranges[request_id] = (0, aligned_end)
+        observer = getattr(self, "_operation_feedback_observer", None)
+        if observer is not None:
+            observer(self.lookup_operation_state(request_id), "submission_observed",
+                     native_phase="lookup_rpc_submitted")
         if self._lookup_progress_enabled:
             self._lookup_progress_queue[request_id] = None
 
@@ -1113,6 +1117,13 @@ class LMCacheMPSchedulerAdapter:
                 ).no_worker_id_version()
                 self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
 
+    def _lookup_feedback_failure(self, request_id: str, reason: str) -> None:
+        observer = getattr(self, "_operation_feedback_observer", None)
+        if observer is not None:
+            observer(self.lookup_operation_state(request_id), "failure_received",
+                     reason=reason, native_phase="native_lookup_failure",
+                     resource_obligation="native_session_cleanup_pending")
+
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
         """
@@ -1149,6 +1160,7 @@ class LMCacheMPSchedulerAdapter:
         if not self.is_healthy:
             # Server went down — give up on this lookup
             self._lookup_progress_queue.pop(request_id, None)
+            self._lookup_feedback_failure(request_id, "server_unhealthy")
             return 0
 
         if request_id in self._finished_lookup_results:
@@ -1176,6 +1188,7 @@ class LMCacheMPSchedulerAdapter:
                         self._mark_lookup_timed_out(url)
                         del self._unacked_lookups[request_id]
                         self._lookup_progress_queue.pop(request_id, None)
+                        self._lookup_feedback_failure(request_id, "ack_rejected_or_failed")
                         return 0
             ack.futures = waiting
             if ack.futures:
@@ -1184,6 +1197,7 @@ class LMCacheMPSchedulerAdapter:
                         self._mark_lookup_timed_out(url)
                     del self._unacked_lookups[request_id]
                     self._lookup_progress_queue.pop(request_id, None)
+                    self._lookup_feedback_failure(request_id, "ack_timeout")
                     return 0
                 # Acknowledgement still in flight; poll again next step.
                 return None
@@ -1212,6 +1226,7 @@ class LMCacheMPSchedulerAdapter:
                 if time.monotonic() - submitted_at >= self._mq_timeout:
                     self._mark_lookup_timed_out(url)
                     self._lookup_progress_queue.pop(request_id, None)
+                    self._lookup_feedback_failure(request_id, "status_timeout")
                     return 0
                 continue
             del futures[url]
@@ -1226,6 +1241,7 @@ class LMCacheMPSchedulerAdapter:
                 )
                 self._health_events[url].clear()
                 self._lookup_progress_queue.pop(request_id, None)
+                self._lookup_feedback_failure(request_id, "status_timeout")
                 return 0
             if r is None:
                 continue
@@ -1250,6 +1266,10 @@ class LMCacheMPSchedulerAdapter:
         wait_emit("lookup_result", request_id, hit_tokens=token_count)
         self._finished_lookup_results[request_id] = token_count
         self._lookup_progress_queue.pop(request_id, None)
+        observer = getattr(self, "_operation_feedback_observer", None)
+        if observer is not None:
+            observer(self.lookup_operation_state(request_id), "completion_received",
+                     native_phase="lookup_result_observed")
         return token_count
 
     def num_blocks_per_chunk(self) -> int:
@@ -1270,6 +1290,8 @@ class LMCacheMPSchedulerAdapter:
             ownership to the confirmed cleanup owner, even after these result
             records have been removed and even while the backend is unhealthy.
         """
+        observer = getattr(self, "_operation_feedback_observer", None)
+        view = self.lookup_operation_state(request_id) if observer is not None else None
         self._lookup_progress_queue.pop(request_id, None)
         self._pending_lookups.discard(request_id)
         self._unacked_lookups.pop(request_id, None)
@@ -1279,6 +1301,9 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_params.pop(request_id, None)
         self._lookup_operation_ids.pop(request_id, None)
         self._lookup_operation_ranges.pop(request_id, None)
+        if view is not None and view["operation_id"]:
+            observer(view, "query_tracking_ended", native_phase="native_lookup_records_discarded",
+                     resource_obligation="source_cleanup_remains_native; not_a_release_receipt")
 
     def shutdown(self) -> None:
         """Drain confirmed logical cleanup before closing transport clients.
