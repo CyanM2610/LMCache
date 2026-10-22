@@ -528,7 +528,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         )
         for key in (
-            "decoupled_control", "prepare_lookup_operations", "prepare_load_operations", "decoupled_store", "action_feedback"
+            "decoupled_control", "prepare_lookup_operations", "prepare_load_operations", "decoupled_store", "action_feedback", "global_plan", "plan_new_lookup"
         ):
             if type(operation_config.get(f"lmcache.mp.{key}", False)) is not bool:
                 raise ValueError(f"lmcache.mp.{key} must be a boolean")
@@ -545,6 +545,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self.prepare_lookup_operations = operation_config.get(
             "lmcache.mp.prepare_lookup_operations", False
         ) is True
+        self.plan_lookup_enabled = (operation_config.get("lmcache.mp.global_plan", False)
+                                    and operation_config.get("lmcache.mp.plan_new_lookup", False))
         self.decoupled_store_enabled = operation_config.get(
             "lmcache.mp.decoupled_store", False
         ) is True
@@ -1244,9 +1246,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
     def lookup_operation_state(self, request_id: str) -> dict[str, Any]:
         """Read native lookup state without querying, matching or taking resources."""
-        return self.scheduler_adapter.lookup_operation_state(request_id)
+        state = self.scheduler_adapter.lookup_operation_state(request_id)
+        tracker = self.request_trackers.get(request_id)
+        if tracker is not None and tracker.state == LMCacheMPRequestState.BYPASS_LMCACHE:
+            state["native_fallback_reason"] = "native_tracker_bypass"
+        return state
 
-    def prepare_lookup_operation(self, request: "Request") -> dict[str, Any]:
+    def prepare_lookup_operation(self, request: "Request", *, planned=False) -> dict[str, Any]:
         """Submit one native LOOKUP only when separate preparation is enabled.
 
         Args:
@@ -1256,7 +1262,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Raises:
             ValueError: Independent new-query preparation is disabled.
         """
-        if not self.decoupled_control_enabled or not self.prepare_lookup_operations:
+        authorized = self.plan_lookup_enabled if planned else self.prepare_lookup_operations
+        if not self.decoupled_control_enabled or not authorized:
             raise ValueError("independent LOOKUP preparation is disabled")
         tracker = self._get_or_create_request_tracker(request)
         if (request.status != RequestStatus.PREEMPTED
@@ -1276,6 +1283,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 self._store_operation_views.values(), self.operation_step_limit
             )
         )
+        return tuple(lookups) + stores
+
+    def get_global_operation_snapshot(self) -> tuple[dict[str, Any], ...]:
+        """Complete scalar read; no result polling or retained-STORE rotation."""
+        lookups = self.scheduler_adapter.lookup_operation_snapshot(complete=True)
+        positions = {identity: index for index, identity in enumerate(self._retained_store_candidates)}
+        stores = tuple(dict(view, retained_store=identity in positions,
+                            queue="retained_store" if identity in positions else "committed_store",
+                            queue_position=positions.get(identity, index))
+                       for index, (identity, view) in enumerate(self._store_operation_views.items()))
         return tuple(lookups) + stores
 
     def set_operation_decider(
@@ -1300,11 +1317,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if observer is not None:
             observer(dict(view), result, **fields)
 
-    def get_retained_store_candidates(self, limit: int) -> tuple[dict[str, Any], ...]:
+    def get_retained_store_candidates(
+        self, limit: int, preferred_ids: Iterable[str] = (),
+        excluded_ids: Iterable[str] = (),
+    ) -> tuple[dict[str, Any], ...]:
         """Visit committed but unsubmitted STOREs in bounded fair round-robin order.
 
         Args:
             limit: Maximum visits, independently capped by operation_step_limit.
+            preferred_ids: Explicit submission choices visited before round-robin.
+            excluded_ids: Plan-held operations; no visit budget or queue rotation.
         Returns:
             Immutable-valued snapshots, not native source block references.
         Raises:
@@ -1316,9 +1338,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             limit, self.operation_step_limit, len(self._retained_store_candidates)
         )
         result = []
-        for _ in range(count):
-            operation_id, _ = self._retained_store_candidates.popitem(last=False)
-            self._retained_store_candidates[operation_id] = None
+        visited = set()
+        excluded = set(excluded_ids)
+        for identity in preferred_ids:
+            if len(result) >= count:
+                break
+            if (identity in self._retained_store_candidates
+                    and identity not in visited and identity not in excluded):
+                visited.add(identity)
+                self._retained_store_candidates.move_to_end(identity)
+                result.append(dict(self._store_operation_views[identity]))
+        for operation_id in tuple(self._retained_store_candidates):
+            if len(result) >= count:
+                break
+            if operation_id in visited or operation_id in excluded:
+                continue
+            self._retained_store_candidates.move_to_end(operation_id)
+            visited.add(operation_id)
             result.append(dict(self._store_operation_views[operation_id]))
         return tuple(result)
 

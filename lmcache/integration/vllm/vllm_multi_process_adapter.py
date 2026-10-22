@@ -766,6 +766,8 @@ class LMCacheMPSchedulerAdapter:
         self._pending_lookups: set[str] = set()
         self._unacked_lookups: dict[str, _LookupAck] = {}
         self._finished_lookup_results: dict[str, int] = {}
+        self._lookup_observed_ns: dict[str, int] = {}
+        self._lookup_failure_reasons: dict[str, str] = {}
         self._per_server_hits: dict[str, dict[str, int]] = {}
         # request_id -> server URL -> (in-flight status future, submission time).
         self._lookup_status: dict[
@@ -989,6 +991,10 @@ class LMCacheMPSchedulerAdapter:
             "pending": submitted and not known,
             "result_known": known,
             "result_tokens": self._finished_lookup_results.get(request_id),
+            "observed_ns": self._lookup_observed_ns.get(request_id),
+            "native_fallback_reason": self._lookup_failure_reasons.get(
+                request_id, "server_unhealthy" if not self.is_healthy else None
+            ),
             "source_ownership": request_id in self._owned_lookup_ids,
             "source_readable": "unknown",
             "stage": "completed_observed" if known else (
@@ -996,13 +1002,38 @@ class LMCacheMPSchedulerAdapter:
             ),
         }
 
-    def lookup_operation_snapshot(self) -> tuple[dict[str, Any], ...]:
+    def lookup_operation_snapshot(self, complete=False) -> tuple[dict[str, Any], ...]:
         """Return a bounded observation of native query records, without polling.
 
         This is a diagnostic view, not an exhaustive candidate discovery pass.
         Only the progress queue determines fair advancement. Native consumed
         queries no longer appear, even when session cleanup still owns leases.
         """
+        if complete:
+            ids = (set(self._pending_lookups) | self._finished_lookup_results.keys()
+                   | set(self._owned_lookup_ids))
+            result = []
+            positions = {rid: index for index, rid in enumerate(self._lookup_progress_queue)}
+            for rid in sorted(ids):
+                view = self.lookup_operation_state(rid)
+                view.update(queue="lookup_progress" if rid in positions else "lookup_owner",
+                            queue_position=positions.get(rid))
+                if view["operation_id"] is None:
+                    view.update(operation_id=f"source-obligation:{rid}",
+                                stage="source_cleanup_owned", native_phase="lookup_consumed")
+                result.append(view)
+            if self._session_cleanup is not None:
+                # Existing local owner lock, scalar copy only; report_status
+                # neither waits for ACK nor polls a transport future.
+                for item in self._session_cleanup.report_status()["requests"]:
+                    result.append(dict(
+                        operation_id=f"cleanup:{item['server']}:{item['generation']}:{item['request_id']}",
+                        request_id=item["request_id"], kind="source_cleanup",
+                        stage="cleanup_pending", native_phase="native_cleanup_owner",
+                        source_ownership=True, source_readable="unknown",
+                        dependencies=(("server_end_ack", "blocked"),),
+                    ))
+            return tuple(result)
         views: dict[str, dict[str, Any]] = {}
         for records in (self._lookup_progress_queue, self._finished_lookup_results):
             for request_id in records:
@@ -1118,6 +1149,7 @@ class LMCacheMPSchedulerAdapter:
                 self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
 
     def _lookup_feedback_failure(self, request_id: str, reason: str) -> None:
+        self._lookup_failure_reasons[request_id] = reason
         observer = getattr(self, "_operation_feedback_observer", None)
         if observer is not None:
             observer(self.lookup_operation_state(request_id), "failure_received",
@@ -1265,6 +1297,7 @@ class LMCacheMPSchedulerAdapter:
 
         wait_emit("lookup_result", request_id, hit_tokens=token_count)
         self._finished_lookup_results[request_id] = token_count
+        self._lookup_observed_ns[request_id] = time.monotonic_ns()
         self._lookup_progress_queue.pop(request_id, None)
         observer = getattr(self, "_operation_feedback_observer", None)
         if observer is not None:
@@ -1297,6 +1330,8 @@ class LMCacheMPSchedulerAdapter:
         self._unacked_lookups.pop(request_id, None)
         self._lookup_status.pop(request_id, None)
         self._finished_lookup_results.pop(request_id, None)
+        self._lookup_observed_ns.pop(request_id, None)
+        self._lookup_failure_reasons.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
         self._lookup_params.pop(request_id, None)
         self._lookup_operation_ids.pop(request_id, None)
