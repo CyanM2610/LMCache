@@ -111,3 +111,19 @@ configured context are rejected. Async scheduling remains enabled. The pinned
 model has 32768 positions; longer inputs require a separately validated model
 or position configuration. ``NATIVE_FIXES.md`` distinguishes repaired-source
 validation from the original measured results.
+
+Minimal profiling canaries
+--------------------------
+
+``run_service.py --trace light --worker-timing`` adds an observation-only worker
+adapter that records separate execute/sample host and current-stream CUDA
+envelopes. It preserves native async scheduling and output objects. Uncorrelated
+output-copy streams remain unknown. ``profile_native_transfer.py`` probes the
+compiled object-group gather/scatter executor using registered host backing;
+byte verification is outside measurement. JSONL-only MP observation now exports
+completed native phase samples without enabling heavy tracing or metrics.
+
+``analyze_canaries.py`` checks frozen sample completeness, unique worker-step
+correlation, independent byte checks and OFF/ON overhead. See
+``PROFILING_CANARIES.md`` for the measured small-shape coverage and overhead;
+these are instrument-validation/training data, not a new blind heldout.

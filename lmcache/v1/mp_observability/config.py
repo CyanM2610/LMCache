@@ -417,7 +417,11 @@ def init_observability(
 
         bus.register_subscriber(JsonlSubscriber(obs_config.event_jsonl, bus))
 
-    if obs_config.metrics_enabled or obs_config.tracing_enabled:
+    if (
+        obs_config.metrics_enabled
+        or obs_config.tracing_enabled
+        or obs_config.event_jsonl
+    ):
         # First Party
         from lmcache.v1.mp_observability.subscribers.transfer_phase_sampler import (
             TransferPhaseSampler,
