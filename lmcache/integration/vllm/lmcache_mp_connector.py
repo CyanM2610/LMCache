@@ -1424,6 +1424,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Report block allocation deltas to LMCache for observability
         self._report_block_allocation_deltas(scheduler_output)
 
+        # Observe existing LOOKUP work only; adoption stays on a later native
+        # request visit. Do not change this step's already-formed metadata.
+        self.scheduler_adapter.progress_pending_lookups()
+
         return metadata
 
     def update_connector_output(self, connector_output: KVConnectorOutput):

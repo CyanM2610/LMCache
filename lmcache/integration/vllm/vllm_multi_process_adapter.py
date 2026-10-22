@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -96,6 +97,9 @@ class ExtraConfigDefault(enum.Enum):
     heartbeat_interval = 10.0
     # Poll status replies without blocking the scheduler by default.
     nonblocking_lookup_status = True
+    # Observe only already-submitted lookups at the end of scheduler steps.
+    lookup_independent_progress = False
+    lookup_progress_per_step = 32
     # Routing mode for ``create_transfer_context``: ``auto`` keeps the
     # historical CUDA -> lmcache_driven / others -> engine_driven dispatch;
     # ``lmcache_driven`` forces the IPC / SHM zero-copy path where the
@@ -665,13 +669,13 @@ class LMCacheMPSchedulerAdapter:
         )
         assert len(server_urls) >= 1, "At least one server url required"
         self._server_urls: list[str] = list(server_urls)
-        self.req_clients: dict[str, RequestClient] = {
-            url: RequestClientFactory.create(url, context=context)
-            for url in self._server_urls
-        }
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
         )
+        self._lookup_progress_enabled = (
+            ExtraConfigDefault.lookup_independent_progress.default
+        )
+        self._lookup_progress_limit = ExtraConfigDefault.lookup_progress_per_step.default
         confirmed_cleanup = False
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
@@ -680,7 +684,31 @@ class LMCacheMPSchedulerAdapter:
             self._nonblocking_lookup_status = cfg[
                 ExtraConfigDefault.nonblocking_lookup_status.name
             ]
+            self._lookup_progress_enabled = cfg[
+                ExtraConfigDefault.lookup_independent_progress.name
+            ]
+            self._lookup_progress_limit = cfg[
+                ExtraConfigDefault.lookup_progress_per_step.name
+            ]
+            raw_limit = extra_config.get(
+                "lmcache.mp.lookup_progress_per_step", self._lookup_progress_limit
+            )
+            if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)):
+                raise ValueError("lookup_progress_per_step must be a positive integer")
             confirmed_cleanup = cfg[ExtraConfigDefault.require_terminal_completion.name]
+        if self._lookup_progress_limit <= 0:
+            raise ValueError("lookup_progress_per_step must be a positive integer")
+        if self._lookup_progress_enabled and not self._nonblocking_lookup_status:
+            raise ValueError("independent lookup progress requires nonblocking STATUS")
+        # Reject incompatible progress configuration before acquiring clients.
+        self.req_clients: dict[str, RequestClient] = {
+            url: RequestClientFactory.create(url, context=context)
+            for url in self._server_urls
+        }
+        self._lookup_progress_queue: OrderedDict[str, None] = OrderedDict()
+        self._lookup_status_submissions = 0
+        self._lookup_progress_status_seen = 0
+        self._lookup_progress_sequence = 0
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -883,6 +911,75 @@ class LMCacheMPSchedulerAdapter:
         wait_emit("lookup_submitted", request_id, tokens=len(token_ids))
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+        if self._lookup_progress_enabled:
+            self._lookup_progress_queue[request_id] = None
+
+    def progress_pending_lookups(self) -> None:
+        """Observe a bounded, fair round of submitted lookups on this thread.
+
+        Called once at the end of connector metadata construction. No LOOKUP,
+        HBM matching/allocation, request-state adoption or LOAD is performed.
+        Final results remain in the native result cache for a later native
+        request visit. No scheduler step means no independent progress.
+
+        Returns:
+            None. Disabled mode is a no-op, including observation emission.
+        Raises:
+            Exceptions from the native checker unchanged; pending progress and
+            source-lease cleanup obligations are retained on that path.
+        Notes:
+            The limit bounds extra visits, not foreground visits or RPC count
+            across servers. Timings are observation costs, never server work
+            completion timestamps; the event's own emission is excluded.
+        """
+        if not self._lookup_progress_enabled:
+            return
+        started = time.monotonic_ns()
+        cpu_started = time.thread_time_ns()
+        self._lookup_progress_sequence += 1
+        status_before = self._lookup_status_submissions
+        visited: list[str] = []
+        completed = fallback = 0
+        failed = True
+        try:
+            count = min(self._lookup_progress_limit, len(self._lookup_progress_queue))
+            for _ in range(count):
+                # Keep the item until check succeeds, so native exceptions do
+                # not silently drop its progress or alter cleanup ownership.
+                request_id = next(iter(self._lookup_progress_queue))
+                visited.append(request_id)
+                result = self.check_lookup_result(request_id)
+                if result is None:
+                    self._lookup_progress_queue.move_to_end(request_id)
+                else:
+                    self._lookup_progress_queue.pop(request_id, None)
+                    if request_id in self._finished_lookup_results:
+                        completed += 1
+                    else:
+                        # Health/timeout zero is not a successful server miss.
+                        fallback += 1
+            failed = False
+        finally:
+            status_after = self._lookup_status_submissions
+            since_previous = status_after - self._lookup_progress_status_seen
+            self._lookup_progress_status_seen = status_after
+            wait_emit(
+                "lookup_progress_step",
+                sequence=self._lookup_progress_sequence,
+                limit=self._lookup_progress_limit,
+                visited=len(visited),
+                request_ids=visited,
+                new_status_queries=status_after - status_before,
+                status_queries_since_previous_step=since_previous,
+                completed=completed,
+                terminal_fallbacks=fallback,
+                pending=len(self._lookup_progress_queue),
+                wall_ns=time.monotonic_ns() - started,
+                thread_cpu_ns=time.thread_time_ns() - cpu_started,
+                failed=failed,
+                timing_scope="scheduler-thread observation; excludes this emit; "
+                "not server completion; completed excludes health/timeout fallbacks",
+            )
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -952,14 +1049,17 @@ class LMCacheMPSchedulerAdapter:
         if request_id not in self._pending_lookups:
             # No job — either unhealthy at submit time or already cleaned up.
             # Return the cached aggregate if any, otherwise 0.
+            self._lookup_progress_queue.pop(request_id, None)
             return self._finished_lookup_results.get(request_id, 0)
 
         if not self.is_healthy:
             # Server went down — give up on this lookup
+            self._lookup_progress_queue.pop(request_id, None)
             return 0
 
         if request_id in self._finished_lookup_results:
             # Aggregation already done; return the cached value.
+            self._lookup_progress_queue.pop(request_id, None)
             return self._finished_lookup_results[request_id]
 
         ack = self._unacked_lookups.get(request_id)
@@ -981,6 +1081,7 @@ class LMCacheMPSchedulerAdapter:
                     if accepted is not True:
                         self._mark_lookup_timed_out(url)
                         del self._unacked_lookups[request_id]
+                        self._lookup_progress_queue.pop(request_id, None)
                         return 0
             ack.futures = waiting
             if ack.futures:
@@ -988,6 +1089,7 @@ class LMCacheMPSchedulerAdapter:
                     for url in ack.futures:
                         self._mark_lookup_timed_out(url)
                     del self._unacked_lookups[request_id]
+                    self._lookup_progress_queue.pop(request_id, None)
                     return 0
                 # Acknowledgement still in flight; poll again next step.
                 return None
@@ -1008,11 +1110,14 @@ class LMCacheMPSchedulerAdapter:
                     self.req_clients[url].query_prefetch_status(request_id),
                     time.monotonic(),
                 )
+                if self._lookup_progress_enabled:
+                    self._lookup_status_submissions += 1
 
         for url, (fut, submitted_at) in list(futures.items()):
             if self._nonblocking_lookup_status and not fut.query():
                 if time.monotonic() - submitted_at >= self._mq_timeout:
                     self._mark_lookup_timed_out(url)
+                    self._lookup_progress_queue.pop(request_id, None)
                     return 0
                 continue
             del futures[url]
@@ -1026,6 +1131,7 @@ class LMCacheMPSchedulerAdapter:
                     url,
                 )
                 self._health_events[url].clear()
+                self._lookup_progress_queue.pop(request_id, None)
                 return 0
             if r is None:
                 continue
@@ -1049,6 +1155,7 @@ class LMCacheMPSchedulerAdapter:
 
         wait_emit("lookup_result", request_id, hit_tokens=token_count)
         self._finished_lookup_results[request_id] = token_count
+        self._lookup_progress_queue.pop(request_id, None)
         return token_count
 
     def num_blocks_per_chunk(self) -> int:
@@ -1069,6 +1176,7 @@ class LMCacheMPSchedulerAdapter:
             ownership to the confirmed cleanup owner, even after these result
             records have been removed and even while the backend is unhealthy.
         """
+        self._lookup_progress_queue.pop(request_id, None)
         self._pending_lookups.discard(request_id)
         self._unacked_lookups.pop(request_id, None)
         self._lookup_status.pop(request_id, None)
@@ -1083,6 +1191,7 @@ class LMCacheMPSchedulerAdapter:
             RuntimeError: If hybrid cleanup cannot be confirmed. Clients and
                 the cleanup owner remain live; backend restart is required.
         """
+        self._lookup_progress_queue.clear()
         with self._heartbeat_lock:
             for hb in self._heartbeats.values():
                 hb.stop()
@@ -1161,6 +1270,7 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
+        self._lookup_progress_queue.pop(request_id, None)
         if self._session_cleanup is not None:
             if request_id in self._owned_lookup_ids:
                 self._session_cleanup.retire(request_id)
