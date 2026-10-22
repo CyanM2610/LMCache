@@ -1110,6 +1110,53 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        return self._get_num_new_matched_tokens(
+            request, num_computed_tokens, allow_lookup_submit=True,
+            commit_match=True, idempotent_prefix_accounting=False,
+        )
+
+    def observe_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        """Progress one native future without committing match accounting.
+
+        The reader lease and future are native-owned. Preparation observes the
+        result but has no HBM ownership and must not record a stored prefix or
+        overwrite the hit boundaries used to construct STORE/RETRIEVE metadata.
+        """
+        return self._get_num_new_matched_tokens(
+            request, num_computed_tokens, allow_lookup_submit=True,
+            commit_match=False, idempotent_prefix_accounting=True,
+        )
+
+    def get_num_new_matched_tokens_from_existing_lookup(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        """Reconcile fresh HBM against the same native future, never submit.
+
+        Admission commits current match boundaries. Repeated allocation
+        attempts must not count the same absolute lower prefix twice. STORE
+        increments remain additive in LMCacheMPRequestTracker. PREEMPTED and
+        failed-load bypass cases use native rules.
+        """
+        return self._get_num_new_matched_tokens(
+            request, num_computed_tokens, allow_lookup_submit=False,
+            commit_match=True, idempotent_prefix_accounting=True,
+        )
+
+    def _get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        *,
+        allow_lookup_submit: bool,
+        commit_match: bool,
+        idempotent_prefix_accounting: bool,
+    ) -> tuple[int | None, bool]:
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
@@ -1163,6 +1210,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             and request.num_computed_tokens == 0
             and tracker.num_lmcache_hit_tokens > 0
         ):
+            if not commit_match:
+                # A read-only estimate can report native recomputation without
+                # consuming failure cleanup; admission/cancellation still owns
+                # those state changes. Never start another LOOKUP for it.
+                return 0, False
             logger.warning(
                 "Bypassing LMCache for request %s after a failed async KV load; "
                 "the prompt will be recomputed locally.",
@@ -1176,12 +1228,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
 
-        self.scheduler_adapter.maybe_submit_lookup_request(
-            request.request_id,
-            token_ids=tracker.get_token_ids(),
-            cache_salt=tracker.cache_salt,
-            request_configs=tracker.request_configs,
-        )
+        if allow_lookup_submit:
+            self.scheduler_adapter.maybe_submit_lookup_request(
+                request.request_id,
+                token_ids=tracker.get_token_ids(),
+                cache_salt=tracker.cache_salt,
+                request_configs=tracker.request_configs,
+            )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
         if ret is None:
@@ -1192,19 +1245,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
 
-        # Update num stored tokens for the tracker
-        tracker.increase_num_stored_tokens(ret)
+        if commit_match:
+            # Update num stored tokens for the tracker
+            if idempotent_prefix_accounting:
+                # ret is an absolute already-stored prefix, unlike the incremental
+                # STORE commits that use the same += method. Preparation never
+                # commits it; admission retries may observe it repeatedly.
+                tracker.increase_num_stored_tokens(max(0, ret - tracker.num_stored_tokens))
+            else:
+                # Preserve the frozen Native entry point's accounting semantics.
+                tracker.increase_num_stored_tokens(ret)
 
-        # Save the vllm and lmcache hit tokens. The vLLM hit count is
-        # rounded down to a boundary aligned for every engine group (e.g.
-        # a full-prompt APC hit reports ``num_prompt_tokens - 1``), so the
-        # retrieve-skip range stays paged-chunk-aligned in all groups.
-        tracker.num_vllm_hit_tokens = (
-            num_computed_tokens
-            // self._hit_alignment_tokens
-            * self._hit_alignment_tokens
-        )
-        tracker.num_lmcache_hit_tokens = ret
+            # Save the vllm and lmcache hit tokens. The vLLM hit count is
+            # rounded down to a boundary aligned for every engine group (e.g.
+            # a full-prompt APC hit reports ``num_prompt_tokens - 1``), so the
+            # retrieve-skip range stays paged-chunk-aligned in all groups.
+            tracker.num_vllm_hit_tokens = (
+                num_computed_tokens
+                // self._hit_alignment_tokens
+                * self._hit_alignment_tokens
+            )
+            tracker.num_lmcache_hit_tokens = ret
 
         need_to_load = max(0, ret - num_computed_tokens)
 
