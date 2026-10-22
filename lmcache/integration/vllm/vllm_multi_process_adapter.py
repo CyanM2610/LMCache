@@ -519,7 +519,7 @@ class HeartbeatThread(PeriodicThread):
         def noop() -> bool:
             return True
 
-        self._recover_callback: Callable[[], bool] = noop
+        self._recover_callback: Callable[[], bool] | None = noop
 
     def register_recover_callback(self, callback: Callable[[], bool]) -> None:
         """Register a callback fired on the unhealthy->healthy transition.
@@ -542,6 +542,21 @@ class HeartbeatThread(PeriodicThread):
             callback: Zero-arg callable returning a success bool.
         """
         self._recover_callback = callback
+
+    def release_recover_callback_after_stop(self) -> bool:
+        """Drop callback ownership after the heartbeat thread has terminated.
+
+        Returns:
+            True if a stop was requested and the underlying thread is no longer
+            alive. False preserves the callback during a stop timeout or before
+            stop. Call only after the adapter's permanent teardown succeeds.
+        """
+        if not self.stop_requested or (
+            self._thread is not None and self._thread.is_alive()
+        ):
+            return False
+        self._recover_callback = None
+        return True
 
     def _execute(self) -> ThreadRunSummary:
         """Run one heartbeat cycle: ping, recover callback, event update.
@@ -2891,6 +2906,7 @@ class LMCacheMPWorkerAdapter:
                 self._heartbeat.stop()
 
         logger.info("Unregistering kv caches")
+        unregister_confirmed = False
         try:
             if isinstance(self.transfer_ctx, EngineDrivenTransferContext):
                 future = self.req_client.unregister_kv_cache_engine_driven_context(
@@ -2899,6 +2915,7 @@ class LMCacheMPWorkerAdapter:
             else:
                 future = self.req_client.unregister_kv_cache(self.instance_id)
             future.result(timeout=self._mq_timeout)
+            unregister_confirmed = True
         except TimeoutError:
             if self.require_terminal_completion and (
                 self.store_futures
@@ -2924,6 +2941,13 @@ class LMCacheMPWorkerAdapter:
 
         self.req_client.close()
         self.request_telemetry.close()
+
+        # The recovery bound method otherwise closes a cycle back to this
+        # adapter and its exported KV tensors. Keep it on every failed teardown
+        # and while a timed-out heartbeat is still alive; retain the stopped
+        # heartbeat shell so stop_requested cannot revert during shutdown.
+        if unregister_confirmed and self._heartbeat is not None:
+            self._heartbeat.release_recover_callback_after_stop()
 
     # Helper functions
     def _record_receive_releases(
