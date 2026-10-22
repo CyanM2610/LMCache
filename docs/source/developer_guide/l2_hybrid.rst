@@ -150,3 +150,32 @@ host consumption envelope do not measure output DMA duration or CPU-active time.
 No new stream wait is added. Inputs beyond the model's position limit require a
 separate explicit model/position decision and independent numerical validation;
 the D2 YaRN candidate is preparation only and is not activated by these runners.
+
+Native execution phases and stable replay
+------------------------------------------
+
+Replayer version 2 dispatches eligible requests by planned time and frozen plan
+index, using one timer. Each dispatch awaits native client submission, while
+inference and output delivery continue asynchronously. Children still follow
+actual predecessor completion plus think time. This defines external tie order;
+native batching continues to depend on actual engine arrival and progress.
+
+``run_service.py --trace light --phase-timing`` enables optional native v2 probes
+around the sample output fork, copy stream after its original dependency,
+postprocess tail, original output-fence wait, and CPU output conversion. Host
+spans retain wall, thread CPU and process CPU clocks. Empty ``no_forward`` steps
+record control work separately. The probes add CUDA event records and queries;
+the original copy-event wait and native scheduler retain their semantics.
+
+``analyze_execution_costs.py --off RUN_OFF --on RUN_ON --out NEW_AUDIT.json``
+requires complete phase/error accounting, per-batch output joins, poll-to-adoption
+receipts, and actual MP transfer/allocator/model-begin trees. Raw transfer plans
+record gather/scatter shapes, host-pool addresses, staging segments and operation
+identities. A producer event may be shared by a save call's requests; MP STORE
+submission still occurs separately for each request.
+
+Outer worker, RPC, transfer, model and nested phase intervals overlap. Copy-stream
+elapsed time includes launch gaps and is not DMA-active time. Async client CPU
+clock deltas can include other tasks. Do not add these durations as independent
+service costs. ``NATIVE_EXECUTION_003.md`` links the bounded training evidence and
+remaining transport/queue/contention gaps; it does not declare a calibrated model.

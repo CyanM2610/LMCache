@@ -15,11 +15,13 @@ import time
 # Third Party
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
+from vllm.v1.worker.gpu.phase_observation import set_phase_observer
 from vllm.v1.worker.gpu_worker import Worker
 
 # First Party
 from lmcache import torch_dev
 from lmcache.integration.vllm.l2_hybrid_observer import TraceSink
+from lmcache.integration.vllm.l2_hybrid_phases import PhaseRecorder, cpu_clock
 
 
 def query_copy_fence(event: Any) -> dict[str, Any]:
@@ -123,8 +125,15 @@ class TimedWorker(Worker):
         self.timing_sink = TraceSink(path / f"worker-{os.getpid()}.jsonl")
         self.timing_pending: deque[tuple[Any, Any, dict[str, Any]]] = deque()
         self.timing_occurrences: Counter[tuple[tuple[str, int], ...]] = Counter()
+        self.timing_errors: list[str] = []
         self.timing_step = 0
         self.timing_identity: dict[str, Any] = {}
+        self.phase_recorder = None
+        if os.environ.get("L2_HYBRID_PHASE_TIMING") == "1":
+            self.phase_recorder = PhaseRecorder(
+                self.timing_sink, lambda: self.timing_identity
+            )
+            set_phase_observer(self.phase_recorder.capture)
         self.timing_sink.emit(
             "timing_scope",
             role="instrument-validation/training",
@@ -158,6 +167,7 @@ class TimedWorker(Worker):
             "signature_occurrence": self.timing_occurrences[signature],
             "contexts": contexts,
             "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+            "has_model_work": scheduler_output.total_num_scheduled_tokens > 0,
         }
         return self._observe("execute", super().execute_model, scheduler_output)
 
@@ -187,21 +197,48 @@ class TimedWorker(Worker):
                 self._collect()
                 if self.timing_pending:
                     time.sleep(0.001)
-            self.timing_sink.emit("timing_drain", pending=len(self.timing_pending))
-            if self.timing_pending:
+            self.timing_sink.emit(
+                "timing_drain",
+                pending=len(self.timing_pending),
+                errors=self.timing_errors,
+            )
+            if self.timing_pending or self.timing_errors:
                 raise RuntimeError("worker timing events did not drain")
         finally:
             try:
                 super().shutdown()
             finally:
-                self.timing_sink.close()
+                try:
+                    if self.phase_recorder:
+                        self.phase_recorder.close()
+                finally:
+                    set_phase_observer(None)
+                    self.timing_sink.close()
 
     def _observe(self, phase: str, call: Callable[..., Any], argument: Any) -> Any:
         self._collect()
+        if self.phase_recorder:
+            self.phase_recorder.collect()
+        before_cpu = cpu_clock()
+        if not self.timing_identity.get("has_model_work", True):
+            try:
+                return call(argument)
+            finally:
+                self.timing_sink.emit(
+                    "worker_control_host",
+                    **self.timing_identity,
+                    phase=phase,
+                    begin=before_cpu,
+                    end=cpu_clock(),
+                    gpu_ms=None,
+                    null_reason="no_forward control, not model kernels",
+                )
         stream = torch_dev.current_stream()
         start = torch_dev.Event(enable_timing=True)
         end = torch_dev.Event(enable_timing=True)
         start.record(stream)
+        if phase == "sample" and self.phase_recorder:
+            self.phase_recorder.sample_begin(self.timing_identity, start)
         before = time.monotonic_ns()
         try:
             return call(argument)
@@ -213,6 +250,8 @@ class TimedWorker(Worker):
                 "phase": phase,
                 "stream_id": int(stream.cuda_stream),
                 "host_begin_ns": before,
+                "cpu_begin": before_cpu,
+                "cpu_end": cpu_clock(),
                 "host_return_ns": after,
                 "cuda_event_enqueued_ns": time.monotonic_ns(),
             }
@@ -220,13 +259,19 @@ class TimedWorker(Worker):
             self.timing_pending.append((start, end, row))
 
     def _collect(self) -> None:
-        while self.timing_pending and self.timing_pending[0][1].query():
-            start, end, row = self.timing_pending.popleft()
-            self.timing_sink.emit(
-                "worker_cuda",
-                **row,
-                cuda_elapsed_ms=start.elapsed_time(end),
-                completion_observed_ns=time.monotonic_ns(),
-                cuda_absolute_begin_ns=None,
-                cuda_absolute_end_ns=None,
-            )
+        while self.timing_pending:
+            start, end, row = self.timing_pending[0]
+            try:
+                if not end.query():
+                    break
+                self.timing_sink.emit(
+                    "worker_cuda",
+                    **row,
+                    cuda_elapsed_ms=start.elapsed_time(end),
+                    completion_observed_ns=time.monotonic_ns(),
+                    cuda_absolute_begin_ns=None,
+                    cuda_absolute_end_ns=None,
+                )
+            except Exception as error:
+                self.timing_errors.append(f"interval {row!r}: {error!r}")
+            self.timing_pending.popleft()

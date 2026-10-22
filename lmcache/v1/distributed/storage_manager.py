@@ -62,6 +62,7 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.host_phase import observed_mp_call
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.mp_observability.trace.decorator import (
     enable_tracing,
@@ -181,6 +182,7 @@ class StorageManager:
 
     # External APIs for serving engine integration code to call
     @enable_tracing()
+    @observed_mp_call("allocator_reserve_write")
     def reserve_write(
         self,
         keys: list[ObjectKey],

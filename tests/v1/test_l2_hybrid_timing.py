@@ -163,3 +163,193 @@ def test_copy_observation_errors_preserve_native_result_or_exception(
     assert consumed["copy_fence_ready_at_return"] is None
     assert "diagnostic CUDA query failure" in consumed["copy_fence_entry_query_error"]
     assert "diagnostic CUDA query failure" in consumed["copy_fence_return_query_error"]
+
+
+def test_phase_stream_intervals_keep_producing_identity_without_waits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Copy/main fork observations survive later steps and only query CUDA events."""
+    # First Party
+    from lmcache.integration.vllm import l2_hybrid_phases as phases
+
+    class Event:
+        def __init__(self, **kwargs: Any) -> None:
+            self.stream = None
+
+        def record(self, stream: Any) -> None:
+            self.stream = stream.cuda_stream
+
+        def query(self) -> bool:
+            return True
+
+        def elapsed_time(self, end: Any) -> float:
+            assert self.stream == end.stream
+            return 0.5
+
+    monkeypatch.setattr(phases, "torch_dev", SimpleNamespace(Event=Event))
+    sink = timing.TraceSink(tmp_path / "phases.jsonl")
+    identity = dict(worker_step_id=1)
+    recorder = phases.PhaseRecorder(sink, lambda: identity)
+    main, copy = SimpleNamespace(cuda_stream=1), SimpleNamespace(cuda_stream=2)
+    begin = Event()
+    begin.record(main)
+    recorder.sample_begin(identity, begin)
+    mark = recorder.capture()
+    mark("sample_before_output_fork", stream=main)
+    mark("output_copy_start", stream=copy)
+    mark("output_copy_end", stream=copy)
+    mark("sample_after_output_fork", stream=main)
+    mark("sample_tail_end", stream=main)
+    identity["worker_step_id"] = 2
+    mark("output_wait_begin")
+    recorder.close()
+    sink.close()
+    rows = [json.loads(s) for s in (tmp_path / "phases.jsonl").read_text().splitlines()]
+    intervals = [r for r in rows if r["event"] == "phase_cuda"]
+    assert {r["phase"] for r in intervals} == {
+        "sample_pre_fork",
+        "fork_enqueue_gap",
+        "sample_main_tail",
+        "output_copy",
+    }
+    assert all(r["worker_step_id"] == 1 for r in intervals)
+    assert (
+        next(r for r in rows if r.get("name") == "output_wait_begin")["worker_step_id"]
+        == 1
+    )
+    assert next(r for r in rows if r["event"] == "phase_drain")["unpaired"] == 0
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_phase_callback_failure_cannot_replace_native_result(fails: bool) -> None:
+    """Observer faults are audited while native values and exceptions survive."""
+    # Third Party
+    from vllm.v1.worker.gpu.phase_observation import (
+        observed_host_call,
+        phase_observation_errors,
+        set_phase_observer,
+    )
+
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("observer failed")
+
+    expected = object()
+    error = ValueError("native failed")
+
+    @observed_host_call("native")
+    def native() -> Any:
+        if fails:
+            raise error
+        return expected
+
+    set_phase_observer(lambda: broken)
+    try:
+        if fails:
+            with pytest.raises(ValueError) as caught:
+                native()
+            assert caught.value is error
+        else:
+            assert native() is expected
+        assert len(phase_observation_errors()) == 2
+    finally:
+        # Reset the process-local diagnostic state for other tests.
+        set_phase_observer(lambda: broken)
+        set_phase_observer(None)
+
+
+def test_native_output_keeps_one_copy_wait_and_conversion_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The optional markers bracket the existing wait, leaving IDs unchanged."""
+    # Third Party
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.worker.gpu import async_utils
+    import numpy as np
+
+    calls = []
+
+    class Event:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def record(self, stream: Any) -> None:
+            calls.append("fence_record")
+
+        def synchronize(self) -> None:
+            calls.append("native_wait")
+
+    monkeypatch.setattr(async_utils.torch.cuda, "Event", Event)
+    monkeypatch.setattr(async_utils.torch.cuda, "set_stream", lambda s: None)
+    monkeypatch.setattr(async_utils, "async_copy_to_np", lambda x: x)
+    stream = SimpleNamespace(wait_stream=lambda s: calls.append("native_dependency"))
+    result = ModelRunnerOutput(
+        req_ids=["a"], req_id_to_index={"a": 0}, sampled_token_ids=[]
+    )
+    sampler = SimpleNamespace(
+        sampled_token_ids=np.array([[7, 8]]),
+        logprobs_tensors=None,
+        num_nans=None,
+        sampling_mask_tensors=None,
+    )
+    output = async_utils.AsyncOutput(
+        result,
+        sampler,
+        np.array([1]),
+        stream,
+        stream,
+        phase_observer=lambda name, **kw: calls.append(name),
+    )
+    assert output.get_output() is result
+    assert result.sampled_token_ids == [[7]]
+    assert calls == [
+        "native_dependency",
+        "output_copy_start",
+        "output_copy_end",
+        "fence_record",
+        "output_wait_begin",
+        "native_wait",
+        "output_wait_end",
+        "output_conversion_end",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["query", "elapsed_time"])
+def test_failed_phase_drain_is_audited_without_interrupting_native_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    """Diagnostic collection is non-throwing; terminal validation rejects it."""
+    # First Party
+    from lmcache.integration.vllm import l2_hybrid_phases as phases
+
+    class Event:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def record(self, stream: Any) -> None:
+            pass
+
+        def query(self) -> bool:
+            if failure == "query":
+                raise RuntimeError("query failed")
+            return True
+
+        def elapsed_time(self, end: Any) -> float:
+            raise RuntimeError("elapsed failed")
+
+    monkeypatch.setattr(phases, "torch_dev", SimpleNamespace(Event=Event))
+    sink = timing.TraceSink(tmp_path / "failed-phase.jsonl")
+    recorder = phases.PhaseRecorder(sink, lambda: {"worker_step_id": 1})
+    mark = recorder.capture()
+    stream = SimpleNamespace(cuda_stream=2)
+    mark("output_copy_start", stream=stream)
+    mark("output_copy_end", stream=stream)
+    recorder.collect()  # Native caller may continue; error is retained for audit.
+    assert recorder.errors
+    with pytest.raises(RuntimeError, match="incomplete"):
+        recorder.close()
+    sink.close()
+    rows = [
+        json.loads(s)
+        for s in (tmp_path / "failed-phase.jsonl").read_text().splitlines()
+    ]
+    assert next(r for r in rows if r["event"] == "phase_drain")["errors"]

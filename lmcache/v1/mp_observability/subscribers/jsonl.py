@@ -17,6 +17,7 @@ from lmcache.v1.mp_observability.event_bus import (
     EventCallback,
     EventSubscriber,
 )
+from lmcache.v1.mp_observability.host_phase import host_phase_errors
 
 
 def encode_value(value: Any) -> Any:
@@ -107,6 +108,7 @@ class JsonlSubscriber(EventSubscriber):
                     "bus_dropped_events": self.bus.dropped_events_count(),
                     "subscriber_errors": self.bus.subscriber_exception_counts(),
                     "bus_queue_depth": self.bus.queue_depth(),
+                    "host_phase_errors": host_phase_errors(),
                 }
             )
         finally:

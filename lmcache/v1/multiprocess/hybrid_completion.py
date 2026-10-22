@@ -22,6 +22,7 @@ from lmcache.v1.distributed.memory_manager.hybrid_l1_memory_manager import (
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.host_phase import observed_mp_call
 
 
 @dataclass
@@ -68,6 +69,7 @@ class HybridCompletionLoop:
         )
         self.thread.start()
 
+    @observed_mp_call("model_begin_objects")
     def begin_objects(
         self,
         accesses: list[HybridAccess],

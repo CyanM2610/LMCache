@@ -41,6 +41,7 @@ from lmcache.v1.mp_observability.event_bus import (
     get_event_bus,
     is_observability_enabled,
 )
+from lmcache.v1.mp_observability.host_phase import observed_mp_call, phase_publish
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
@@ -336,6 +337,9 @@ def _run_object_group_transfer_plan(
     max_batch_size = cache_context.max_batch_size
 
     # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
+    observe_plan = os.environ.get("L2_HYBRID_PHASE_TIMING") == "1"
+    plan_groups: list[dict[str, Any]] = []
+    plan_steps: list[dict[str, Any]] = []
     kernel_group_specs: list[Any] = []
     spec_index_by_kg: dict[int, int] = {}
     blocks_per_chunk_by_kg: dict[int, int] = {}
@@ -361,6 +365,28 @@ def _run_object_group_transfer_plan(
             for slot in range(max_batch_size)
         ]
 
+        if observe_plan:
+            shape = cache_context.get_shape_desc(kernel_group_id)
+            plan_groups.append(
+                dict(
+                    kernel_group_id=kernel_group_id,
+                    shape={
+                        name: getattr(shape, name)
+                        for name in (
+                            "kv_size",
+                            "nl",
+                            "nb",
+                            "bs",
+                            "nh",
+                            "hs",
+                            "element_size",
+                        )
+                    },
+                    format=str(cache_context.get_engine_kv_format(kernel_group_id)),
+                    block_ids_ptr=block_ids_tensor.data_ptr(),
+                    block_ids_count=block_ids_tensor.numel(),
+                )
+            )
         spec_index_by_kg[kernel_group_id] = len(kernel_group_specs)
         kernel_group_specs.append(
             device_ops.KernelGroupSpec(
@@ -423,6 +449,31 @@ def _run_object_group_transfer_plan(
             is_h2d,
         )
 
+        plan_copies: list[dict[str, Any]] = []
+        plan_launches: list[dict[str, Any]] = []
+        if observe_plan:
+            for slot, obj in enumerate(memory_object_batch):
+                assert obj is not None
+                offset, remaining = obj.meta.address, obj.get_size()
+                segments = []
+                while remaining:
+                    length = min(
+                        remaining,
+                        LazyMemoryAllocator.PIN_CHUNK_SIZE
+                        - offset % LazyMemoryAllocator.PIN_CHUNK_SIZE,
+                    )
+                    segments.append(dict(host_offset=offset, nbytes=length))
+                    remaining -= length
+                    offset += length
+                plan_copies.append(
+                    dict(
+                        host_ptr=obj.data_ptr,
+                        gpu_ptr=object_group_buffers[slot].data_ptr(),
+                        host_offset=obj.meta.address,
+                        nbytes=obj.get_size(),
+                        segments=segments,
+                    )
+                )
         launches: list[Any] = []
         for kernel_group_id in kernel_group_ids:
             blocks_per_chunk = blocks_per_chunk_by_kg[kernel_group_id]
@@ -440,6 +491,16 @@ def _run_object_group_transfer_plan(
                 orig_skip_blocks,
             )
 
+            if observe_plan:
+                plan_launches.append(
+                    dict(
+                        group_idx=spec_index_by_kg[kernel_group_id],
+                        block_ids_offset=start_block_pos,
+                        total_blocks=end_block_pos - start_block_pos,
+                        num_objects=batch_len,
+                        skip_prefix_n_blocks=recalculated_skip_blocks,
+                    )
+                )
             launches.append(
                 device_ops.LaunchVar(
                     spec_index_by_kg[kernel_group_id],
@@ -451,6 +512,8 @@ def _run_object_group_transfer_plan(
             )
 
         batch_steps.append(device_ops.BatchStep(staging, launches))
+        if observe_plan:
+            plan_steps.append(dict(staging_copies=plan_copies, launches=plan_launches))
 
     if not batch_steps:
         return
@@ -460,7 +523,8 @@ def _run_object_group_transfer_plan(
     # them, so fall back to the untimed legacy signature.
     timing_kwargs = (
         {
-            "phase_timing_enabled": is_observability_enabled()
+            "phase_timing_enabled": os.environ.get("L2_HYBRID_PHASE_TIMING", "1") != "0"
+            and is_observability_enabled()
             and get_event_bus().has_subscribers(EventType.MP_TRANSFER_PHASE_SAMPLES),
             # Echoed back verbatim on each sample; the transfer's identity.
             "session_id": transfer_key,
@@ -468,6 +532,20 @@ def _run_object_group_transfer_plan(
         if _HAS_TRANSFER_PHASE_TIMING
         else {}
     )
+    if observe_plan:
+        phase_publish(
+            Event(
+                event_type=EventType.MP_TRANSFER_PLAN,
+                session_id=transfer_key.rsplit("#", 1)[0],
+                metadata=dict(
+                    transfer_key=transfer_key,
+                    direction="load" if is_h2d else "store",
+                    kernel_groups=plan_groups,
+                    batch_steps=plan_steps,
+                    block_ids_source="hybrid.access with same transfer_key",
+                ),
+            )
+        )
     device_ops.execute_object_group_transfer(
         direction,
         cache_context.device,
@@ -1088,6 +1166,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     @_lmcache_nvtx_annotate
+    @observed_mp_call("mp_store_handler")
     def store(
         self,
         key: IPCCacheServerKey,
@@ -1421,6 +1500,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
 
     @_lmcache_nvtx_annotate
+    @observed_mp_call("mp_load_handler")
     def retrieve(
         self,
         key: IPCCacheServerKey,

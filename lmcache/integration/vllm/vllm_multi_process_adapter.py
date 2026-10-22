@@ -21,6 +21,7 @@ from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.hybrid_session_cleanup import ConfirmedSessionCleanup
+from lmcache.integration.vllm.phase_hooks import observed_worker_call
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
@@ -1661,6 +1662,7 @@ class LMCacheMPWorkerAdapter:
 
         return True
 
+    @observed_worker_call("worker_producer_event")
     def create_recorded_event(self) -> _IpcEvent | None:
         """Create the ordering event required by the active transfer context.
 
@@ -1683,6 +1685,7 @@ class LMCacheMPWorkerAdapter:
         return transfer_ctx.create_recorded_event()
 
     @_lmcache_nvtx_annotate
+    @observed_worker_call("worker_store_submit")
     def submit_store_request(
         self,
         request_id: str,
@@ -1739,6 +1742,7 @@ class LMCacheMPWorkerAdapter:
             self.store_events[request_id] = event
 
     @_lmcache_nvtx_annotate
+    @observed_worker_call("worker_load_submit")
     def submit_retrieve_request(
         self,
         request_id: str,
@@ -1921,6 +1925,7 @@ class LMCacheMPWorkerAdapter:
         return ret_stores
 
     @_lmcache_nvtx_annotate
+    @observed_worker_call("worker_get_finished")
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:

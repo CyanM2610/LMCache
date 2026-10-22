@@ -99,6 +99,8 @@ class EventType(Enum):
     MP_TOKENS = "mp.tokens"
 
     # MP Server lifecycle sentinels (CPU-synchronous)
+    MP_TRANSFER_PLAN = "mp.transfer.plan"
+    MP_HOST_PHASE = "mp.host.phase"
     MP_REQUEST_START = "mp.request.start"
     MP_RETRIEVE_SUBMITTED = "mp.retrieve.submitted"
     MP_STORE_SUBMITTED = "mp.store.submitted"

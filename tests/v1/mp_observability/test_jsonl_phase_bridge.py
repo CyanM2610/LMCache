@@ -54,3 +54,41 @@ def test_jsonl_only_exports_phase_samples(
     assert phases[0]["metadata"]["ended_transfer_key"] == "transfer-7"
     assert rows[-1]["bus_dropped_events"] == rows[-1]["bus_queue_depth"] == 0
     assert not rows[-1]["subscriber_errors"]
+
+
+def test_host_phase_nesting_and_publish_failure_preserve_native_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inclusive host spans retain parents and audit diagnostic publication errors."""
+    # First Party
+    from lmcache.v1.mp_observability import host_phase
+
+    events: list[Event] = []
+    monkeypatch.setenv("L2_HYBRID_PHASE_TIMING", "1")
+    monkeypatch.setattr(
+        host_phase, "get_event_bus", lambda: SimpleNamespace(publish=events.append)
+    )
+
+    @host_phase.observed_mp_call("inner")
+    def inner() -> int:
+        return 42
+
+    @host_phase.observed_mp_call("outer")
+    def outer() -> int:
+        return inner()
+
+    assert outer() == 42
+    child, parent = [event.metadata for event in events]
+    assert child["parent_span_id"] == parent["span_id"]
+    assert child["begin_wall_ns"] >= parent["begin_wall_ns"]
+    assert child["end_wall_ns"] <= parent["end_wall_ns"]
+
+    def broken(event: Event) -> None:
+        raise RuntimeError("publication failed")
+
+    monkeypatch.setattr(
+        host_phase, "get_event_bus", lambda: SimpleNamespace(publish=broken)
+    )
+    before = len(host_phase.host_phase_errors())
+    assert inner() == 42
+    assert len(host_phase.host_phase_errors()) == before + 1

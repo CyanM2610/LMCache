@@ -115,21 +115,31 @@ class ObservedAsyncScheduler(AsyncScheduler):
 
     def add_request(self, request: Request) -> None:
         """Record actual core enqueue around the inherited enqueue operation."""
+        begin_thread_ns = time.thread_time_ns()
+        begin_process_ns = time.process_time_ns()
         before = time.monotonic_ns()
         super().add_request(request)
         self.observation.emit(
             "core_enqueue",
             request_id=request.request_id,
             begin_ns=before,
+            begin_thread_cpu_ns=begin_thread_ns,
+            begin_process_cpu_ns=begin_process_ns,
+            end_thread_cpu_ns=time.thread_time_ns(),
+            end_process_cpu_ns=time.process_time_ns(),
             end_ns=time.monotonic_ns(),
             prompt_tokens=request.num_prompt_tokens,
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Export computed context and physical blocks selected by native logic."""
+        begin_thread_ns = time.thread_time_ns()
+        begin_process_ns = time.process_time_ns()
         before = time.monotonic_ns()
         output = super().schedule(throttle_prefills)
         after = time.monotonic_ns()
+        end_thread_ns = time.thread_time_ns()
+        end_process_ns = time.process_time_ns()
         self.observation_step += 1
         self.observation_batches[id(output)] = self.observation_step
         contexts = {
@@ -163,12 +173,28 @@ class ObservedAsyncScheduler(AsyncScheduler):
                 "schedule",
                 batch_id=self.observation_step,
                 begin_ns=before,
+                begin_thread_cpu_ns=begin_thread_ns,
+                begin_process_cpu_ns=begin_process_ns,
+                end_thread_cpu_ns=end_thread_ns,
+                end_process_cpu_ns=end_process_ns,
                 end_ns=after,
                 requests=requests,
                 preempted_request_ids=sorted(output.preempted_req_ids or ()),
                 gpu_begin_ns=None,
                 gpu_end_ns=None,
                 gpu_null_reason="native scheduling precedes device execution",
+            )
+        if not output.num_scheduled_tokens:
+            self.observation.emit(
+                "control_schedule",
+                batch_id=self.observation_step,
+                signature=[],
+                begin_process_cpu_ns=begin_process_ns,
+                end_process_cpu_ns=end_process_ns,
+                begin_ns=before,
+                end_ns=after,
+                begin_thread_cpu_ns=begin_thread_ns,
+                end_thread_cpu_ns=end_thread_ns,
             )
         self._observe_state()
         return output
@@ -177,18 +203,26 @@ class ObservedAsyncScheduler(AsyncScheduler):
         self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
     ) -> dict[int, EngineCoreOutputs]:
         """Bracket native receive adoption and export its actual worker IDs."""
+        begin_thread_ns = time.thread_time_ns()
+        begin_process_ns = time.process_time_ns()
         before = time.monotonic_ns()
         transfer = model_runner_output.kv_connector_output
         receiving = sorted(transfer.finished_recving or ()) if transfer else []
         sending = sorted(transfer.finished_sending or ()) if transfer else []
         output = super().update_from_output(scheduler_output, model_runner_output)
         after = time.monotonic_ns()
+        end_thread_ns = time.thread_time_ns()
+        end_process_ns = time.process_time_ns()
         batch_id = self.observation_batches.pop(id(scheduler_output), None)
         if receiving or sending or scheduler_output.total_num_scheduled_tokens:
             self.observation.emit(
                 "scheduler_output_processed",
                 batch_id=batch_id,
                 begin_ns=before,
+                begin_thread_cpu_ns=begin_thread_ns,
+                begin_process_cpu_ns=begin_process_ns,
+                end_thread_cpu_ns=end_thread_ns,
+                end_process_cpu_ns=end_process_ns,
                 end_ns=after,
                 finished_receiving=receiving,
                 finished_sending=sending,
