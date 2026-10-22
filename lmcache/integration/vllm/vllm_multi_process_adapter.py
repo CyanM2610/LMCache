@@ -36,6 +36,9 @@ from lmcache.integration.vllm.phase_hooks import (
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
+from lmcache.v1.gpu_connector.kv_format.contiguity import (
+    attempt_permute_to_contiguous_view,
+)
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
@@ -1581,6 +1584,9 @@ class LMCacheMPWorkerAdapter:
         ):
             details["reason"] = "unsupported_execution_path"
             return full, details
+        if (self._layout_hints or {}).get("kv_layout") != "NHD":
+            details["reason"] = "unsupported_layout_hint"
+            return full, details
         skip = op.skip_first_n_tokens
         length = op.end - op.start
         if op.start < 0 or length < 0 or not 0 <= skip <= length:
@@ -1613,17 +1619,37 @@ class LMCacheMPWorkerAdapter:
             if not indices or any(index < 0 or index >= len(tensors) for index in indices):
                 group["reason"] = "unknown_layer_geometry"
                 continue
-            # The frozen Qwen path registers per-layer [NB, BS, NH, CS].
-            # Requiring physical BS == logical tokens_per_block excludes
-            # compressed/recurrent layouts and avoids guessing from model names.
+            # vLLM supplies logical [B, H, N, C] views; the existing CUDA IPC
+            # normalizer recovers physical [B, N, H, C] by metadata only.
+            # Do not replace the original transport tensors with these views.
+            group["layout_views"] = []
             try:
-                supported_layout = all(
-                    tensors[index].dtype == torch.bfloat16
-                    and tensors[index].ndim == 4
-                    and tensors[index].shape[1] == block_tokens
-                    and tensors[index].is_contiguous() for index in indices
-                )
-            except (AttributeError, IndexError, TypeError):
+                supported_layout = True
+                for index in sorted(indices):
+                    raw = tensors[index]
+                    if raw.dtype != torch.bfloat16 or raw.ndim != 4:
+                        supported_layout = False
+                        break
+                    normalized = attempt_permute_to_contiguous_view(raw)
+                    group["layout_views"].append({
+                        "layer_index": index,
+                        "raw_shape": list(raw.shape), "raw_stride": list(raw.stride()),
+                        "canonical_shape": list(normalized.shape),
+                        "canonical_stride": list(normalized.stride()),
+                    })
+                    if not (
+                        normalized.dtype == torch.bfloat16
+                        and normalized.ndim == 4
+                        and normalized.shape[1] == block_tokens
+                        and normalized.is_contiguous()
+                        and raw.shape[0] == normalized.shape[0]
+                        and raw.stride(0) == normalized.stride(0)
+                        and raw.data_ptr() == normalized.data_ptr()
+                        and raw.storage_offset() == normalized.storage_offset()
+                    ):
+                        supported_layout = False
+                        break
+            except (AttributeError, IndexError, TypeError, ValueError, AssertionError):
                 supported_layout = False
             if not supported_layout:
                 group["reason"] = "unsupported_physical_layout"
