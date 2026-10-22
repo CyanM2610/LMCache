@@ -2946,8 +2946,24 @@ class LMCacheMPWorkerAdapter:
         # adapter and its exported KV tensors. Keep it on every failed teardown
         # and while a timed-out heartbeat is still alive; retain the stopped
         # heartbeat shell so stop_requested cannot revert during shutdown.
+        heartbeat_stopped = self._heartbeat is None
         if unregister_confirmed and self._heartbeat is not None:
-            self._heartbeat.release_recover_callback_after_stop()
+            heartbeat_stopped = self._heartbeat.release_recover_callback_after_stop()
+        if (
+            unregister_confirmed
+            and heartbeat_stopped
+            and self.require_terminal_completion
+            and not self.store_futures
+            and not self.retrieve_futures
+            and not self.retained_stores
+            and not self.promotion_completions.pending
+            and self._uncertain_promotion is None
+            and self.page_ownership.pending_count == 0
+        ):
+            # The native model runner can retain this closed connector after
+            # clearing its own KV owners. Drop only our borrowed reference:
+            # do not clear the dictionary that belongs to the model runner.
+            self.kv_caches = {}
 
     # Helper functions
     def _record_receive_releases(
