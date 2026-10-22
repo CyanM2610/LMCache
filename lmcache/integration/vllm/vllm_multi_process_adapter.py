@@ -1702,7 +1702,14 @@ class LMCacheMPWorkerAdapter:
             )
         if not self.is_healthy:
             return None
-        return transfer_ctx.create_recorded_event()
+        producer_before_ns = time.monotonic_ns()
+        event = transfer_ctx.create_recorded_event()
+        wait_emit("producer_event_recorded",
+                  producer_event_identity=str(id(event)) if event is not None else None,
+                  producer_record_before_ns=producer_before_ns,
+                  transfer_context=type(transfer_ctx).__name__,
+                  semantics="native record call returned; not GPU event completion")
+        return event
 
     @_lmcache_nvtx_annotate
     @observed_worker_call("worker_store_submit")
@@ -1762,7 +1769,8 @@ class LMCacheMPWorkerAdapter:
         self.store_futures[request_id] = future
         if self.require_terminal_completion:
             self.page_ownership.record(
-                future, dict(enumerate(op.block_ids)), writes=False
+                future, dict(enumerate(op.block_ids)), writes=False,
+                request_id=request_id, operation="STORE"
             )
         if event is not None:
             self.store_events[request_id] = event
@@ -1824,7 +1832,8 @@ class LMCacheMPWorkerAdapter:
             self.blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
-        self.page_ownership.record(future, targets, writes=True)
+        self.page_ownership.record(future, targets, writes=True,
+                                   request_id=command.control_id, operation="PROMOTION")
         self.promotion_completions.record(command.control_id, future, (event, op))
         self._uncertain_promotion = None
 
@@ -1889,6 +1898,8 @@ class LMCacheMPWorkerAdapter:
         wait_emit(
             "restore_trigger",
             request_id,
+            producer_event_identity=str(id(event)) if event is not None else None,
+            producer_dependency="native_stream_event" if event is not None else "none",
             start_token=op.start,
             end_token=op.end,
             skip_tokens=op.skip_first_n_tokens,
@@ -1910,7 +1921,8 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         if self.require_terminal_completion:
             self.page_ownership.record(
-                future, dict(enumerate(op.block_ids)), writes=True
+                future, dict(enumerate(op.block_ids)), writes=True,
+                request_id=request_id, operation="LOAD"
             )
         if event is not None:
             self.retrieve_events[request_id] = event

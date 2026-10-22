@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import time
 
 from vllm.v1.kv_wait_trace import span as wait_span
+from vllm.v1.kv_wait_trace import emit as wait_emit
 
 Page = tuple[int, int]
 
@@ -38,6 +39,9 @@ class PendingAccess:
     future: TerminalFuture
     pages: frozenset[Page]
     writes: bool
+    observation_id: int = 0
+    request_id: str = ""
+    operation: str = "unknown"
 
 
 class PendingKVPageAccess:
@@ -52,6 +56,17 @@ class PendingKVPageAccess:
 
     def __init__(self) -> None:
         self._pending: list[PendingAccess] = []
+        self._observation_owner = str(id(self))
+        self._observation_sequence = 0
+        wait_emit("ownership_initial_snapshot", owner_id=self._observation_owner,
+                  pending_count=0, pending=[])
+
+    def _observe(self, name: str, access: PendingAccess, **fields) -> None:
+        wait_emit(name, access.request_id, owner_id=self._observation_owner,
+                  op_id=access.observation_id, operation=access.operation,
+                  future_identity=str(id(access.future)), writes=access.writes,
+                  pages=sorted(access.pages), pending_count=len(self._pending),
+                  **fields)
 
     @property
     def pending_count(self) -> int:
@@ -64,9 +79,17 @@ class PendingKVPageAccess:
         block_ids: Mapping[int, Sequence[int]],
         *,
         writes: bool,
+        request_id: str = "",
+        operation: str | None = None,
     ) -> None:
         """Retain a submitted transfer and immutable engine-group/page identities."""
-        self._pending.append(PendingAccess(future, pages(block_ids), writes))
+        self._observation_sequence += 1
+        access = PendingAccess(future, pages(block_ids), writes,
+                               self._observation_sequence, request_id,
+                               operation or ("LOAD" if writes else "STORE"))
+        record_before_ns = time.monotonic_ns()
+        self._pending.append(access)
+        self._observe("ownership_record", access, record_before_ns=record_before_ns)
 
     def reap(self) -> None:
         """Discard observed terminal hazards; preserve ambiguous failures.
@@ -78,6 +101,7 @@ class PendingKVPageAccess:
             if access.future.query():
                 access.future.result(timeout=0)
                 self._pending.remove(access)
+                self._observe("ownership_release_observed", access, via="reap")
 
     def wait(
         self,
@@ -102,6 +126,7 @@ class PendingKVPageAccess:
             conflict = access.pages & (reads | writes if access.writes else writes)
             if not conflict:
                 continue
+            self._observe("ownership_wait_begin", access, conflict_pages=sorted(conflict))
             with wait_span(
                 "physical_page_dependency",
                 dependency="LOAD" if access.writes else "STORE",
@@ -109,3 +134,5 @@ class PendingKVPageAccess:
             ):
                 access.future.result(timeout=max(0.0, deadline - time.monotonic()))
             self._pending.remove(access)
+            self._observe("ownership_wait_end", access, conflict_pages=sorted(conflict))
+            self._observe("ownership_release_observed", access, via="wait")
