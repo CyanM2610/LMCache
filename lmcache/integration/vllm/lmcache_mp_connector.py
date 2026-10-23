@@ -1256,6 +1256,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """Share a nonblocking observation epoch without submitting or polling."""
         self.scheduler_adapter.begin_lookup_observation_step(step_id)
 
+    def lookup_observation_counters(self) -> dict[str, int]:
+        return self.scheduler_adapter.lookup_observation_counters()
+
     def prepare_lookup_operation(self, request: "Request", *, planned=False) -> dict[str, Any]:
         """Submit one native LOOKUP only when separate preparation is enabled.
 

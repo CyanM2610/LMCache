@@ -1002,6 +1002,14 @@ class LMCacheMPSchedulerAdapter:
             ),
         }
 
+    def lookup_observation_counters(self) -> dict[str, int]:
+        """Read observation counts; never query a future or mutate ownership."""
+        return {
+            "ack_observed": getattr(self, "_lookup_ack_observations", 0),
+            "status_submitted": self._lookup_status_submissions,
+            "status_observed": getattr(self, "_lookup_status_observations", 0),
+        }
+
     def lookup_operation_snapshot(self, complete=False) -> tuple[dict[str, Any], ...]:
         """Return a bounded observation of native query records, without polling.
 
@@ -1257,6 +1265,7 @@ class LMCacheMPSchedulerAdapter:
                 # Acknowledgement still in flight; poll again next step.
                 return None
             wait_emit("lookup_ack_observed", request_id)
+            self._lookup_ack_observations = getattr(self, "_lookup_ack_observations", 0) + 1
             del self._unacked_lookups[request_id]
 
         # Persistent accumulator for this request. A server present in
@@ -1273,8 +1282,7 @@ class LMCacheMPSchedulerAdapter:
                     self.req_clients[url].query_prefetch_status(request_id),
                     time.monotonic(),
                 )
-                if self._lookup_progress_enabled:
-                    self._lookup_status_submissions += 1
+                self._lookup_status_submissions += 1
 
         for url, (fut, submitted_at) in list(futures.items()):
             if self._nonblocking_lookup_status and not fut.query():
@@ -1298,6 +1306,7 @@ class LMCacheMPSchedulerAdapter:
                 self._lookup_progress_queue.pop(request_id, None)
                 self._lookup_feedback_failure(request_id, "status_timeout")
                 return 0
+            self._lookup_status_observations = getattr(self, "_lookup_status_observations", 0) + 1
             if r is None:
                 continue
             per_server[url] = int(r)
