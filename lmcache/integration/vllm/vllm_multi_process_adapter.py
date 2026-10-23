@@ -1156,8 +1156,31 @@ class LMCacheMPSchedulerAdapter:
                      reason=reason, native_phase="native_lookup_failure",
                      resource_obligation="native_session_cleanup_pending")
 
+    def begin_lookup_observation_step(self, step_id: int) -> None:
+        """Opt in to one nonblocking query observation per request per step.
+
+        Preparation, foreground visits and bounded control reuse the same
+        observation, including pending None. This is an observation cache,
+        not source ownership; disabled callers retain their original behavior.
+        """
+        if not self._nonblocking_lookup_status:
+            raise ValueError("first-match preparation requires nonblocking STATUS")
+        if getattr(self, "_lookup_observation_step", None) != step_id:
+            self._lookup_observation_step = step_id
+            self._lookup_step_results = {}
+
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
+        """Observe the native ACK/STATUS state machine, at most once when gated."""
+        cache = getattr(self, "_lookup_step_results", None)
+        if cache is not None and request_id in cache:
+            return cache[request_id]
+        result = self._check_lookup_result(request_id)
+        if cache is not None:
+            cache[request_id] = result
+        return result
+
+    def _check_lookup_result(self, request_id: str) -> int | None:
         """
         Check the result of a previously submitted lookup request.
 
@@ -1325,6 +1348,9 @@ class LMCacheMPSchedulerAdapter:
         """
         observer = getattr(self, "_operation_feedback_observer", None)
         view = self.lookup_operation_state(request_id) if observer is not None else None
+        cache = getattr(self, "_lookup_step_results", None)
+        if cache is not None:
+            cache.pop(request_id, None)
         self._lookup_progress_queue.pop(request_id, None)
         self._pending_lookups.discard(request_id)
         self._unacked_lookups.pop(request_id, None)

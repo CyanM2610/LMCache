@@ -1252,6 +1252,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             state["native_fallback_reason"] = "native_tracker_bypass"
         return state
 
+    def begin_first_match_step(self, step_id: int) -> None:
+        """Share a nonblocking observation epoch without submitting or polling."""
+        self.scheduler_adapter.begin_lookup_observation_step(step_id)
+
     def prepare_lookup_operation(self, request: "Request", *, planned=False) -> dict[str, Any]:
         """Submit one native LOOKUP only when separate preparation is enabled.
 
@@ -1404,6 +1408,33 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             commit_match=False, idempotent_prefix_accounting=True,
         )
 
+    def match_prefix_tokens(
+        self, request: "Request", num_computed_tokens: int, *,
+        allow_lookup_submit: bool, allow_lookup_progress: bool,
+        commit_match: bool,
+    ) -> tuple[int | None, bool]:
+        """Reconcile a local hit with explicitly authorized query side effects.
+
+        Preparation passes commit_match=False. Cached-only callers neither
+        submit nor poll; a missing result stays unknown unless the native
+        failure/bypass path already permits local recomputation. This does not
+        adopt HBM blocks, reserve a target, or release source ownership.
+        """
+        if allow_lookup_submit and not allow_lookup_progress:
+            raise ValueError("LOOKUP submission requires query progression")
+        if not commit_match and request.status == RequestStatus.PREEMPTED:
+            return 0, False
+        if not allow_lookup_progress:
+            state = self.lookup_operation_state(request.request_id)
+            if not state["result_known"] and not state.get("native_fallback_reason"):
+                return None, True
+        return self._get_num_new_matched_tokens(
+            request, num_computed_tokens,
+            allow_lookup_submit=allow_lookup_submit,
+            allow_lookup_progress=allow_lookup_progress,
+            commit_match=commit_match, idempotent_prefix_accounting=True,
+        )
+
     def get_num_new_matched_tokens_from_existing_lookup(
         self,
         request: "Request",
@@ -1429,6 +1460,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         allow_lookup_submit: bool,
         commit_match: bool,
         idempotent_prefix_accounting: bool,
+        allow_lookup_progress: bool = True,
     ) -> tuple[int | None, bool]:
         """
         Get number of new tokens that can be loaded from the
@@ -1509,7 +1541,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_configs=tracker.request_configs,
             )
 
-        ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+        if allow_lookup_progress:
+            ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+        else:
+            state = self.lookup_operation_state(request.request_id)
+            ret = (state["result_tokens"] if state["result_known"] else
+                   0 if state.get("native_fallback_reason") else None)
         if ret is None:
             return None, True
 
