@@ -30,6 +30,7 @@ except ImportError:
 # Third Party
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_wait_trace import emit as wait_emit
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 import torch
@@ -1250,6 +1251,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         tracker = self.request_trackers.get(request_id)
         if tracker is not None and tracker.state == LMCacheMPRequestState.BYPASS_LMCACHE:
             state["native_fallback_reason"] = "native_tracker_bypass"
+        elif tracker is not None and tracker.recompute_lower_prefix_tokens is not None:
+            # Query records are consumed at initial adoption. Native re-entry
+            # of the committed local path still needs no new query; this says
+            # nothing about physical readiness or successful HBM allocation.
+            state["native_fallback_reason"] = "committed_recompute_path"
         return state
 
     def begin_first_match_step(self, step_id: int) -> None:
@@ -1495,6 +1501,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         tracker = self._get_or_create_request_tracker(request)
         # TODO: support loading KV for preempted requests in the future
         if request.status == RequestStatus.PREEMPTED:
+            if commit_match and tracker.recompute_lower_prefix_tokens is not None:
+                # Native re-admission refreshes the actual local prefix. The
+                # original lower saved scalar survives; no new query is needed.
+                tracker.local_compute_start_tokens = num_computed_tokens
+                tracker.num_vllm_hit_tokens = (
+                    num_computed_tokens // self._hit_alignment_tokens
+                    * self._hit_alignment_tokens
+                )
+            return 0, False
+
+        if (
+            tracker.recompute_lower_prefix_tokens is not None
+            and tracker.state == LMCacheMPRequestState.READY
+        ):
+            # A committed local path is not a failed remote load, even when its
+            # first compute allocation has not yet advanced vLLM's counters.
+            # Never recreate a query after its original result was consumed.
             return 0, False
 
         # A failed asynchronous load is bypassed until vLLM admits the request
@@ -1622,6 +1645,92 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request_configs=tracker.request_configs,
         )
 
+    def validate_recompute_path(
+        self, request: "Request", local_compute_start_tokens: int
+    ) -> None:
+        """Check the explicit local path without query or ownership side effects.
+
+        Args:
+            request: Owner about to take its first HBM allocation, or a native
+                preemption re-admission of that already committed local path.
+                The runtime must have refreshed and committed its prefix match.
+            local_compute_start_tokens: Current HBM prefix, including native
+                last-token handling. This is a scalar, not a resource credential.
+        Raises:
+            ValueError: The request has already adopted resources, its complete
+                query result is unavailable, or the refreshed match disagrees.
+        Notes:
+            Call this before actual native allocation in the same synchronous
+            processing branch. It reads only current request/tracker/query
+            scalars; it never polls, allocates, releases or advances a watermark.
+        """
+        tracker = self.request_trackers.get(request.request_id)
+        if tracker is None:
+            raise ValueError("recompute path requires a live native request tracker")
+        readmission = (
+            request.status == RequestStatus.PREEMPTED
+            and tracker.recompute_lower_prefix_tokens is not None
+        )
+        if (
+            request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            or (request.status == RequestStatus.PREEMPTED and not readmission)
+            or request.num_computed_tokens != 0
+            or tracker.state != LMCacheMPRequestState.PREFETCHING
+            or tracker.num_scheduled_tokens != 0
+            or any(tracker.allocated_block_ids.values())
+            or (tracker.local_compute_start_tokens is not None and not readmission)
+        ):
+            raise ValueError("recompute path requires first resource adoption")
+        if (
+            type(local_compute_start_tokens) is not int
+            or not 0 <= local_compute_start_tokens < len(request.prompt_token_ids)
+        ):
+            raise ValueError("invalid local recompute prefix")
+        if not readmission:
+            state = self.lookup_operation_state(request.request_id)
+            if not state["result_known"]:
+                raise ValueError("recompute path requires a complete valid lookup")
+            if tracker.num_lmcache_hit_tokens != state["result_tokens"]:
+                raise ValueError("recompute path requires the current committed match")
+        if (
+            tracker.num_vllm_hit_tokens
+            != local_compute_start_tokens
+            // self._hit_alignment_tokens
+            * self._hit_alignment_tokens
+        ):
+            raise ValueError("recompute path requires the current committed match")
+
+    def commit_recompute_path(
+        self, request: "Request", local_compute_start_tokens: int
+    ) -> None:
+        """Record the checked local path after successful native allocation.
+
+        Args:
+            request: The same request validated immediately before allocation.
+            local_compute_start_tokens: The same current HBM prefix used by the
+                successful allocation, including native last-token handling.
+        Raises:
+            ValueError: The synchronous validator contract has been violated.
+        Notes:
+            This grants no compute quota and performs no async observation.
+            Follow with update_state_after_alloc(..., num_external_tokens=0);
+            that native branch releases unused source locks and keeps saved
+            lower coverage. Validation alone does not commit this path.
+        """
+        self.validate_recompute_path(request, local_compute_start_tokens)
+        tracker = self._get_request_tracker(request.request_id)
+        readmission = request.status == RequestStatus.PREEMPTED
+        tracker.local_compute_start_tokens = local_compute_start_tokens
+        if not readmission:
+            tracker.recompute_lower_prefix_tokens = tracker.num_lmcache_hit_tokens
+        wait_emit(
+            "recompute_path_committed", request.request_id,
+            local_compute_start_tokens=local_compute_start_tokens,
+            lower_hit_tokens=tracker.num_lmcache_hit_tokens,
+            saved_prefix_tokens=tracker.num_stored_tokens,
+            native_readmission=readmission,
+        )
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -1649,6 +1758,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # We must only append the NEW blocks beyond what's already tracked
         # to avoid duplication, which would corrupt the store path's block indexing.
         tracker = self._get_request_tracker(request.request_id)
+        if tracker.local_compute_start_tokens is not None and num_external_tokens:
+            raise ValueError("committed recompute path cannot allocate external tokens")
         block_ids = blocks.get_block_ids() or ()
 
         # Only append blocks beyond what's already tracked, per engine group.
@@ -1682,7 +1793,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
             # Free locks on chunks that vLLM already computed and won't
             # retrieve from LMCache.
-            if tracker.num_lmcache_hit_tokens > 0:
+            if tracker.num_lmcache_hit_tokens > 0 and not (
+                tracker.recompute_lower_prefix_tokens is not None
+                and request.status == RequestStatus.PREEMPTED
+            ):
                 if not condition:
                     # No retrieve needed — free ALL locked chunks
                     free_end = tracker.num_lmcache_hit_tokens
@@ -1704,6 +1818,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                         cache_salt=tracker.cache_salt,
                         request_configs=tracker.request_configs,
                     )
+                    if tracker.local_compute_start_tokens is not None:
+                        wait_emit(
+                            "recompute_source_release_requested", request.request_id,
+                            start_token=0, end_token=free_end,
+                            release_confirmed=False,
+                            cleanup_owner="native_session_cleanup",
+                        )
                     logger.debug(
                         "Free locks of tokens %d-%d since it is cached by vLLM.",
                         0,
@@ -2247,6 +2368,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request"
     ) -> LMCacheMPRequestTracker:
         request_id = request.request_id
+        recompute_lower_prefix = None
         # Remove the old trackers that is created before the preemption
         if (
             request.status == RequestStatus.PREEMPTED
@@ -2260,10 +2382,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # will only do the remove if the tracker is not in the "fresh"
             # state, i.e., PREFETCHING
             if tracker.state != LMCacheMPRequestState.PREFETCHING:
+                recompute_lower_prefix = tracker.recompute_lower_prefix_tokens
                 self.request_trackers.pop(request_id)
 
         if request_id not in self.request_trackers:
             new_tracker = LMCacheMPRequestTracker(request)
+            if recompute_lower_prefix is not None:
+                # Preserve only the original known L1 copy. Later STORE
+                # commitments are not a physical-completion receipt, so do
+                # not carry their watermark through native preemption.
+                new_tracker.recompute_lower_prefix_tokens = recompute_lower_prefix
+                new_tracker.num_lmcache_hit_tokens = recompute_lower_prefix
+                new_tracker.num_stored_tokens = recompute_lower_prefix
+                new_tracker.local_compute_start_tokens = 0
             self.request_trackers[request_id] = new_tracker
         return self.request_trackers[request_id]
 

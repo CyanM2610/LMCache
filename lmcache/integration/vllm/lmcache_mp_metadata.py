@@ -71,6 +71,16 @@ class LMCacheMPRequestTracker:
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
 
+    # Explicit local recomputation keeps the L1 hit as saved logical coverage,
+    # but that hit is not a physical HBM prefix. Only this actual local start
+    # plus subsequently scheduled compute may form new STORE metadata.
+    # None preserves native restored-prefix accounting.
+    local_compute_start_tokens: int | None = None
+    # Original observed L1 coverage, distinct from later STORE commitments.
+    # Native preemption can rebuild a tracker without forgetting this saved
+    # prefix; this scalar is neither a retained source lease nor an HBM pointer.
+    recompute_lower_prefix_tokens: int | None = None
+
     # Main state
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
 
@@ -88,6 +98,8 @@ class LMCacheMPRequestTracker:
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
+        self.local_compute_start_tokens = None
+        self.recompute_lower_prefix_tokens = None
         self.state = LMCacheMPRequestState.PREFETCHING
         self.mm_adjusted_prompt_ids = []
         mm_hashes, mm_positions = extract_mm_features(request)
@@ -249,9 +261,15 @@ class LMCacheMPRequestMetadata:
         #   low and silently skip the APC-hit tokens that fall between the
         #   two values, causing under-storing.  Taking the max ensures we
         #   always use the tighter (larger) of the two hit counts.
-        computed_tokens = tracker.num_scheduled_tokens + max(
-            tracker.num_vllm_hit_tokens, tracker.num_lmcache_hit_tokens
+        # Explicit RECOMPUTE is different: the lower hit remains only an
+        # already-saved watermark. Its untransferred KV cannot advance this
+        # physical upper bound, even if the allocator owns a longer block table.
+        compute_start = (
+            max(tracker.num_vllm_hit_tokens, tracker.num_lmcache_hit_tokens)
+            if tracker.local_compute_start_tokens is None
+            else tracker.local_compute_start_tokens
         )
+        computed_tokens = tracker.num_scheduled_tokens + compute_start
         # Each group covers ``len(block_ids) * tokens_per_block`` tokens; the
         # storable prefix is bounded by the least-covered group (e.g.
         # gemma-4 sliding: one 32-token ID covers 2x the tokens of a
