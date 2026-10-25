@@ -1245,7 +1245,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._control_step_id = step_id
         self.scheduler_adapter.progress_pending_lookups()
 
-    def lookup_operation_state(self, request_id: str) -> dict[str, Any]:
+    def lookup_operation_state(
+        self, request_id: str, *, request: "Request | None" = None
+    ) -> dict[str, Any]:
         """Read native lookup state without querying, matching or taking resources."""
         state = self.scheduler_adapter.lookup_operation_state(request_id)
         tracker = self.request_trackers.get(request_id)
@@ -1256,6 +1258,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # of the committed local path still needs no new query; this says
             # nothing about physical readiness or successful HBM allocation.
             state["native_fallback_reason"] = "committed_recompute_path"
+        elif (tracker is not None and request is not None
+              and tracker.state == LMCacheMPRequestState.READY
+              and request.num_computed_tokens == 0
+              and tracker.num_lmcache_hit_tokens > 0):
+            # Same native failed-load predicate as matching below. Expose the
+            # fallback without consuming lookup state or changing STORE progress.
+            state["native_fallback_reason"] = "failed_load_native_recompute"
         return state
 
     def begin_first_match_step(self, step_id: int) -> None:
@@ -1434,7 +1443,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if not commit_match and request.status == RequestStatus.PREEMPTED:
             return 0, False
         if not allow_lookup_progress:
-            state = self.lookup_operation_state(request.request_id)
+            state = self.lookup_operation_state(request.request_id, request=request)
             if not state["result_known"] and not state.get("native_fallback_reason"):
                 return None, True
         return self._get_num_new_matched_tokens(
