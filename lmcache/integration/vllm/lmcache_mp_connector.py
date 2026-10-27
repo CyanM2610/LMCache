@@ -1251,6 +1251,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """Read native lookup state without querying, matching or taking resources."""
         state = self.scheduler_adapter.lookup_operation_state(request_id)
         tracker = self.request_trackers.get(request_id)
+        # This is native committed/saved coverage, not physical write completion.
+        # Reading it does not create a tracker or call Peek/Commit.
+        state["store_committed_or_saved_tokens"] = (
+            tracker.num_stored_tokens if tracker is not None else 0
+        )
         if tracker is not None and tracker.state == LMCacheMPRequestState.BYPASS_LMCACHE:
             state["native_fallback_reason"] = "native_tracker_bypass"
         elif tracker is not None and tracker.recompute_lower_prefix_tokens is not None:
