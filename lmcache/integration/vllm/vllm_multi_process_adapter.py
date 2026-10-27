@@ -969,6 +969,26 @@ class LMCacheMPSchedulerAdapter:
         if self._lookup_progress_enabled:
             self._lookup_progress_queue[request_id] = None
 
+    def lookup_reply_readiness(self, request_ids: tuple[str, ...]) -> dict[str, Any]:
+        """Read bounded host reply flags without observing/consuming a result.
+
+        This does not submit STATUS, mutate ACK tracking, or release any source
+        reference. Device completion and unread replies outside this supplied
+        window remain unknown. A ready error is also work for native handling.
+        """
+        if len(request_ids) > 32:
+            raise ValueError("reply readiness window exceeds 32 requests")
+        checked = 0
+        for request_id in request_ids:
+            ack = self._unacked_lookups.get(request_id)
+            futures = () if ack is None else tuple(ack.futures.values())
+            futures += tuple(f for f, _ in self._lookup_status.get(request_id, {}).values())
+            for future in futures:
+                checked += 1
+                if future.query():
+                    return {"ready": True, "host_flags_checked": checked}
+        return {"ready": False, "host_flags_checked": checked}
+
     def lookup_operation_state(self, request_id: str) -> dict[str, Any]:
         """Read native query state without polling, submitting or taking a lease.
 

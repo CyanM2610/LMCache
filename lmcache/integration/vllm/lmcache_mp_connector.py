@@ -1245,6 +1245,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._control_step_id = step_id
         self.scheduler_adapter.progress_pending_lookups()
 
+    def lookup_reply_readiness(self, request_ids: tuple[str, ...]) -> dict[str, Any]:
+        """Only inspect scheduler adapter host flags; leave native progress intact."""
+        return self.scheduler_adapter.lookup_reply_readiness(request_ids)
+
     def lookup_operation_state(
         self, request_id: str, *, request: "Request | None" = None
     ) -> dict[str, Any]:
