@@ -359,6 +359,58 @@ class LiveProtocolTests(unittest.TestCase):
         self.client.abandon_drained(token)
         self.client.close()
 
+    def test_batch_keeps_per_token_cuda_fences_and_supports_fallback(self) -> None:
+        """Grouping FFI calls does not let model time replace actual data reports."""
+        self.assertTrue(self.client.batch_calls)
+        for batching in (True, False):
+            self.client.batch_calls = batching
+            begun = []
+            self.client.begin_many("load", [(0, 64), (64, 64), (128, 64)], begun)
+            self.assertEqual(len(begun), 3)
+            tokens = [b.result.access_token for b in begun]
+            self.assertEqual(len(set(tokens)), 3)
+            self.assertTrue(all(b.observed_ns >= b.started_ns > 0 for b in begun))
+            self.assertTrue(
+                all(r.state in (0, 1) for r in self.client.poll_many(tokens))
+            )
+            with self.assertRaises(RuntimeError):
+                self.client.close()
+            results = self.client.poll_many(tokens, cuda_success=True)
+            self.assertTrue(all(r.state == 3 for r in results))
+            self.assertFalse(self.client.active)
+        self.client.close()
+
+    def test_batch_begin_preserves_prefix_after_native_rejection(self) -> None:
+        """A later duplicate op cannot lose a successful earlier reservation."""
+        begun = []
+        with patch(
+            "lmcache.v1.distributed.cxl_sim_client.secrets.randbits", return_value=12345
+        ):
+            with self.assertRaises(RuntimeError):
+                self.client.begin_many("load", [(0, 64), (64, 64), (128, 64)], begun)
+        self.assertEqual(len(begun), 1)
+        token = begun[0].result.access_token
+        self.assertEqual(self.client.active, {token})
+        with self.assertRaises(RuntimeError):
+            self.client.close()
+        result = self.client.poll_many([token], cuda_success=False)[0]
+        self.assertEqual(result.state, 5)
+        self.client.close()
+
+    def test_batch_transport_failure_retains_drained_cleanup_ownership(self) -> None:
+        """A dead peer produces errors for every token without losing DMA reports."""
+        begun = []
+        self.client.begin_many("load", [(0, 64), (64, 64)], begun)
+        tokens = [b.result.access_token for b in begun]
+        self.server.terminate()
+        self.server.wait(timeout=5)
+        results = self.client.poll_many(tokens, cuda_success=True)
+        self.assertTrue(all(isinstance(r, RuntimeError) for r in results))
+        self.assertEqual(self.client.active, set(tokens))
+        for token in tokens:
+            self.client.abandon_drained(token)
+        self.client.close()
+
     def test_cancel_requires_local_transfer_drain(self) -> None:
         """A terminal model cancellation does not release a DMA reservation."""
         token = self.client.begin("store", 0, 64).access_token

@@ -18,6 +18,7 @@ from vllm.v1.kv_wait_trace import emit as wait_emit
 # First Party
 from lmcache import torch_dev
 from lmcache.v1.distributed.api import L1BackendType, ObjectKey
+from lmcache.v1.distributed.cxl_sim_client import TimedBegin
 from lmcache.v1.distributed.memory_manager.hybrid_l1_memory_manager import (
     HybridL1MemoryManager,
 )
@@ -101,6 +102,7 @@ class HybridCompletionLoop:
             raise RuntimeError(
                 "hybrid modeled backend failed: " + self.protocol_failure
             )
+        modeled: list[tuple[HybridAccess, int, int]] = []
         for index, (obj, key) in enumerate(zip(objects, keys, strict=True)):
             if obj is None or (
                 direction == "load" and (index + 1) * chunk_tokens <= skip_tokens
@@ -141,13 +143,7 @@ class HybridCompletionLoop:
             }
             access = HybridAccess(metadata)
             if medium == L1BackendType.CXL_SIM:
-                begin = self.memory.client.begin(direction, offset, obj.get_size())
-                access.token = begin.access_token
-                metadata["modeled_token"] = begin.access_token
-                metadata["model_begin_observed_ns"] = time.monotonic_ns()
-                metadata["modeled_completion_control"] = (
-                    "combined" if self.memory.client.combined_completion else "separate"
-                )
+                modeled.append((access, offset, obj.get_size()))
             if medium == L1BackendType.CXL_DAX:
                 descriptor = self.memory.mapping.descriptor
                 metadata.update(
@@ -157,9 +153,37 @@ class HybridCompletionLoop:
                     cuda_host_registered=self.memory.registered,
                 )
             accesses.append(access)
-            self._emit(
-                EventType.HYBRID_ACCESS, transfer_key, metadata | {"phase": "begin"}
-            )
+            if medium != L1BackendType.CXL_SIM:
+                self._emit(
+                    EventType.HYBRID_ACCESS, transfer_key, metadata | {"phase": "begin"}
+                )
+        if modeled:
+            begun: list[TimedBegin] = []
+            try:
+                self.memory.client.begin_many(
+                    direction, [(offset, size) for _, offset, size in modeled], begun
+                )
+            finally:
+                # Preserve every successful prefix token before emitting events
+                # or propagating a later begin failure. CUDA has not started yet.
+                for (access, _, _), begin in zip(modeled, begun, strict=False):
+                    access.token = begin.result.access_token
+                    access.metadata.update(
+                        modeled_token=access.token,
+                        model_begin_started_ns=begin.started_ns,
+                        model_begin_observed_ns=begin.observed_ns,
+                        modeled_completion_control=(
+                            "native_batch"
+                            if self.memory.client.batch_calls
+                            else "individual"
+                        ),
+                    )
+                for access, _, _ in modeled[: len(begun)]:
+                    self._emit(
+                        EventType.HYBRID_ACCESS,
+                        transfer_key,
+                        access.metadata | {"phase": "begin"},
+                    )
 
     def claim_failure(self, direction: str) -> bool:
         """Consume the explicitly configured one-shot partial-copy test hook."""
@@ -299,6 +323,28 @@ class HybridCompletionLoop:
                 job.transfer_key,
                 {"phase": "cuda_observed", "observed_ns": job.cuda_observed_ns},
             )
+        results = {}
+        batches = [
+            (
+                reported,
+                [
+                    a
+                    for a in job.accesses
+                    if not a.done and a.token is not None and a.reported == reported
+                ],
+            )
+            for reported in (False, True)
+        ]
+        for already_reported, pending in batches:
+            if not pending:
+                continue
+            for access in pending:
+                access.reported = True
+            tokens = [a.token for a in pending if a.token is not None]
+            outcomes = self.memory.client.poll_many(
+                tokens, cuda_success=None if already_reported else job.success
+            )
+            results.update(zip(tokens, outcomes, strict=True))
         for access in job.accesses:
             if access.done:
                 continue
@@ -320,13 +366,9 @@ class HybridCompletionLoop:
                 )
                 continue
             try:
-                if not access.reported:
-                    access.reported = True
-                    result = self.memory.client.complete_and_poll(
-                        access.token, job.success
-                    )
-                else:
-                    result = self.memory.client.poll(access.token)
+                result = results[access.token]
+                if isinstance(result, RuntimeError):
+                    raise result
                 if result.state not in (3, 4, 5):
                     if time.monotonic() > job.deadline:
                         self.memory.client.cancel(

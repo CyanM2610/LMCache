@@ -9,6 +9,9 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 import threading
 
+# Third Party
+import pytest
+
 # First Party
 from lmcache.v1.multiprocess import hybrid_completion as mod
 from lmcache.v1.multiprocess.hybrid_completion import HybridAccess, HybridCompletionLoop
@@ -100,13 +103,15 @@ def test_cuda_query_error_cannot_pretend_the_copy_drained(monkeypatch):
         loop.close()
 
 
-def test_combined_control_failure_cannot_publish_success(monkeypatch):
+def test_combined_control_failure_cannot_publish_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """After the DMA fence, a failed metadata exchange retires the backend."""
     loop, client, context = make_loop(monkeypatch)
     fence = ManualFence()
     abandoned = []
 
-    def fail_after_report(token, success):
+    def fail_after_report(token: int, success: bool) -> None:
         client.data_complete(token, success)
         raise RuntimeError("control server stopped")
 
@@ -133,6 +138,32 @@ def test_combined_control_failure_cannot_publish_success(monkeypatch):
         loop.close()
 
 
+def test_one_pending_token_keeps_the_whole_batch_owned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ready token in a batch cannot release buffers still gated by another."""
+    loop, client, context = make_loop(monkeypatch)
+    client.gates[1].set()
+    fence = ManualFence(True)
+    future = loop.defer(
+        fence,
+        context,
+        [HybridAccess({}, token=1), HybridAccess({}, token=2)],
+        True,
+        lambda ok: (b"event", ok),
+        "batch#1",
+    )
+    try:
+        assert client.observed.wait(2)
+        assert not future.done()
+        client.gates[2].set()
+        assert future.result(timeout=2) == (b"event", True)
+        assert client.reported == {1: True, 2: True}
+    finally:
+        client.gates[2].set()
+        loop.close()
+
+
 class ManualModel:
     """Controllable terminal acknowledgments, without timing or payload simulation."""
 
@@ -142,6 +173,8 @@ class ManualModel:
         self.observed = threading.Event()
 
     def data_complete(self, token: int, success: bool) -> None:
+        if token in self.reported:
+            raise ValueError("duplicate CUDA report")
         self.reported[token] = success
         self.observed.set()
 
@@ -149,6 +182,23 @@ class ManualModel:
         """Report the controlled fence while preserving the independent model gate."""
         self.data_complete(token, success)
         return self.poll(token)
+
+    def poll_many(
+        self, tokens: list[int], *, cuda_success: bool | None = None
+    ) -> list[SimpleNamespace | RuntimeError]:
+        """Preserve independent controlled gates across one batch call."""
+        results = []
+        for token in tokens:
+            try:
+                result = (
+                    self.poll(token)
+                    if cuda_success is None
+                    else self.complete_and_poll(token, cuda_success)
+                )
+                results.append(result)
+            except RuntimeError as error:
+                results.append(error)
+        return results
 
     def poll(self, token: int) -> SimpleNamespace:
         state = (

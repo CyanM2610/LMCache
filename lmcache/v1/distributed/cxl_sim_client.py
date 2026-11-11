@@ -107,6 +107,32 @@ class PollResult(ct.Structure):
     ]
 
 
+class AccessRange(ct.Structure):
+    """One ordered native batch input; offsets and lengths are bytes."""
+
+    _fields_ = [("op_id", ct.c_uint64), ("offset", ct.c_uint64), ("bytes", ct.c_uint64)]
+
+
+class TimedBegin(ct.Structure):
+    """A successful token plus actual native call boundaries on the CPU clock."""
+
+    _fields_ = [
+        ("result", BeginResult),
+        ("started_ns", ct.c_uint64),
+        ("observed_ns", ct.c_uint64),
+    ]
+
+
+class BatchPollResult(ct.Structure):
+    """Per-token transport status, distinct from the modeled terminal state."""
+
+    _fields_ = [
+        ("call_status", ct.c_int32),
+        ("reserved", ct.c_uint32),
+        ("result", PollResult),
+    ]
+
+
 @dataclass(frozen=True)
 class PayloadDescriptor:
     """Validated server-published POSIX mapping; sizes and offset are bytes."""
@@ -191,6 +217,10 @@ class ModeledClient:
             self.combined_completion = bool(cap.capability_bits & 2) and hasattr(
                 self.library, "cxl_modeled_complete_and_poll"
             )
+            self.batch_calls = all(
+                hasattr(self.library, "cxl_modeled_" + name)
+                for name in ("begin_access_batch", "completion_batch")
+            )
             if (
                 cap.protocol_version != 1
                 or cap.provider_kind != 1
@@ -247,6 +277,125 @@ class ModeledClient:
             )
             self.active.add(result.access_token)
             return result
+
+    def begin_many(
+        self, direction: str, ranges: list[tuple[int, int]], begun: list[TimedBegin]
+    ) -> None:
+        """Begin ordered accesses with one Python/native boundary crossing.
+
+        Args:
+            direction: ``load`` or ``store``.
+            ranges: Ordered (offset, bytes) pairs in the registered payload.
+            begun: Caller-owned output; retains every successful prefix token,
+                even when a later native exchange fails. Caller must drain it.
+        Raises:
+            ValueError: On invalid direction or any out-of-bounds input.
+            RuntimeError: On native failure, after preserving successful tokens.
+        Notes:
+            Older libraries use individual calls. The server still processes
+            each access separately, with its original queue and ownership rules.
+        """
+        if direction not in ("load", "store"):
+            raise ValueError("direction must be load or store")
+        if any(o < 0 or n <= 0 or o + n > self.capacity for o, n in ranges):
+            raise ValueError("transfer outside payload")
+        if not ranges:
+            return
+        with self.lock:
+            if not self.batch_calls:
+                for offset, size in ranges:
+                    start = time.monotonic_ns()
+                    result = self.begin(direction, offset, size)
+                    begun.append(TimedBegin(result, start, time.monotonic_ns()))
+                return
+            requests = (AccessRange * len(ranges))(
+                *(AccessRange(secrets.randbits(63) or 1, o, n) for o, n in ranges)
+            )
+            results = (TimedBegin * len(ranges))()
+            completed = ct.c_uint32()
+            try:
+                self._call(
+                    "begin_access_batch",
+                    self.handle,
+                    self.client_id,
+                    1 if direction == "load" else 2,
+                    self.region,
+                    requests,
+                    len(ranges),
+                    results,
+                    ct.byref(completed),
+                )
+            finally:
+                for result in results[: completed.value]:
+                    self.active.add(result.result.access_token)
+                    begun.append(result)
+
+    def poll_many(
+        self, tokens: list[int], *, cuda_success: bool | None = None
+    ) -> list[PollResult | RuntimeError]:
+        """Poll ordered tokens, optionally reporting an observed CUDA fence.
+
+        Args:
+            tokens: Distinct active tokens in submission order.
+            cuda_success: None polls only; a bool reports terminal CUDA first.
+        Returns:
+            One state or protocol error per token. Every successful terminal
+            state retains the same per-token DMA-fence checks as ``poll``.
+        Raises:
+            ValueError: On duplicate, absent, or already-reported inputs.
+        Notes:
+            The CUDA report remains recorded locally on IPC failure, so the
+            caller can fail the operation and abandon only drained reservations.
+        """
+        with self.lock:
+            if len(set(tokens)) != len(tokens) or any(
+                t not in self.active for t in tokens
+            ):
+                raise ValueError("duplicate or unknown transfer")
+            if cuda_success is not None and any(t in self.reported for t in tokens):
+                raise ValueError("already reported transfer")
+            if not tokens:
+                return []
+            if not self.batch_calls or any(t in self.cancelled for t in tokens):
+                results: list[PollResult | RuntimeError] = []
+                for token in tokens:
+                    try:
+                        result = (
+                            self.poll(token)
+                            if cuda_success is None
+                            else self.complete_and_poll(token, cuda_success)
+                        )
+                        results.append(result)
+                    except RuntimeError as error:
+                        results.append(error)
+                return results
+            if cuda_success is not None:
+                self.reported.update({t: cuda_success for t in tokens})
+            native = (BatchPollResult * len(tokens))()
+            try:
+                self._call(
+                    "completion_batch",
+                    self.handle,
+                    (ct.c_uint64 * len(tokens))(*tokens),
+                    len(tokens),
+                    0 if cuda_success is None else (1 if cuda_success else 2),
+                    time.monotonic_ns(),
+                    native,
+                )
+            except RuntimeError as error:
+                return [error] * len(tokens)
+            results = []
+            for token, entry in zip(tokens, native, strict=True):
+                try:
+                    if entry.call_status:
+                        message = self.library.cxl_modeled_error_string(
+                            entry.call_status
+                        ).decode()
+                        raise RuntimeError("CXLMemSim completion batch: " + message)
+                    results.append(self._accept_poll(token, entry.result))
+                except RuntimeError as error:
+                    results.append(error)
+            return results
 
     def data_complete(self, token: int, success: bool) -> None:
         """Report an *observed* CUDA terminal state, after the caller drains it.
@@ -416,5 +565,30 @@ class ModeledClient:
             function = self.library.cxl_modeled_complete_and_poll
             function.argtypes = [ptr, u64, u32, u64, ct.POINTER(PollResult)]
             function.restype = ct.c_int
+        optional = {
+            "begin_access_batch": [
+                ptr,
+                u64,
+                u32,
+                u64,
+                ct.POINTER(AccessRange),
+                u32,
+                ct.POINTER(TimedBegin),
+                ct.POINTER(u32),
+            ],
+            "completion_batch": [
+                ptr,
+                ct.POINTER(u64),
+                u32,
+                u32,
+                u64,
+                ct.POINTER(BatchPollResult),
+            ],
+        }
+        for name, args in optional.items():
+            if hasattr(self.library, "cxl_modeled_" + name):
+                function = getattr(self.library, "cxl_modeled_" + name)
+                function.argtypes = args
+                function.restype = ct.c_int
         self.library.cxl_modeled_client_close.restype = None
         self.library.cxl_modeled_error_string.restype = ct.c_char_p
