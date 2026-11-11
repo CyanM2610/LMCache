@@ -248,7 +248,11 @@ def get_configured_capacity_bytes(
     if config.hybrid_config is not None:
         return {
             L1BackendType.DRAM: config.hybrid_config.dram_bytes,
-            L1BackendType.CXL_SIM: config.hybrid_config.cxl_bytes,
+            (
+                L1BackendType.CXL_DAX
+                if config.hybrid_config.cxl_backend == "devdax"
+                else L1BackendType.CXL_SIM
+            ): config.hybrid_config.cxl_bytes,
         }
     if config.gds_l1_config is not None:
         size = config.gds_l1_config.size_in_bytes

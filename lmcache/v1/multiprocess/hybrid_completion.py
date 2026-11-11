@@ -109,7 +109,7 @@ class HybridCompletionLoop:
             medium = self.memory.get_backend_type(obj)
             offset = (
                 obj.data_ptr - self.memory.mapping.address
-                if medium == L1BackendType.CXL_SIM
+                if medium in (L1BackendType.CXL_SIM, L1BackendType.CXL_DAX)
                 else obj.meta.address
             )
             skipped = (
@@ -144,7 +144,15 @@ class HybridCompletionLoop:
                 begin = self.memory.client.begin(direction, offset, obj.get_size())
                 access.token = begin.access_token
                 metadata["modeled_token"] = begin.access_token
-            metadata["model_begin_observed_ns"] = time.monotonic_ns()
+                metadata["model_begin_observed_ns"] = time.monotonic_ns()
+            if medium == L1BackendType.CXL_DAX:
+                descriptor = self.memory.mapping.descriptor
+                metadata.update(
+                    dax_device=descriptor.device,
+                    dax_device_offset=descriptor.offset_bytes + offset,
+                    dax_target_node=descriptor.target_node,
+                    cuda_host_registered=self.memory.registered,
+                )
             accesses.append(access)
             self._emit(
                 EventType.HYBRID_ACCESS, transfer_key, metadata | {"phase": "begin"}

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Two bounded peer pools using the shared L1 directory and native KV copies.
 
-The CXL-simulation pool is a CUDA-registered view of the CXLMemSim payload.
+The CXL pool is a CUDA-registered view of Device-DAX or a CXLMemSim payload.
 Allocation does not stage or migrate payload. The caller must hold directory
 locks until both CUDA and model completion, including error/cancel paths.
 """
@@ -29,13 +29,14 @@ from lmcache.v1.distributed.hybrid_policy import (
     PlacementPolicy,
 )
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
+from lmcache.v1.distributed.physical_dax import PhysicalDaxMapping
 from lmcache.v1.memory_allocators.tensor_memory_allocator import TensorMemoryAllocator
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 from lmcache.v1.platform import current_device_spec
 
 
 class HybridL1MemoryManager:
-    """Own DRAM/CXLMemSim allocations, with atomic rollback on batch exhaustion."""
+    """Own bounded peer allocations, with atomic rollback on batch exhaustion."""
 
     def __init__(
         self, config: HybridMemoryConfig, policy: PlacementPolicy | None = None
@@ -43,7 +44,7 @@ class HybridL1MemoryManager:
         """Map, validate and pin the peer pools, failing closed on pin failure.
 
         Args:
-            config: Pool quotas and live CXLMemSim endpoints.
+            config: Pool quotas and either an assigned DAX region or model endpoints.
             policy: Replaceable allocation preference; defaults to DRAM first.
         Raises:
             ValueError: For invalid capacities/alignment or quota beyond backing.
@@ -60,41 +61,61 @@ class HybridL1MemoryManager:
         ):
             raise ValueError("pool quotas must be aligned")
         self.config = config
+        cxl_medium: Medium = "cxl_dax" if config.cxl_backend == "devdax" else "cxl_sim"
         self.policy = policy or (
-            AllPoolsLRUPolicy()
+            AllPoolsLRUPolicy(cxl_medium)
             if config.policy == "all_lru"
-            else DramFirstPolicy()
+            else DramFirstPolicy(cxl_medium)
             if config.policy == "dram_first"
             else ForcedPoolPolicy(
-                "dram" if config.policy == "force_dram" else "cxl_sim"
+                "dram" if config.policy == "force_dram" else cxl_medium
             )
         )
         self.lock = threading.RLock()
         self.live: dict[int, Medium] = {}
         self.closed = False
-        descriptor = read_payload_descriptor(config.bulk_control)
-        if config.cxl_bytes > descriptor.capacity:
-            raise ValueError("CXL quota exceeds the published payload capacity")
-        self.mapping = PayloadMapping(descriptor)
+        self.mapping: PayloadMapping | PhysicalDaxMapping | None = None
         self._client: ModeledClient | None = None
         self.registered = False
         self.pools: dict[Medium, TensorMemoryAllocator] = {}
         try:
-            self._client = ModeledClient(
-                config.client_library, config.modeled_control, descriptor.capacity
-            )
             if not current_device_spec.is_pin_supported:
                 raise RuntimeError("hybrid direct transfers require host pinning")
-            if not current_device_spec.pin_memory(
-                self.mapping.address, descriptor.capacity
-            ):
-                raise RuntimeError("CUDA registration of CXLMemSim payload failed")
-            self.registered = True
             if config.cxl_bytes:
+                if config.cxl_backend == "devdax":
+                    assert config.dax_path is not None
+                    self.mapping = PhysicalDaxMapping(
+                        config.dax_path,
+                        config.dax_offset_bytes,
+                        config.dax_region_bytes,
+                        config.cxl_bytes,
+                    )
+                else:
+                    descriptor = read_payload_descriptor(config.bulk_control)
+                    if config.cxl_bytes > descriptor.capacity:
+                        raise ValueError(
+                            "CXL quota exceeds the published payload capacity"
+                        )
+                    self.mapping = PayloadMapping(descriptor)
+                    self._client = ModeledClient(
+                        config.client_library,
+                        config.modeled_control,
+                        descriptor.capacity,
+                    )
+                if not current_device_spec.pin_memory(
+                    self.mapping.address, self.mapping.descriptor.capacity
+                ):
+                    raise RuntimeError(
+                        "CUDA registration of CXL payload failed; no staged fallback"
+                    )
+                self.registered = True
+                assert self.mapping.mapping is not None
                 cxl_tensor = torch.frombuffer(
                     self.mapping.mapping, dtype=torch.uint8, count=config.cxl_bytes
                 )
-                self.pools["cxl_sim"] = TensorMemoryAllocator(cxl_tensor, config.alignment)
+                self.pools[cxl_medium] = TensorMemoryAllocator(
+                    cxl_tensor, config.alignment
+                )
             if config.dram_bytes:
                 dram_tensor = torch.empty(
                     config.dram_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
@@ -107,10 +128,12 @@ class HybridL1MemoryManager:
             # A partially created frombuffer view can otherwise outlive mmap.
             cxl_tensor = None
             if self.registered:
+                assert self.mapping is not None
                 current_device_spec.unpin_memory(self.mapping.address)
             if self._client is not None:
                 self._client.close()
-            self.mapping.close()
+            if self.mapping is not None:
+                self.mapping.close()
             raise
 
     @property
@@ -219,7 +242,7 @@ class HybridL1MemoryManager:
                     "capacity_bytes": pool.address_manager.get_heap_size(),
                     "backing_bytes": (
                         self.mapping.descriptor.capacity
-                        if medium == "cxl_sim"
+                        if medium != "dram" and self.mapping is not None
                         else self.config.dram_bytes
                     ),
                     "active_allocations": pool.num_active_allocations,
@@ -314,16 +337,22 @@ class HybridL1MemoryManager:
         with self.lock:
             if self.closed:
                 return
-            if self.live or self.client.active:
+            if self.live or (self._client is not None and self._client.active):
                 raise RuntimeError(
                     "drain live objects and modeled transfers before close"
                 )
-            self.client.close()
+            if self._client is not None:
+                self._client.close()
             for pool in self.pools.values():
                 pool.buffer = torch.empty(0, dtype=torch.uint8)
             self.pools.clear()
             if self.registered:
-                current_device_spec.unpin_memory(self.mapping.address)
+                assert self.mapping is not None
+                if not current_device_spec.unpin_memory(self.mapping.address):
+                    raise RuntimeError(
+                        "CXL CUDA unregistration failed; mapping retained"
+                    )
                 self.registered = False
-            self.mapping.close()
+            if self.mapping is not None:
+                self.mapping.close()
             self.closed = True

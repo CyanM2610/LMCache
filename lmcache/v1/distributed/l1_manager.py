@@ -5,7 +5,7 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 import threading
 import time
 
@@ -15,7 +15,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.hybrid_policy import EvictionCandidate
+from lmcache.v1.distributed.hybrid_policy import EvictionCandidate, Medium
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L1ObjectMeta
 from lmcache.v1.distributed.memory_manager import (
     GDSL1MemoryManager,
@@ -1078,11 +1078,8 @@ class L1Manager:
         candidates = [
             EvictionCandidate(
                 object_id=identity,
-                medium=(
-                    "cxl_sim"
-                    if manager.get_backend_type(self._objects[key].memory_obj)
-                    == L1BackendType.CXL_SIM
-                    else "dram"
+                medium=cast(
+                    Medium, manager.get_backend_type(self._objects[key].memory_obj).value
                 ),
                 physical_bytes=self._objects[key].memory_obj.meta.phy_size,
                 last_access_ns=self._objects[key].last_access_ns,

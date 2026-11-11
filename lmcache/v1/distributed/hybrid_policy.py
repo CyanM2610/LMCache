@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-Medium = Literal["dram", "cxl_sim"]
+Medium = Literal["dram", "cxl_sim", "cxl_dax"]
 
 
 @dataclass(frozen=True)
@@ -34,9 +34,15 @@ class PlacementPolicy(Protocol):
 class DramFirstPolicy:
     """DRAM then CXL; evict only legal CXL residents, LRU with stable ID ties."""
 
+    def __init__(self, cxl_medium: Medium = "cxl_sim") -> None:
+        """Select the CXL backing label without changing placement decisions."""
+        if cxl_medium not in ("cxl_sim", "cxl_dax"):
+            raise ValueError("expected a CXL medium")
+        self.cxl_medium = cxl_medium
+
     def pool_order(self) -> tuple[Medium, ...]:
         """Use free DRAM first; do not migrate existing residents."""
-        return ("dram", "cxl_sim")
+        return ("dram", self.cxl_medium)
 
     def victims(self, candidates: list[EvictionCandidate]) -> list[str]:
         """Order eligible CXL residents; never return pinned or DRAM objects.
@@ -49,7 +55,7 @@ class DramFirstPolicy:
         eligible = [
             entry
             for entry in candidates
-            if entry.medium == "cxl_sim" and entry.evictable
+            if entry.medium == self.cxl_medium and entry.evictable
         ]
         return [
             entry.object_id
@@ -68,8 +74,9 @@ class ForcedPoolPolicy(DramFirstPolicy):
         Raises:
             ValueError: If medium is unknown.
         """
-        if medium not in ("dram", "cxl_sim"):
+        if medium not in ("dram", "cxl_sim", "cxl_dax"):
             raise ValueError("unknown hybrid medium")
+        super().__init__("cxl_dax" if medium == "cxl_dax" else "cxl_sim")
         self.medium = medium
 
     def pool_order(self) -> tuple[Medium, ...]:
@@ -78,7 +85,7 @@ class ForcedPoolPolicy(DramFirstPolicy):
 
     def victims(self, candidates: list[EvictionCandidate]) -> list[str]:
         """Keep the same legal CXL-only eviction rule, even in diagnostics."""
-        return super().victims(candidates) if self.medium == "cxl_sim" else []
+        return super().victims(candidates) if self.medium != "dram" else []
 
 
 class AllPoolsLRUPolicy(DramFirstPolicy):
