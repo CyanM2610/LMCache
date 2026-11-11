@@ -145,6 +145,9 @@ class HybridCompletionLoop:
                 access.token = begin.access_token
                 metadata["modeled_token"] = begin.access_token
                 metadata["model_begin_observed_ns"] = time.monotonic_ns()
+                metadata["modeled_completion_control"] = (
+                    "combined" if self.memory.client.combined_completion else "separate"
+                )
             if medium == L1BackendType.CXL_DAX:
                 descriptor = self.memory.mapping.descriptor
                 metadata.update(
@@ -319,8 +322,11 @@ class HybridCompletionLoop:
             try:
                 if not access.reported:
                     access.reported = True
-                    self.memory.client.data_complete(access.token, job.success)
-                result = self.memory.client.poll(access.token)
+                    result = self.memory.client.complete_and_poll(
+                        access.token, job.success
+                    )
+                else:
+                    result = self.memory.client.poll(access.token)
                 if result.state not in (3, 4, 5):
                     if time.monotonic() > job.deadline:
                         self.memory.client.cancel(

@@ -325,6 +325,40 @@ class LiveProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.client.active), 0)
         self.client.close()
 
+    def test_combined_completion_preserves_terminal_and_cancel_semantics(self) -> None:
+        """The single exchange has the same ownership contract as report + poll."""
+        self.assertTrue(self.client.combined_completion)
+        for combined in (True, False):
+            with self.subTest(combined=combined):
+                self.client.combined_completion = combined
+                for success in (True, False):
+                    token = self.client.begin("load", 0, 64).access_token
+                    result = self.client.complete_and_poll(token, success)
+                    self.assertEqual(result.state, 3 if success else 5)
+                    self.assertNotIn(token, self.client.active)
+                    with self.assertRaises(ValueError):
+                        self.client.complete_and_poll(token, success)
+                token = self.client.begin("store", 0, 64).access_token
+                self.client.cancel(token, "cancel before DMA drain")
+                self.assertEqual(self.client.poll(token).state, 4)
+                self.assertIn(token, self.client.active)
+                self.assertEqual(self.client.complete_and_poll(token, False).state, 4)
+                self.assertNotIn(token, self.client.active)
+        self.client.close()
+
+    def test_combined_protocol_failure_keeps_the_real_dma_fence(self) -> None:
+        """A stopped server fails the reply but still permits drained cleanup."""
+        token = self.client.begin("load", 0, 64).access_token
+        self.server.terminate()
+        self.server.wait(timeout=5)
+        with self.assertRaises(RuntimeError):
+            self.client.complete_and_poll(token, True)
+        self.assertIn(token, self.client.active)
+        with self.assertRaises(RuntimeError):
+            self.client.close()
+        self.client.abandon_drained(token)
+        self.client.close()
+
     def test_cancel_requires_local_transfer_drain(self) -> None:
         """A terminal model cancellation does not release a DMA reservation."""
         token = self.client.begin("store", 0, 64).access_token

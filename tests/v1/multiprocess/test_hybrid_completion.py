@@ -100,6 +100,39 @@ def test_cuda_query_error_cannot_pretend_the_copy_drained(monkeypatch):
         loop.close()
 
 
+def test_combined_control_failure_cannot_publish_success(monkeypatch):
+    """After the DMA fence, a failed metadata exchange retires the backend."""
+    loop, client, context = make_loop(monkeypatch)
+    fence = ManualFence()
+    abandoned = []
+
+    def fail_after_report(token, success):
+        client.data_complete(token, success)
+        raise RuntimeError("control server stopped")
+
+    monkeypatch.setattr(client, "complete_and_poll", fail_after_report)
+    monkeypatch.setattr(client, "abandon_drained", abandoned.append, raising=False)
+    future = loop.defer(
+        fence,
+        context,
+        [HybridAccess({}, token=1)],
+        True,
+        lambda ok: (b"event", ok),
+        "control-error#1",
+    )
+    try:
+        assert fence.queried.wait(2)
+        assert not abandoned and not future.done()
+        fence.ready.set()
+        assert future.result(timeout=2) == (b"event", False)
+        assert abandoned == [1]
+        assert client.reported == {1: True}
+        assert "control server stopped" in loop.report_status()["protocol_failure"]
+    finally:
+        fence.ready.set()
+        loop.close()
+
+
 class ManualModel:
     """Controllable terminal acknowledgments, without timing or payload simulation."""
 
@@ -111,6 +144,11 @@ class ManualModel:
     def data_complete(self, token: int, success: bool) -> None:
         self.reported[token] = success
         self.observed.set()
+
+    def complete_and_poll(self, token: int, success: bool) -> SimpleNamespace:
+        """Report the controlled fence while preserving the independent model gate."""
+        self.data_complete(token, success)
+        return self.poll(token)
 
     def poll(self, token: int) -> SimpleNamespace:
         state = (

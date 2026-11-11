@@ -188,6 +188,9 @@ class ModeledClient:
             self.capabilities = Capabilities()
             self._call("get_capabilities", self.handle, ct.byref(self.capabilities))
             cap = self.capabilities
+            self.combined_completion = bool(cap.capability_bits & 2) and hasattr(
+                self.library, "cxl_modeled_complete_and_poll"
+            )
             if (
                 cap.protocol_version != 1
                 or cap.provider_kind != 1
@@ -287,15 +290,39 @@ class ModeledClient:
                 raise ValueError("unknown transfer")
             result = PollResult()
             self._call("poll_access", self.handle, token, ct.byref(result))
-            if result.state == 3 and not self.reported.get(token, False):
-                raise RuntimeError("server published completion before CUDA success")
-            # Cancellation is not a DMA fence. Keep the lifetime reservation
-            # until the caller also reports a terminal CUDA state.
-            if result.state in (3, 4, 5) and token in self.reported:
-                self.active.remove(token)
-                del self.reported[token]
-                self.cancelled.discard(token)
-            return result
+            return self._accept_poll(token, result)
+
+    def complete_and_poll(self, token: int, success: bool) -> PollResult:
+        """Report observed CUDA completion and check the model in one exchange.
+
+        Args:
+            token: Active, not yet reported access token.
+            success: Whether the caller observed successful terminal CUDA work.
+        Returns:
+            Current model state, which can still be pending. Older peers use
+            separate report and poll calls with the same completion semantics.
+        Raises:
+            ValueError: If the token is unknown or already reported.
+            RuntimeError: On protocol failure or success without a CUDA fence.
+        """
+        with self.lock:
+            if not self.combined_completion or token in self.cancelled:
+                self.data_complete(token, success)
+                return self.poll(token)
+            if token not in self.active or token in self.reported:
+                raise ValueError("unknown or already reported transfer")
+            # A metadata failure must not erase the observed real DMA fence.
+            self.reported[token] = success
+            result = PollResult()
+            self._call(
+                "complete_and_poll",
+                self.handle,
+                token,
+                1 if success else 2,
+                time.monotonic_ns(),
+                ct.byref(result),
+            )
+            return self._accept_poll(token, result)
 
     def cancel(self, token: int, reason: str) -> None:
         """Cancel model demand; caller must still drain CUDA and report it.
@@ -340,6 +367,16 @@ class ModeledClient:
             self.reported.pop(token)
             self.cancelled.discard(token)
 
+    def _accept_poll(self, token: int, result: PollResult) -> PollResult:
+        if result.state == 3 and not self.reported.get(token, False):
+            raise RuntimeError("server published completion before CUDA success")
+        # Cancellation alone is not a DMA fence.
+        if result.state in (3, 4, 5) and token in self.reported:
+            self.active.remove(token)
+            del self.reported[token]
+            self.cancelled.discard(token)
+        return result
+
     def _call(self, name: str, *args: object) -> None:
         if name != "client_open" and not self.handle:
             raise RuntimeError("CXLMemSim client is closed")
@@ -374,6 +411,10 @@ class ModeledClient:
         for name, args in signatures.items():
             function = getattr(self.library, "cxl_modeled_" + name)
             function.argtypes = args
+            function.restype = ct.c_int
+        if hasattr(self.library, "cxl_modeled_complete_and_poll"):
+            function = self.library.cxl_modeled_complete_and_poll
+            function.argtypes = [ptr, u64, u32, u64, ct.POINTER(PollResult)]
             function.restype = ct.c_int
         self.library.cxl_modeled_client_close.restype = None
         self.library.cxl_modeled_error_string.restype = ct.c_char_p
